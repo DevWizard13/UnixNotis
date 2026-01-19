@@ -1,20 +1,20 @@
 //! Installer action orchestration and shared exports.
 
-#[path = "actions_config.rs"]
+#[path = "actions/actions_config.rs"]
 mod actions_config;
-#[path = "actions_daemon.rs"]
+#[path = "actions/actions_daemon.rs"]
 mod actions_daemon;
-#[path = "actions_format.rs"]
+#[path = "actions/actions_format.rs"]
 mod actions_format;
-#[path = "actions_install.rs"]
+#[path = "actions/actions_install.rs"]
 mod actions_install;
-#[path = "actions_plan.rs"]
+#[path = "actions/actions_plan.rs"]
 mod actions_plan;
-#[path = "actions_process.rs"]
+#[path = "actions/actions_process.rs"]
 mod actions_process;
-#[path = "actions_state.rs"]
+#[path = "actions/actions_state.rs"]
 mod actions_state;
-#[path = "actions_verify.rs"]
+#[path = "actions/actions_verify.rs"]
 mod actions_verify;
 
 pub use actions_format::{format_daemon_status, summarize_owner};
