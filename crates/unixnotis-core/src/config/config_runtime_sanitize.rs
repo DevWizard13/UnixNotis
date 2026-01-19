@@ -1,7 +1,7 @@
 //! Runtime sanitization and validation for configuration values.
 
 use super::{Config, PanelConfig, PopupConfig, ThemeConfig};
-use crate::program_in_path;
+use crate::{program_in_path, util};
 use tracing::warn;
 
 const MIN_REFRESH_MS: u64 = 100;
@@ -171,48 +171,5 @@ fn command_requires_shell(cmd: &str) -> bool {
     }
     // Strip known runtime placeholders so braces do not trigger false positives.
     let cmd = cmd.replace("{value}", "0");
-    const META: [char; 15] = [
-        '|', '&', ';', '<', '>', '$', '`', '(', ')', '{', '}', '[', ']', '*', '?',
-    ];
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    for ch in cmd.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && !in_single {
-            escaped = true;
-            continue;
-        }
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            continue;
-        }
-        if in_single {
-            continue;
-        }
-        if in_double {
-            // Shell expansions still apply inside double quotes for `$` and backticks.
-            if ch == '$' || ch == '`' {
-                return true;
-            }
-            continue;
-        }
-        if META.contains(&ch) || ch == '~' || ch == '\n' || ch == '\r' {
-            return true;
-        }
-    }
-
-    // Shell-style env assignments at the start need a shell to expand.
-    let first = cmd.split_whitespace().next().unwrap_or_default();
-    if first.starts_with('"') || first.starts_with('\'') {
-        return false;
-    }
-    first.contains('=') && !first.starts_with('/') && !first.starts_with("./")
+    !util::is_simple_command(&cmd)
 }

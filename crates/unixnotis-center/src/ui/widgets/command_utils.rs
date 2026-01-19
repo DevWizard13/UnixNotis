@@ -459,7 +459,7 @@ fn configure_command_tokio(command: &mut TokioCommand) {
 
 fn parse_simple_command(cmd: &str) -> Option<(String, Vec<String>)> {
     let cmd = cmd.trim();
-    if cmd.is_empty() || !is_simple_command(cmd) {
+    if cmd.is_empty() || !util::is_simple_command(cmd) {
         return None;
     }
     // Use GLib parsing to honor quoted arguments without invoking a shell.
@@ -469,25 +469,6 @@ fn parse_simple_command(cmd: &str) -> Option<(String, Vec<String>)> {
         .map(|arg| arg.into_string().ok())
         .collect::<Option<Vec<_>>>()?;
     Some((program, args))
-}
-
-fn is_simple_command(cmd: &str) -> bool {
-    const META: [char; 15] = [
-        '|', '&', ';', '<', '>', '$', '`', '(', ')', '{', '}', '[', ']', '*', '?',
-    ];
-    if cmd
-        .chars()
-        .any(|ch| META.contains(&ch) || ch == '~' || ch == '\n' || ch == '\r')
-    {
-        return false;
-    }
-
-    let first = cmd.split_whitespace().next().unwrap_or_default();
-    if first.contains('=') && !first.starts_with('/') && !first.starts_with("./") {
-        return false;
-    }
-
-    true
 }
 
 pub(in crate::ui::widgets) fn kill_process_group(pid: i32) {

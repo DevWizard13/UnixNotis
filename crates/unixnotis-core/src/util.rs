@@ -14,6 +14,9 @@ struct ProgramCache {
 }
 
 static PROGRAM_CACHE: OnceLock<Mutex<ProgramCache>> = OnceLock::new();
+pub const SHELL_META_CHARS: [char; 15] = [
+    '|', '&', ';', '<', '>', '$', '`', '(', ')', '{', '}', '[', ']', '*', '?',
+];
 const DEFAULT_LOG_LIMIT: usize = 160;
 const DIAGNOSTIC_LOG_LIMIT: usize = 512;
 
@@ -70,6 +73,23 @@ pub fn expand_tilde(value: &str) -> Cow<'_, str> {
         }
     }
     value.into()
+}
+
+/// Returns true when the command can run without a shell wrapper.
+pub fn is_simple_command(cmd: &str) -> bool {
+    if cmd
+        .chars()
+        .any(|ch| SHELL_META_CHARS.contains(&ch) || ch == '~' || ch == '\n' || ch == '\r')
+    {
+        return false;
+    }
+
+    let first = cmd.split_whitespace().next().unwrap_or_default();
+    if first.contains('=') && !first.starts_with('/') && !first.starts_with("./") {
+        return false;
+    }
+
+    true
 }
 
 /// Returns true when diagnostics are explicitly enabled via environment.
