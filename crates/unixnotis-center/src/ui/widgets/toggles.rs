@@ -256,6 +256,13 @@ fn parse_toggle_state(output: &str) -> bool {
     }
 
     let value = output.trim().to_ascii_lowercase();
+    // systemctl is-active returns "active"/"inactive"/"failed".
+    if matches!(value.as_str(), "active" | "activated") {
+        return true;
+    }
+    if matches!(value.as_str(), "inactive" | "failed" | "dead") {
+        return false;
+    }
     if matches!(
         value.as_str(),
         "1" | "on" | "yes" | "true" | "enabled" | "up"
@@ -264,5 +271,5 @@ fn parse_toggle_state(output: &str) -> bool {
     }
     value
         .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|token| matches!(token, "on" | "yes" | "true" | "enabled" | "up"))
+        .any(|token| matches!(token, "on" | "yes" | "true" | "enabled" | "up" | "active"))
 }

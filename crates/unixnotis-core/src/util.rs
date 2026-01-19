@@ -1,5 +1,6 @@
 //! Shared helper utilities used across UnixNotis components.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
 use std::path::Path;
@@ -54,6 +55,21 @@ pub fn program_in_path(program: &str) -> bool {
     }
 
     found
+}
+
+/// Expand leading `~`/`~/` to $HOME, preserving other paths as-is.
+pub fn expand_tilde(value: &str) -> Cow<'_, str> {
+    let trimmed = value.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") {
+        if let Ok(home) = env::var("HOME") {
+            if trimmed == "~" {
+                return home.into();
+            }
+            let suffix = trimmed.trim_start_matches("~/");
+            return format!("{home}/{suffix}").into();
+        }
+    }
+    value.into()
 }
 
 /// Returns true when diagnostics are explicitly enabled via environment.

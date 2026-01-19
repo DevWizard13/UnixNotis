@@ -38,10 +38,15 @@ frontends for the panel and popups.
 - D-Bus session bus.
 - Rust toolchain for builds and the installer.
 - systemd --user for the installer-managed service.
+- POSIX shell (`sh`) for widget commands that use pipes or redirects.
 - Optional external commands used by widgets and watchers:
   - `nmcli` for NetworkManager toggles
   - `bluetoothctl` for Bluetooth toggles
+  - `rfkill` for airplane mode toggles
   - `udevadm` for rfkill events
+  - `hyprsunset` for night mode toggles on Hyprland
+  - `hyprctl` for night mode IPC control on Hyprland
+  - `pgrep`/`pkill` (procps) for night mode state/control
   - `pactl` for audio subscription events
 
 ## Installer (recommended)
@@ -134,6 +139,17 @@ title = "System"
 Removing entries from `widgets.toggles`, `widgets.stats`, or `widgets.cards` disables them
 entirely. For sliders, set `enabled = false`.
 
+### Toggle identifiers
+
+Toggle widgets can include a stable `kind` identifier to keep backend selection intact when the
+label is customized. Supported kinds are `wifi`, `bluetooth`, `airplane`, and `night`.
+
+```toml
+[[widgets.toggles]]
+kind = "night"
+label = "Night Light"
+```
+
 ### Styling
 
 CSS is controlled by the theme files under the config directory:
@@ -223,3 +239,4 @@ cargo clippy --all-targets --all-features -- -D warnings
 - Panel fails to start: ensure the session type is Wayland (`XDG_SESSION_TYPE=wayland`).
 - Icons missing: verify GTK icon themes are installed and the image hints contain valid paths.
 - Widget toggles do not update: ensure the optional external commands listed above are available.
+- Night toggle does nothing: install `hyprsunset` (Hyprland 0.45+) and verify `hyprctl` and `pgrep` exist.

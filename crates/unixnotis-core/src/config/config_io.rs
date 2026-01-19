@@ -10,9 +10,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::util::expand_tilde;
 use crate::{DEFAULT_BASE_CSS, DEFAULT_PANEL_CSS, DEFAULT_POPUP_CSS, DEFAULT_WIDGETS_CSS};
 
-use super::config_runtime::{apply_brightness_backend, apply_volume_backend, sanitize_config};
+use super::config_runtime::{
+    apply_brightness_backend, apply_toggle_backends, apply_volume_backend, sanitize_config,
+};
 use super::Config;
 
 static LEGACY_RENAME_WARNED: AtomicBool = AtomicBool::new(false);
@@ -80,9 +83,14 @@ impl Config {
         fs::create_dir_all(&config_dir).map_err(|err| ConfigError::ReadFailed(err.to_string()))?;
 
         let legacy = config_dir.join("style.css");
-        let legacy_contents = fs::read_to_string(&legacy)
-            .ok()
-            .filter(|contents| !contents.trim().is_empty());
+        let base_exists = theme_paths.base_css.exists();
+        let legacy_contents = if base_exists {
+            None
+        } else {
+            fs::read_to_string(&legacy)
+                .ok()
+                .filter(|contents| !contents.trim().is_empty())
+        };
 
         write_if_missing(
             &theme_paths.base_css,
@@ -116,6 +124,7 @@ impl Config {
     fn apply_runtime_defaults(&mut self) {
         apply_volume_backend(&mut self.widgets.volume);
         apply_brightness_backend(&mut self.widgets.brightness);
+        apply_toggle_backends(&mut self.widgets.toggles);
         sanitize_config(self);
     }
 
@@ -136,7 +145,8 @@ impl Config {
     }
 
     fn resolve_path(base: &Path, value: &str) -> PathBuf {
-        let path = PathBuf::from(value);
+        let path = expand_tilde(value);
+        let path = PathBuf::from(path.as_ref());
         if path.is_absolute() {
             path
         } else {

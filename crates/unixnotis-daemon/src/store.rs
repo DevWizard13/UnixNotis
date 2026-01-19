@@ -328,7 +328,7 @@ fn rule_matches(rule: &RuleConfig, notification: &Notification) -> bool {
         }
     }
     if let Some(urgency) = rule.urgency {
-        if notification.urgency.as_u8() != urgency {
+        if notification.urgency != Urgency::from(urgency) {
             return false;
         }
     }
@@ -343,11 +343,7 @@ fn apply_rule(rule: &RuleConfig, notification: &mut Notification) {
         notification.suppress_sound = silent;
     }
     if let Some(force_urgency) = rule.force_urgency {
-        notification.urgency = match force_urgency {
-            0 => Urgency::Low,
-            2 => Urgency::Critical,
-            _ => Urgency::Normal,
-        };
+        notification.urgency = Urgency::from(force_urgency);
     }
     if let Some(expire_timeout_ms) = rule.expire_timeout_ms {
         let clamped = expire_timeout_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32;

@@ -191,7 +191,9 @@ fn resolve_default_file(config: &Config) -> Option<PathBuf> {
 }
 
 fn resolve_config_path(value: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(value);
+    // Support common ~ home shorthand in user-configured sound paths.
+    let path = util::expand_tilde(value);
+    let path = PathBuf::from(path.as_ref());
     if path.is_absolute() {
         return Some(path);
     }

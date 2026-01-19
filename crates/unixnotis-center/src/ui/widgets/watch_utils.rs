@@ -122,8 +122,12 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
             let reader = io::BufReader::new(stdout);
             let mut events = 0usize;
             for line in reader.lines() {
-                if line.is_err() {
-                    break;
+                let line = match line {
+                    Ok(line) => line,
+                    Err(_) => break,
+                };
+                if !should_emit_watch_event(&cmd, &line) {
+                    continue;
                 }
                 events += 1;
                 if tx.send_blocking(()).is_err() {
@@ -143,4 +147,13 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
         thread: Some(thread),
         task: Some(task),
     })
+}
+
+fn should_emit_watch_event(cmd: &str, line: &str) -> bool {
+    // pactl subscribe emits events for all server activity; filter to sink/server changes.
+    if cmd.trim().starts_with("pactl subscribe") {
+        let line = line.to_ascii_lowercase();
+        return line.contains(" on sink ") || line.contains(" on server ");
+    }
+    true
 }
