@@ -34,20 +34,39 @@ frontends for the panel and popups.
 ## Requirements
 
 - Wayland session (panel UI requires Wayland compositors).
-- GTK4 and gtk4-layer-shell libraries.
+- GTK4 development libraries.
+- gtk4-layer-shell library (pkg-config name: `gtk4-layer-shell-0`).
+- `pkg-config` for native dependency discovery at build time.
 - D-Bus session bus.
 - Rust toolchain for builds and the installer.
 - systemd --user for the installer-managed service.
 - POSIX shell (`sh`) for widget commands that use pipes or redirects.
 - Optional external commands used by widgets and watchers:
+  - `wpctl` (WirePlumber) or `pactl` (pipewire-pulse / PulseAudio) for volume control and updates
   - `nmcli` for NetworkManager toggles
+  - `brightnessctl` for the brightness slider
   - `bluetoothctl` for Bluetooth toggles
+  - `dbus-monitor` for Bluetooth change events
   - `rfkill` for airplane mode toggles
   - `udevadm` for rfkill events
   - `hyprsunset` for night mode toggles on Hyprland
   - `hyprctl` for night mode IPC control on Hyprland
   - `pgrep`/`pkill` (procps) for night mode state/control
   - `pactl` for audio subscription events
+
+### Distro packages
+
+Arch Linux:
+
+```sh
+sudo pacman -S gtk4 gtk4-layer-shell pkgconf dbus systemd rust
+```
+
+Arch Linux (optional widget backends):
+
+```sh
+sudo pacman -S networkmanager wireplumber pipewire-pulse brightnessctl bluez rfkill procps-ng hyprsunset
+```
 
 ## Installer (recommended)
 
@@ -239,4 +258,3 @@ cargo clippy --all-targets --all-features -- -D warnings
 - Panel fails to start: ensure the session type is Wayland (`XDG_SESSION_TYPE=wayland`).
 - Icons missing: verify GTK icon themes are installed and the image hints contain valid paths.
 - Widget toggles do not update: ensure the optional external commands listed above are available.
-- Night toggle does nothing: install `hyprsunset` (Hyprland 0.45+) and verify `hyprctl` and `pgrep` exist.

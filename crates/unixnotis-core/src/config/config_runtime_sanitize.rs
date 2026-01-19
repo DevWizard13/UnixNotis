@@ -194,7 +194,14 @@ fn command_requires_shell(cmd: &str) -> bool {
             in_double = !in_double;
             continue;
         }
-        if in_single || in_double {
+        if in_single {
+            continue;
+        }
+        if in_double {
+            // Shell expansions still apply inside double quotes for `$` and backticks.
+            if ch == '$' || ch == '`' {
+                return true;
+            }
             continue;
         }
         if META.contains(&ch) || ch == '~' || ch == '\n' || ch == '\r' {
