@@ -148,6 +148,10 @@ pub fn check_install_state_step(ctx: &mut ActionContext) -> Result<()> {
             ctx,
             "Warning: installation is present but unixnotis-daemon.service is inactive",
         );
+        log_line(
+            ctx,
+            "Hint: logout/login should refresh session environment and restart the service",
+        );
     } else {
         log_line(ctx, "Install will continue and update missing items.");
     }

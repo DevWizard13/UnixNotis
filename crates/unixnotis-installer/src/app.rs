@@ -124,6 +124,7 @@ impl App {
     }
 
     fn install_label(&self) -> &'static str {
+        // Installed state is derived from filesystem presence, not runtime health.
         if self
             .install_state
             .as_ref()

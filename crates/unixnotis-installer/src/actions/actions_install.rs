@@ -24,6 +24,8 @@ const HYPR_IMPORT_VARS: [&str; 7] = [
     "PATH",
 ];
 const HYPR_REQUIRED_VARS: [&str; 2] = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"];
+const HYPR_RESTART_CMD: &str =
+    "exec-once = systemctl --user --no-block restart unixnotis-daemon.service";
 
 pub fn install_binaries(ctx: &mut ActionContext) -> Result<()> {
     let binaries = [
@@ -334,26 +336,18 @@ fn ensure_hyprland_autostart(ctx: &mut ActionContext) {
     // Only append missing exec-once directives; existing lines remain untouched.
     // Build the minimal set of exec-once directives required for a clean login sync.
     let mut additions = Vec::new();
-    if !stripped.contains("dbus-update-activation-environment --systemd --all") {
+    if !has_exec_once_command(&stripped, "dbus-update-activation-environment --systemd --all") {
         additions.push("exec-once = dbus-update-activation-environment --systemd --all".to_string());
     }
-    let has_import = stripped.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.contains("systemctl --user import-environment")
-            && trimmed.contains("PATH")
-            && trimmed.contains("WAYLAND_DISPLAY")
-    });
+    // Detect existing exec-once imports that already cover the required variables.
+    let has_import = has_exec_once_import(&stripped, &HYPR_IMPORT_VARS);
     if !has_import {
         additions.push(hyprland_import_line());
     }
-    let has_restart = stripped.contains("unixnotis-daemon.service")
-        && (stripped.contains("systemctl --user restart")
-            || stripped.contains("systemctl --user --no-pager restart"));
+    // Detect exec-once restarts without matching commented examples.
+    let has_restart = has_exec_once_restart(&stripped);
     if !has_restart {
-        additions.push(
-            "exec-once = systemctl --user --no-pager restart unixnotis-daemon.service"
-                .to_string(),
-        );
+        additions.push(HYPR_RESTART_CMD.to_string());
     }
 
     if additions.is_empty() {
@@ -480,6 +474,45 @@ fn hyprland_import_line() -> String {
         "exec-once = systemctl --user import-environment {}",
         HYPR_IMPORT_VARS.join(" ")
     )
+}
+
+fn has_exec_once_command(contents: &str, needle: &str) -> bool {
+    // Only consider non-comment exec-once lines to avoid false positives.
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        trimmed.starts_with("exec-once") && trimmed.contains(needle)
+    })
+}
+
+fn has_exec_once_import(contents: &str, vars: &[&str]) -> bool {
+    // Ensure the import line includes every expected variable.
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        if !(trimmed.starts_with("exec-once") && trimmed.contains("import-environment")) {
+            return false;
+        }
+        vars.iter().all(|var| trimmed.contains(var))
+    })
+}
+
+fn has_exec_once_restart(contents: &str) -> bool {
+    // Require an active exec-once restart line for unixnotis-daemon.service.
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+        trimmed.starts_with("exec-once")
+            && trimmed.contains("systemctl")
+            && trimmed.contains("restart")
+            && trimmed.contains("unixnotis-daemon.service")
+    })
 }
 
 fn strip_hyprland_bootstrap_block(
