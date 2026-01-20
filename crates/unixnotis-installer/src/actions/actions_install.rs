@@ -14,6 +14,16 @@ use unixnotis_core::program_in_path;
 
 const HYPR_BOOTSTRAP_START: &str = "# BEGIN UNIXNOTIS SESSION BOOTSTRAP";
 const HYPR_BOOTSTRAP_END: &str = "# END UNIXNOTIS SESSION BOOTSTRAP";
+const HYPR_IMPORT_VARS: [&str; 7] = [
+    "WAYLAND_DISPLAY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+    "XDG_SESSION_DESKTOP",
+    "DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "PATH",
+];
+const HYPR_REQUIRED_VARS: [&str; 2] = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"];
 
 pub fn install_binaries(ctx: &mut ActionContext) -> Result<()> {
     let binaries = [
@@ -84,7 +94,7 @@ pub fn enable_service(ctx: &mut ActionContext) -> Result<()> {
         None,
     )?;
     // Keep the environment in sync after enabling the service so future restarts inherit it.
-    sync_user_environment(ctx);
+    sync_user_environment(ctx)?;
     // Hyprland exec-once ensures session vars are synced once per login without extra hooks.
     ensure_hyprland_autostart(ctx);
     Ok(())
@@ -181,10 +191,26 @@ fn format_exec_start(paths: &InstallPaths) -> String {
     }
 }
 
-fn sync_user_environment(ctx: &mut ActionContext) {
+fn sync_user_environment(ctx: &mut ActionContext) -> Result<()> {
     if !program_in_path("systemctl") {
-        log_line(ctx, "Warning: systemctl not found; skipping user environment sync");
-        return;
+        let message = "systemctl not found; cannot sync user environment";
+        log_line(ctx, format!("Error: {}", message));
+        return Err(anyhow!(message));
+    }
+
+    // Require a minimal Wayland session context before attempting import.
+    let missing_required = HYPR_REQUIRED_VARS
+        .iter()
+        .copied()
+        .filter(|var| env::var(var).is_err())
+        .collect::<Vec<_>>();
+    if !missing_required.is_empty() {
+        let message = format!(
+            "missing session variables: {}; run from a Wayland session",
+            missing_required.join(", ")
+        );
+        log_line(ctx, format!("Error: {}", message));
+        return Err(anyhow!(message));
     }
 
     // Track whether any environment sync step completed successfully.
@@ -211,23 +237,15 @@ fn sync_user_environment(ctx: &mut ActionContext) {
     }
 
     // Import session variables that are commonly missing from systemd --user.
-    let candidate_vars = [
-        "WAYLAND_DISPLAY",
-        "XDG_CURRENT_DESKTOP",
-        "XDG_SESSION_TYPE",
-        "XDG_SESSION_DESKTOP",
-        "DISPLAY",
-        "XDG_RUNTIME_DIR",
-    ];
-    let vars = candidate_vars
-        .into_iter()
+    let vars = HYPR_IMPORT_VARS
+        .iter()
+        .copied()
         .filter(|var| env::var(var).is_ok())
         .collect::<Vec<_>>();
     if vars.is_empty() {
-        log_line(
-            ctx,
-            "Warning: no session environment variables found to import for systemd --user",
-        );
+        let message = "no session environment variables found to import for systemd --user";
+        log_line(ctx, format!("Error: {}", message));
+        return Err(anyhow!(message));
     } else {
         let mut command = Command::new("systemctl");
         command.args(["--user", "--no-pager", "import-environment"]);
@@ -242,6 +260,12 @@ fn sync_user_environment(ctx: &mut ActionContext) {
         } else {
             updated = true;
         }
+    }
+
+    if !updated {
+        let message = "failed to synchronize systemd --user environment";
+        log_line(ctx, format!("Error: {}", message));
+        return Err(anyhow!(message));
     }
 
     if updated {
@@ -262,6 +286,7 @@ fn sync_user_environment(ctx: &mut ActionContext) {
             log_line(ctx, format!("Warning: {}", err));
         }
     }
+    Ok(())
 }
 
 fn ensure_hyprland_autostart(ctx: &mut ActionContext) {
@@ -307,21 +332,27 @@ fn ensure_hyprland_autostart(ctx: &mut ActionContext) {
         };
 
     // Only append missing exec-once directives; existing lines remain untouched.
+    // Build the minimal set of exec-once directives required for a clean login sync.
     let mut additions = Vec::new();
     if !stripped.contains("dbus-update-activation-environment --systemd --all") {
-        additions.push("exec-once = dbus-update-activation-environment --systemd --all");
+        additions.push("exec-once = dbus-update-activation-environment --systemd --all".to_string());
     }
-    if !stripped.contains("systemctl --user import-environment") {
-        additions.push(
-            "exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP",
-        );
+    let has_import = stripped.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.contains("systemctl --user import-environment")
+            && trimmed.contains("PATH")
+            && trimmed.contains("WAYLAND_DISPLAY")
+    });
+    if !has_import {
+        additions.push(hyprland_import_line());
     }
     let has_restart = stripped.contains("unixnotis-daemon.service")
         && (stripped.contains("systemctl --user restart")
             || stripped.contains("systemctl --user --no-pager restart"));
     if !has_restart {
         additions.push(
-            "exec-once = systemctl --user --no-pager restart unixnotis-daemon.service",
+            "exec-once = systemctl --user --no-pager restart unixnotis-daemon.service"
+                .to_string(),
         );
     }
 
@@ -426,7 +457,7 @@ fn hyprland_config_path() -> Result<std::path::PathBuf> {
     Ok(home_dir()?.join(".config").join("hypr").join("hyprland.conf"))
 }
 
-fn render_hyprland_bootstrap_block(lines: &[&'static str]) -> String {
+fn render_hyprland_bootstrap_block(lines: &[String]) -> String {
     // The block markers allow a clean uninstall without touching unrelated config content.
     let mut block = String::new();
     block.push_str(HYPR_BOOTSTRAP_START);
@@ -443,6 +474,14 @@ fn render_hyprland_bootstrap_block(lines: &[&'static str]) -> String {
     block
 }
 
+fn hyprland_import_line() -> String {
+    // Keep the import list in one place so Hyprland exec-once stays consistent.
+    format!(
+        "exec-once = systemctl --user import-environment {}",
+        HYPR_IMPORT_VARS.join(" ")
+    )
+}
+
 fn strip_hyprland_bootstrap_block(
     ctx: &mut ActionContext,
     contents: &str,
@@ -456,7 +495,7 @@ fn strip_hyprland_bootstrap_block(
         log_line(
             ctx,
             format!(
-                "Warning: unterminated UnixNotis block in {}",
+                "Error: unterminated UnixNotis block in {}; manual cleanup required before install",
                 format_with_home(config_path)
             ),
         );

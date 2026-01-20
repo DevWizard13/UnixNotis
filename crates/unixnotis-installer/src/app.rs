@@ -75,11 +75,7 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         // Initialize with current system state.
-        let checks = Checks::run();
-        let detection = crate::detect::detect();
-        let install_state = InstallPaths::discover()
-            .ok()
-            .map(|paths| check_install_state(&paths));
+        let (checks, detection, install_state) = Self::load_state();
 
         Self {
             checks,
@@ -112,11 +108,11 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
-        self.checks = Checks::run();
-        self.detection = crate::detect::detect();
-        self.install_state = InstallPaths::discover()
-            .ok()
-            .map(|paths| check_install_state(&paths));
+        // Refresh all state on demand to match the initial load path.
+        let (checks, detection, install_state) = Self::load_state();
+        self.checks = checks;
+        self.detection = detection;
+        self.install_state = install_state;
     }
 
     pub fn action_label(&self, mode: ActionMode) -> &'static str {
@@ -131,12 +127,23 @@ impl App {
         if self
             .install_state
             .as_ref()
-            .map(|state| state.is_fully_installed())
+            .map(|state| state.is_installed())
             .unwrap_or(false)
         {
             "Reinstall"
         } else {
             "Install"
         }
+    }
+
+    fn load_state() -> (Checks, Detection, Option<InstallState>) {
+        // Keep initialization and refresh logic consistent in a single helper.
+        let checks = Checks::run();
+        let detection = crate::detect::detect();
+        // Install state remains optional so the UI can render even if discovery fails.
+        let install_state = InstallPaths::discover()
+            .ok()
+            .map(|paths| check_install_state(&paths));
+        (checks, detection, install_state)
     }
 }

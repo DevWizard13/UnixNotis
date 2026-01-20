@@ -39,8 +39,13 @@ pub struct InstallState {
 }
 
 impl InstallState {
+    pub fn is_installed(&self) -> bool {
+        // Treat installed as binaries + unit present; runtime status tracked separately.
+        self.binaries.iter().all(|binary| binary.exists) && self.unit_exists
+    }
+
     pub fn is_fully_installed(&self) -> bool {
-        self.binaries.iter().all(|binary| binary.exists) && self.unit_exists && self.unit_active
+        self.is_installed() && self.unit_active
     }
 }
 
@@ -84,6 +89,7 @@ pub fn check_install_state(paths: &InstallPaths) -> InstallState {
 }
 
 pub fn check_install_state_step(ctx: &mut ActionContext) -> Result<()> {
+    // Use cached install state when available to keep the UI consistent with the plan.
     let state = ctx
         .install_state
         .clone()
@@ -136,6 +142,12 @@ pub fn check_install_state_step(ctx: &mut ActionContext) -> Result<()> {
         } else {
             log_line(ctx, "Already installed.");
         }
+    } else if state.is_installed() {
+        // Service inactivity is flagged without blocking installation workflows.
+        log_line(
+            ctx,
+            "Warning: installation is present but unixnotis-daemon.service is inactive",
+        );
     } else {
         log_line(ctx, "Install will continue and update missing items.");
     }
