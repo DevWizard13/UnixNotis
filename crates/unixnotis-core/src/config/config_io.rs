@@ -22,6 +22,8 @@ static LEGACY_RENAME_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub struct ThemePaths {
+    // Base directory used to resolve relative theme paths.
+    pub base_dir: PathBuf,
     pub base_css: PathBuf,
     pub popup_css: PathBuf,
     pub panel_css: PathBuf,
@@ -43,8 +45,17 @@ impl Config {
     pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
         let contents =
             fs::read_to_string(path).map_err(|err| ConfigError::ReadFailed(err.to_string()))?;
-        let mut config: Config =
-            toml::from_str(&contents).map_err(|err| ConfigError::ParseFailed(err.to_string()))?;
+        let mut ignored_keys = Vec::new();
+        let deserializer = toml::de::Deserializer::new(&contents);
+        let mut config: Config = serde_ignored::deserialize(deserializer, |path| {
+            ignored_keys.push(path.to_string());
+        })
+        .map_err(|err| ConfigError::ParseFailed(err.to_string()))?;
+        if !ignored_keys.is_empty() {
+            for key in ignored_keys {
+                warn!(key = %key, "unknown config key ignored");
+            }
+        }
         config.apply_runtime_defaults();
         Ok(config)
     }
@@ -70,6 +81,7 @@ impl Config {
     pub fn resolve_theme_paths_from(&self, base: &Path) -> Result<ThemePaths, ConfigError> {
         // Resolve relative paths against the supplied config directory.
         Ok(ThemePaths {
+            base_dir: base.to_path_buf(),
             base_css: Self::resolve_path(base, &self.theme.base_css),
             popup_css: Self::resolve_path(base, &self.theme.popup_css),
             panel_css: Self::resolve_path(base, &self.theme.panel_css),
@@ -79,8 +91,14 @@ impl Config {
 
     /// Ensure all theme files exist in the config directory.
     pub fn ensure_theme_files(&self, theme_paths: &ThemePaths) -> Result<(), ConfigError> {
-        let config_dir = Self::default_config_dir()?;
-        fs::create_dir_all(&config_dir).map_err(|err| ConfigError::ReadFailed(err.to_string()))?;
+        // Use the same base directory used for resolving theme paths.
+        let config_dir = &theme_paths.base_dir;
+        fs::create_dir_all(config_dir).map_err(|err| ConfigError::ReadFailed(err.to_string()))?;
+
+        ensure_parent_dir(&theme_paths.base_css)?;
+        ensure_parent_dir(&theme_paths.panel_css)?;
+        ensure_parent_dir(&theme_paths.popup_css)?;
+        ensure_parent_dir(&theme_paths.widgets_css)?;
 
         let legacy = config_dir.join("style.css");
         let base_exists = theme_paths.base_css.exists();
@@ -160,4 +178,11 @@ fn write_if_missing(path: &Path, contents: &str) -> Result<(), ConfigError> {
         return Ok(());
     }
     fs::write(path, contents).map_err(|err| ConfigError::ReadFailed(err.to_string()))
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), ConfigError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ConfigError::ReadFailed("missing theme file parent directory".to_string()))?;
+    fs::create_dir_all(parent).map_err(|err| ConfigError::ReadFailed(err.to_string()))
 }

@@ -14,21 +14,30 @@ pub fn stop_active_daemon(ctx: &mut ActionContext) -> Result<()> {
         return Ok(());
     };
 
-    let Some(comm) = owner.comm.as_deref() else {
-        log_line(
-            ctx,
-            "Active owner detected, but command name is unavailable.",
-        );
-        return Ok(());
-    };
-
-    let known = ctx
-        .detection
-        .daemons
-        .iter()
-        .find(|daemon| daemon.name == comm);
+    let owner_pid = owner.pid;
+    let owner_comm = owner.comm.as_deref();
+    // Prefer the bus-reported command name, but fall back to PID matching when comm is unavailable.
+    let known = owner_comm
+        .and_then(|comm| ctx.detection.daemons.iter().find(|daemon| daemon.name == comm))
+        .or_else(|| {
+            owner_pid.and_then(|pid| {
+                ctx.detection
+                    .daemons
+                    .iter()
+                    .find(|daemon| daemon.running_pids.contains(&pid))
+            })
+        });
 
     if let Some(daemon) = known {
+        if owner_comm.is_none() {
+            log_line(
+                ctx,
+                format!(
+                    "Active owner detected without command name; matched pid to {}",
+                    daemon.name
+                ),
+            );
+        }
         if daemon.systemd_active {
             let is_unixnotis = daemon.name == "unixnotis-daemon";
             log_line(ctx, format!("Stopping systemd unit {}", daemon.unit));
@@ -47,7 +56,7 @@ pub fn stop_active_daemon(ctx: &mut ActionContext) -> Result<()> {
             return Ok(());
         }
 
-        if let Some(pid) = owner.pid {
+        if let Some(pid) = owner_pid {
             log_line(ctx, format!("Stopping {} (pid {})", daemon.name, pid));
             let status = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
@@ -61,10 +70,19 @@ pub fn stop_active_daemon(ctx: &mut ActionContext) -> Result<()> {
         }
     }
 
-    log_line(
-        ctx,
-        format!("Detected owner '{}' is not managed by a known unit.", comm),
-    );
+    if let Some(comm) = owner_comm {
+        log_line(
+            ctx,
+            format!("Detected owner '{}' is not managed by a known unit.", comm),
+        );
+    } else if let Some(pid) = owner_pid {
+        log_line(
+            ctx,
+            format!("Detected owner pid {} is not managed by a known unit.", pid),
+        );
+    } else {
+        log_line(ctx, "Detected owner is not managed by a known unit.");
+    }
     Ok(())
 }
 

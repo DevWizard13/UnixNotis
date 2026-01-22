@@ -1,13 +1,58 @@
 //! D-Bus runtime for popup UI events and control updates.
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use tracing::{info, warn};
 use unixnotis_core::{CloseReason, ControlProxy, ControlState, NotificationView};
 use zbus::{Connection, Result as ZbusResult};
+
+// Backoff settings throttle reconnect attempts while keeping recovery responsive.
+const BACKOFF_BASE_MS: u64 = 250;
+const BACKOFF_MAX_MS: u64 = 5000;
+const BACKOFF_JITTER_MS: u64 = 120;
+
+struct Backoff {
+    base: Duration,
+    current: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(base_ms: u64, max_ms: u64) -> Self {
+        let base = Duration::from_millis(base_ms);
+        Self {
+            base,
+            current: base,
+            max: Duration::from_millis(max_ms),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current = self.base;
+    }
+
+    fn next_sleep(&mut self) -> Duration {
+        let jitter = jitter_duration(BACKOFF_JITTER_MS);
+        let sleep = self.current;
+        self.current = (self.current * 2).min(self.max);
+        sleep + jitter
+    }
+}
+
+fn jitter_duration(max_ms: u64) -> Duration {
+    if max_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let jitter_ms = (nanos % (max_ms * 1_000_000)) / 1_000_000;
+    Duration::from_millis(jitter_ms)
+}
 
 /// Events delivered to the GTK main loop.
 #[derive(Debug, Clone)]
@@ -44,24 +89,33 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
             }
         };
         runtime.block_on(async move {
-            let connection = match Connection::session().await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    warn!(?err, "failed to connect to session bus");
-                    return;
-                }
-            };
+            let mut connect_backoff = Backoff::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS);
+            let mut subscribe_backoff = Backoff::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS);
 
             loop {
+                let connection = loop {
+                    match Connection::session().await {
+                        Ok(connection) => {
+                            connect_backoff.reset();
+                            break connection;
+                        }
+                        Err(err) => {
+                            warn!(?err, "failed to connect to session bus; retrying");
+                            tokio::time::sleep(connect_backoff.next_sleep()).await;
+                        }
+                    }
+                };
+
                 let proxy = match ControlProxy::new(&connection).await {
                     Ok(proxy) => proxy,
                     Err(err) => {
                         warn!(?err, "control interface unavailable, retrying");
                         drain_offline_commands(&mut command_rx);
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
                 };
+                subscribe_backoff.reset();
                 info!("connected to unixnotis control interface");
                 seed_state(&proxy, &sender).await;
 
@@ -69,7 +123,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                     Ok(stream) => stream,
                     Err(err) => {
                         warn!(?err, "failed to subscribe to notification_added");
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
                 };
@@ -77,7 +131,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                     Ok(stream) => stream,
                     Err(err) => {
                         warn!(?err, "failed to subscribe to notification_updated");
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
                 };
@@ -85,7 +139,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                     Ok(stream) => stream,
                     Err(err) => {
                         warn!(?err, "failed to subscribe to notification_closed");
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
                 };
@@ -93,7 +147,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                     Ok(stream) => stream,
                     Err(err) => {
                         warn!(?err, "failed to subscribe to state_changed");
-                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
                 };
@@ -161,7 +215,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                tokio::time::sleep(subscribe_backoff.next_sleep()).await;
             }
         });
     });
@@ -173,8 +227,18 @@ async fn seed_state(proxy: &ControlProxy<'_>, sender: &async_channel::Sender<UiE
     let state = proxy.get_state().await;
     let active = proxy.list_active().await;
 
-    if let (Ok(state), Ok(active)) = (state, active) {
-        let _ = sender.send(UiEvent::Seed { state, active }).await;
+    match (state, active) {
+        (Ok(state), Ok(active)) => {
+            let _ = sender.send(UiEvent::Seed { state, active }).await;
+        }
+        (state, active) => {
+            if let Err(err) = state {
+                warn!(?err, "failed to fetch popup state");
+            }
+            if let Err(err) = active {
+                warn!(?err, "failed to fetch active notifications for popups");
+            }
+        }
     }
 }
 

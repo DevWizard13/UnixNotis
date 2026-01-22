@@ -391,6 +391,8 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
 
     let mut lines = Vec::new();
     let mut current = String::new();
+    // Track current width to avoid repeated O(n) scans as the line grows.
+    let mut current_width = 0usize;
     let sanitized = line.replace('\t', " ");
 
     for word in sanitized.split_whitespace() {
@@ -399,6 +401,7 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
             if !current.is_empty() {
                 lines.push(current);
                 current = String::new();
+                current_width = 0;
             }
             for chunk in break_long_word(word, width) {
                 lines.push(chunk);
@@ -409,17 +412,20 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
         let next_len = if current.is_empty() {
             word_width
         } else {
-            current.chars().count() + 1 + word_width
+            current_width + 1 + word_width
         };
 
         if next_len > width {
             lines.push(current);
             current = word.to_string();
+            current_width = word_width;
         } else {
             if !current.is_empty() {
                 current.push(' ');
+                current_width += 1;
             }
             current.push_str(word);
+            current_width += word_width;
         }
     }
 
@@ -442,17 +448,20 @@ fn break_long_word(word: &str, width: usize) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut current_width = 0usize;
 
     // Iterate by Unicode scalar values (chars), so we never cut UTF-8 in the middle of a codepoint.
     // Note: this counts "chars", not terminal column width (wide glyphs/emojis may still misalign).
     for ch in word.chars() {
         current.push(ch);
+        current_width += 1;
 
         // When the current chunk reaches the target width, finalize it and start a new one.
         // This uses a char count so it matches the way we built the string above.
-        if current.chars().count() >= width {
+        if current_width >= width {
             chunks.push(current);
             current = String::new();
+            current_width = 0;
         }
     }
 

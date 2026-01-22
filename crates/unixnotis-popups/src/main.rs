@@ -17,6 +17,8 @@ use unixnotis_ui::css::{self, CssKind};
 mod dbus;
 mod ui;
 
+const UI_EVENT_QUEUE_CAPACITY: usize = 512;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 struct Args {
@@ -62,7 +64,8 @@ fn main() -> Result<()> {
     let app = gtk::Application::new(Some("com.unixnotis.Popups"), Default::default());
 
     app.connect_activate(move |app| {
-        let (event_tx, event_rx) = async_channel::unbounded();
+        // Bound the UI event queue to avoid unbounded memory growth under stalls.
+        let (event_tx, event_rx) = async_channel::bounded(UI_EVENT_QUEUE_CAPACITY);
         let command_tx = dbus::start_dbus_runtime(event_tx.clone());
 
         let css_manager = css::CssManager::new_popup(theme_paths.clone(), config.theme.clone());

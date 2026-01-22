@@ -173,7 +173,16 @@ impl CommandSlider {
     }
 
     pub fn needs_polling(&self) -> bool {
-        self.watch_handle.borrow().is_none()
+        let mut handle = self.watch_handle.borrow_mut();
+        if let Some(watch) = handle.as_ref() {
+            // If the watch command exited, fall back to polling and allow a new watch later.
+            if !watch.is_active() {
+                handle.take();
+                return true;
+            }
+            return false;
+        }
+        true
     }
 
     pub fn set_watch_active(&self, active: bool) {

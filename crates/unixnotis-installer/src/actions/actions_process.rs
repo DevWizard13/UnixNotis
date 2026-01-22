@@ -32,26 +32,34 @@ pub fn run_command(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let log_tx = ctx.log_tx.clone();
+    let label_string = label.to_string();
 
     let stdout_handle = stdout.map(|stream| {
         let tx = log_tx.clone();
-        thread::spawn(move || read_stream(stream, tx))
+        let label = label_string.clone();
+        thread::spawn(move || read_stream(stream, tx, label, "stdout"))
     });
 
     let stderr_handle = stderr.map(|stream| {
         let tx = log_tx.clone();
-        thread::spawn(move || read_stream(stream, tx))
+        let label = label_string.clone();
+        thread::spawn(move || read_stream(stream, tx, label, "stderr"))
     });
 
     let status = child
         .wait()
         .with_context(|| format!("command failed to run: {}", label))?;
 
+    // Surface log thread failures so command output issues are visible in the installer UI.
     if let Some(handle) = stdout_handle {
-        let _ = handle.join();
+        if let Err(err) = handle.join() {
+            log_line(ctx, format!("Warning: stdout log thread panicked: {:?}", err));
+        }
     }
     if let Some(handle) = stderr_handle {
-        let _ = handle.join();
+        if let Err(err) = handle.join() {
+            log_line(ctx, format!("Warning: stderr log thread panicked: {:?}", err));
+        }
     }
 
     if status.success() {
@@ -71,11 +79,27 @@ fn sanitize_log_line(line: &str) -> String {
     line.replace('\r', "")
 }
 
-fn read_stream(stream: impl std::io::Read, tx: Sender<UiMessage>) {
+fn read_stream(
+    stream: impl std::io::Read,
+    tx: Sender<UiMessage>,
+    label: String,
+    stream_name: &str,
+) {
     let reader = BufReader::new(stream);
-    for line in reader.lines().map_while(Result::ok) {
-        let _ = tx.send(UiMessage::Worker(WorkerEvent::LogLine(sanitize_log_line(
-            &line,
-        ))));
+    for line in reader.lines() {
+        match line {
+            Ok(line) => {
+                let _ = tx.send(UiMessage::Worker(WorkerEvent::LogLine(sanitize_log_line(
+                    &line,
+                ))));
+            }
+            Err(err) => {
+                let _ = tx.send(UiMessage::Worker(WorkerEvent::LogLine(format!(
+                    "Warning: log stream error for {} ({}): {}",
+                    label, stream_name, err
+                ))));
+                break;
+            }
+        }
     }
 }

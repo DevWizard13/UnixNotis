@@ -3,6 +3,8 @@
 use std::io::{self, BufRead};
 use std::process::Child;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_channel::TryRecvError;
@@ -20,10 +22,13 @@ pub(in crate::ui::widgets) struct CommandWatch {
     child: Option<Child>,
     thread: Option<std::thread::JoinHandle<()>>,
     task: Option<glib::JoinHandle<()>>,
+    // Tracks whether the watch process is still emitting events.
+    active: Arc<AtomicBool>,
 }
 
 impl Drop for CommandWatch {
     fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -94,6 +99,7 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
     let (tx, rx) = async_channel::unbounded::<()>();
     let on_event = Rc::new(on_event);
     let debounce = Duration::from_millis(120);
+    let active = Arc::new(AtomicBool::new(true));
     let task = glib::MainContext::default().spawn_local({
         let on_event = on_event.clone();
         let cmd = cmd_string.clone();
@@ -118,6 +124,7 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
 
     let thread = std::thread::spawn({
         let cmd = cmd_for_thread;
+        let active = Arc::clone(&active);
         move || {
             let reader = io::BufReader::new(stdout);
             let mut events = 0usize;
@@ -134,6 +141,7 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
                     break;
                 }
             }
+            active.store(false, Ordering::Release);
             debug::log(PanelDebugLevel::Info, || {
                 let snippet = util::log_snippet(&cmd);
                 format!("watch stopped: {snippet} (events={events})")
@@ -146,7 +154,14 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
         child: Some(child),
         thread: Some(thread),
         task: Some(task),
+        active,
     })
+}
+
+impl CommandWatch {
+    pub(in crate::ui::widgets) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
 fn should_emit_watch_event(cmd: &str, line: &str) -> bool {

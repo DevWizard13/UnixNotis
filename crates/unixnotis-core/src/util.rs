@@ -6,6 +6,9 @@ use std::env;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 struct ProgramCache {
     // Snapshot of PATH used to invalidate cached entries when environment changes.
     path: Option<String>,
@@ -23,7 +26,7 @@ const DIAGNOSTIC_LOG_LIMIT: usize = 512;
 /// Check whether a program exists in $PATH, caching results to avoid repeated scans.
 pub fn program_in_path(program: &str) -> bool {
     if program.contains(std::path::MAIN_SEPARATOR) {
-        return Path::new(program).is_file();
+        return is_executable_path(Path::new(program));
     }
     // Capture PATH once per call to avoid repeated env lookups.
     let current_path = env::var("PATH").ok();
@@ -46,7 +49,7 @@ pub fn program_in_path(program: &str) -> bool {
 
     let found = current_path
         .as_ref()
-        .map(|paths| env::split_paths(paths).any(|dir| dir.join(program).is_file()))
+        .map(|paths| env::split_paths(paths).any(|dir| is_executable_path(&dir.join(program))))
         .unwrap_or(false);
 
     if let Ok(mut cache) = cache.lock() {
@@ -58,6 +61,24 @@ pub fn program_in_path(program: &str) -> bool {
     }
 
     found
+}
+
+fn is_executable_path(path: &Path) -> bool {
+    // Ensure backend selection only succeeds when the program can actually be executed.
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// Expand leading `~`/`~/` to $HOME, preserving other paths as-is.

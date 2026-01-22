@@ -182,12 +182,34 @@ fn enqueue_command(
     plan: CommandPlan,
     respond: Option<async_channel::Sender<Result<Output, io::Error>>>,
 ) {
-    let job = CommandJob { cmd, plan, respond };
     let worker = CommandWorker::global();
     if worker.inline_fallback {
-        handle_job(job, None);
+        // Fall back to a dedicated worker thread to avoid blocking the GTK loop.
+        if std::thread::Builder::new()
+            .name("unixnotis-command-fallback".to_string())
+            .spawn({
+                let job_for_thread = CommandJob {
+                    cmd: cmd.clone(),
+                    plan,
+                    respond: respond.clone(),
+                };
+                move || handle_job(job_for_thread, None)
+            })
+            .is_err()
+        {
+            warn!("failed to spawn fallback command worker; running inline");
+            handle_job(
+                CommandJob {
+                    cmd,
+                    plan,
+                    respond,
+                },
+                None,
+            );
+        }
         return;
     }
+    let job = CommandJob { cmd, plan, respond };
     if worker.tx.send(job).is_err() {
         warn!("command worker channel closed");
     }

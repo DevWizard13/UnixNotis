@@ -7,13 +7,14 @@ mod ui_window;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::thread;
 
 use gtk::prelude::*;
 use gtk::Align;
 use gtk::{gdk, glib};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::debug;
+use tracing::{debug, warn};
 use unixnotis_core::{Config, NotificationView, Urgency};
 
 use crate::dbus::{UiCommand, UiEvent};
@@ -24,6 +25,50 @@ use icons::{
     resolve_icon_image, DesktopIconIndex, RasterIcon,
 };
 use ui_window::{apply_popup_config, build_popup_window};
+
+const ICON_CACHE_MAX_ENTRIES: usize = 256;
+const ICON_DECODE_WORKERS: usize = 2;
+
+struct IconDecodeJob {
+    path: PathBuf,
+    reply: async_channel::Sender<Result<RasterIcon, String>>,
+}
+
+struct IconDecodePool {
+    tx: async_channel::Sender<IconDecodeJob>,
+}
+
+impl IconDecodePool {
+    fn global() -> &'static IconDecodePool {
+        static POOL: OnceLock<IconDecodePool> = OnceLock::new();
+        POOL.get_or_init(|| IconDecodePool::new(ICON_DECODE_WORKERS))
+    }
+
+    fn new(worker_count: usize) -> Self {
+        let (tx, rx) = async_channel::unbounded::<IconDecodeJob>();
+        // Limit decode concurrency to keep bursty icon loads from spawning unbounded threads.
+        for idx in 0..worker_count.max(1) {
+            let rx = rx.clone();
+            let name = format!("unixnotis-icon-decode-{idx}");
+            if thread::Builder::new().name(name).spawn(move || worker_loop(rx)).is_err() {
+                warn!("failed to spawn icon decode worker");
+            }
+        }
+        Self { tx }
+    }
+
+    fn submit(&self, path: PathBuf, reply: async_channel::Sender<Result<RasterIcon, String>>) {
+        let _ = self.tx.send_blocking(IconDecodeJob { path, reply });
+    }
+}
+
+fn worker_loop(rx: async_channel::Receiver<IconDecodeJob>) {
+    while let Ok(job) = rx.recv_blocking() {
+        // Decode file-backed icons off the GTK thread to keep animations smooth.
+        let result = decode_icon_file(&job.path);
+        let _ = job.reply.send_blocking(result);
+    }
+}
 
 /// Popup-only GTK state for notification toasts.
 pub struct UiState {
@@ -37,6 +82,8 @@ pub struct UiState {
     popup_order: VecDeque<u32>,
     desktop_icons: DesktopIconIndex,
     icon_cache: HashMap<String, Option<String>>,
+    // FIFO order used to cap icon cache growth.
+    icon_cache_order: VecDeque<String>,
 }
 
 struct PopupEntry {
@@ -65,6 +112,7 @@ impl UiState {
             popup_order: VecDeque::new(),
             desktop_icons: DesktopIconIndex::new(),
             icon_cache: HashMap::new(),
+            icon_cache_order: VecDeque::new(),
         }
     }
 
@@ -405,8 +453,28 @@ impl UiState {
             }
         }
 
-        self.icon_cache.insert(cache_key, resolved.clone());
+        self.cache_icon(cache_key, resolved.clone());
         resolved.and_then(|icon_name| resolve_icon_image(&icon_name, 20))
+    }
+
+    fn cache_icon(&mut self, cache_key: String, resolved: Option<String>) {
+        // Bound the icon cache to avoid unbounded growth in long-running sessions.
+        match self.icon_cache.entry(cache_key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(resolved);
+                return;
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let key = entry.key().clone();
+                entry.insert(resolved);
+                self.icon_cache_order.push_back(key);
+            }
+        }
+        while self.icon_cache_order.len() > ICON_CACHE_MAX_ENTRIES {
+            if let Some(evicted) = self.icon_cache_order.pop_front() {
+                self.icon_cache.remove(&evicted);
+            }
+        }
     }
 
     fn spawn_file_icon(&self, path: PathBuf) -> gtk::Image {
@@ -435,11 +503,8 @@ impl UiState {
             }
         });
 
-        thread::spawn(move || {
-            // Decode on a background thread to keep popup animations smooth.
-            let result = decode_icon_file(&path);
-            let _ = tx.send_blocking(result);
-        });
+        // Decode on a background worker pool to avoid spawning unbounded threads.
+        IconDecodePool::global().submit(path, tx);
 
         widget
     }

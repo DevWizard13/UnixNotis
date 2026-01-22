@@ -3,14 +3,22 @@
 //! Centralizes signal waiting logic used by the daemon runtime.
 
 use tokio::signal;
+use tracing::warn;
 
 pub(super) async fn shutdown_signal() {
     let ctrl_c = signal::ctrl_c();
 
     #[cfg(unix)]
     let terminate = async {
-        if let Ok(mut signal) = signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            signal.recv().await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                warn!(?err, "failed to register SIGTERM handler");
+                // Keep the future pending so startup does not abort on registration failure.
+                std::future::pending::<()>().await;
+            }
         }
     };
 

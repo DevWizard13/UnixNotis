@@ -29,14 +29,20 @@ pub struct Checks {
 
 impl Checks {
     pub fn run() -> Self {
-        let wayland = if env::var("XDG_SESSION_TYPE")
+        let wayland_session = env::var("XDG_SESSION_TYPE")
             .map(|val| val == "wayland")
             .unwrap_or(false)
             || env::var("WAYLAND_DISPLAY")
                 .map(|val| !val.is_empty())
-                .unwrap_or(false)
-        {
+                .unwrap_or(false);
+        let runtime_ok = env::var("XDG_RUNTIME_DIR")
+            .map(|val| !val.is_empty())
+            .unwrap_or(false);
+        // Align preflight with runtime requirements to avoid late install failures.
+        let wayland = if wayland_session && runtime_ok {
             CheckItem::ok("Wayland", "session detected")
+        } else if wayland_session {
+            CheckItem::fail("Wayland", "session missing XDG_RUNTIME_DIR")
         } else {
             CheckItem::fail("Wayland", "session missing")
         };

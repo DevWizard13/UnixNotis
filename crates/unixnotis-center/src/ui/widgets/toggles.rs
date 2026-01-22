@@ -155,7 +155,16 @@ impl ToggleItem {
     }
 
     fn needs_polling(&self) -> bool {
-        self.watch_handle.borrow().is_none()
+        let mut handle = self.watch_handle.borrow_mut();
+        if let Some(watch) = handle.as_ref() {
+            // Drop inactive watches so polling can keep the toggle state in sync.
+            if !watch.is_active() {
+                handle.take();
+                return true;
+            }
+            return false;
+        }
+        true
     }
 
     fn set_watch_active(&self, active: bool) {

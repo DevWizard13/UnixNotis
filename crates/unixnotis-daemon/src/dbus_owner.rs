@@ -16,6 +16,11 @@ pub(super) async fn wait_for_owner_state(
     expect_owner: bool,
     timeout: Duration,
 ) -> Result<bool> {
+    let name_str = name.to_string();
+    let mut stream = dbus_proxy
+        .receive_name_owner_changed_with_args(&[(0, name_str.as_str())])
+        .await?;
+    // Re-check after subscribing to avoid missing a transition between the initial query and stream setup.
     let has_owner = match dbus_proxy.name_has_owner(name.clone()).await {
         Ok(value) => value,
         Err(err) => {
@@ -26,11 +31,6 @@ pub(super) async fn wait_for_owner_state(
     if has_owner == expect_owner {
         return Ok(true);
     }
-
-    let name_str = name.to_string();
-    let mut stream = dbus_proxy
-        .receive_name_owner_changed_with_args(&[(0, name_str.as_str())])
-        .await?;
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
 
