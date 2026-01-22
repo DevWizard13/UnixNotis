@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::{glib, Align};
@@ -19,6 +20,9 @@ pub struct ToggleGrid {
     root: gtk::FlowBox,
     items: Vec<ToggleItem>,
 }
+
+// Staggered delays keep post-action refreshes responsive without continuous polling.
+const TOGGLE_REFRESH_DELAYS_MS: &[u64] = &[0, 50, 100, 200, 400, 800];
 
 struct ToggleItem {
     config: ToggleWidgetConfig,
@@ -130,10 +134,15 @@ impl ToggleItem {
                 let guard = guard_clone.clone();
                 let refresh_gen = refresh_gen_for_toggle.clone();
                 let button = button.clone();
-                glib::timeout_add_local(std::time::Duration::from_millis(160), move || {
-                    refresh_toggle_state(&state_cmd, &button, &guard, &refresh_gen);
-                    glib::ControlFlow::Break
-                });
+                // The button state reflects user intent; the retries reconcile it with reality.
+                let expected = button.is_active();
+                schedule_toggle_refresh_with_retry(
+                    state_cmd,
+                    expected,
+                    button,
+                    guard,
+                    refresh_gen,
+                );
             }
         });
 
@@ -208,39 +217,99 @@ fn refresh_toggle_state(
     refresh_gen: &Arc<AtomicU64>,
 ) {
     let cmd = cmd.to_string();
+    // Generation tokens prevent stale refreshes from overwriting newer state.
     let gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
-    let rx = run_command_capture_status_async(&cmd);
     let button = button.clone();
     let guard = guard.clone();
     let refresh_gen = Arc::clone(refresh_gen);
     glib::MainContext::default().spawn_local(async move {
-        let output = match rx.recv().await {
-            Ok(output) => output,
-            Err(_) => return,
+        let Some(active) = fetch_toggle_state(&cmd, true).await else {
+            return;
         };
         if refresh_gen.load(Ordering::Relaxed) != gen {
             return;
         }
-        let output = match output {
-            Ok(output) => output,
-            Err(err) => {
-                warn!(?cmd, ?err, "toggle state command failed");
-                return;
-            }
-        };
-        let success = output.status.success();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let active = if stdout.trim().is_empty() {
-            success
-        } else {
-            parse_toggle_state(&stdout)
-        };
         if button.is_active() != active {
             guard.set(true);
             button.set_active(active);
             guard.set(false);
         }
     });
+}
+
+fn schedule_toggle_refresh_with_retry(
+    state_cmd: String,
+    expected: bool,
+    button: gtk::ToggleButton,
+    guard: Rc<Cell<bool>>,
+    refresh_gen: Arc<AtomicU64>,
+) {
+    // Bounded retry keeps the UI honest for slow toggles without long-lived polling.
+    let gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
+    // Weak refs prevent the retry task from keeping the widget tree alive.
+    let button_weak = button.downgrade();
+    let guard_weak = Rc::downgrade(&guard);
+    let refresh_gen_weak = Arc::downgrade(&refresh_gen);
+    glib::MainContext::default().spawn_local(async move {
+        for (attempt, delay_ms) in TOGGLE_REFRESH_DELAYS_MS.iter().enumerate() {
+            if *delay_ms > 0 {
+                glib::timeout_future(Duration::from_millis(*delay_ms)).await;
+            }
+            let Some(refresh_gen) = refresh_gen_weak.upgrade() else {
+                return;
+            };
+            if refresh_gen.load(Ordering::Relaxed) != gen {
+                return;
+            }
+            // Limit warnings to the first attempt to avoid log spam during retries.
+            let log_failures = attempt == 0;
+            let Some(active) = fetch_toggle_state(&state_cmd, log_failures).await else {
+                continue;
+            };
+            if refresh_gen.load(Ordering::Relaxed) != gen {
+                return;
+            }
+            let (Some(button), Some(guard)) = (button_weak.upgrade(), guard_weak.upgrade())
+            else {
+                // Stop retries if the UI has been dropped to avoid needless work.
+                return;
+            };
+            if button.is_active() != active {
+                guard.set(true);
+                button.set_active(active);
+                guard.set(false);
+            }
+            if active == expected {
+                return;
+            }
+        }
+    });
+}
+
+async fn fetch_toggle_state(cmd: &str, log_failures: bool) -> Option<bool> {
+    let rx = run_command_capture_status_async(cmd);
+    let output = match rx.recv().await {
+        Ok(output) => output,
+        Err(_) => return None,
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            if log_failures {
+                warn!(?cmd, ?err, "toggle state command failed");
+            }
+            return None;
+        }
+    };
+    let success = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Empty stdout is treated as success/failure status, otherwise parse text.
+    let active = if stdout.trim().is_empty() {
+        success
+    } else {
+        parse_toggle_state(&stdout)
+    };
+    Some(active)
 }
 
 fn parse_toggle_state(output: &str) -> bool {

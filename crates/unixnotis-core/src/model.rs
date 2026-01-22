@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use zbus::zvariant::{Array, OwnedValue, Structure, Type, Value};
 
 /// Notification urgency levels defined by the specification.
@@ -69,6 +70,18 @@ pub struct NotificationImage {
 
 const MAX_IMAGE_BYTES: usize = 1024 * 1024;
 const MAX_IMAGE_DIMENSION: i32 = 512;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn has_ssse3() -> bool {
+    // Cache the CPU feature probe to avoid repeated CPUID checks per image.
+    static HAS_SSSE3: OnceLock<bool> = OnceLock::new();
+    *HAS_SSSE3.get_or_init(|| std::is_x86_feature_detected!("ssse3"))
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn has_ssse3() -> bool {
+    false
+}
 
 /// Full notification record stored by the daemon.
 #[derive(Debug)]
@@ -393,16 +406,7 @@ impl NotificationImage {
         let mut rgba = vec![0u8; output_len];
 
         // SSSE3 path is opt-in per CPU to accelerate RGB->RGBA expansion.
-        let use_simd = {
-            #[cfg(target_arch = "x86_64")]
-            {
-                std::is_x86_feature_detected!("ssse3")
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                false
-            }
-        };
+        let use_simd = has_ssse3();
         for y in 0..height {
             let row_start = y.saturating_mul(rowstride);
             let row_bytes = width.checked_mul(3)?;

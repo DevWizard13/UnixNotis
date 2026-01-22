@@ -216,24 +216,98 @@ fn read_loadavg() -> Option<String> {
     Some(format!("{} {} {}", one, five, fifteen))
 }
 
+fn read_power_supply_value(path: &Path) -> Option<u64> {
+    // Simple helper that trims and parses numeric power_supply values.
+    let contents = fs::read_to_string(path).ok()?;
+    contents.trim().parse::<u64>().ok()
+}
+
 fn read_battery() -> Option<String> {
-    let entries = fs::read_dir("/sys/class/power_supply").ok()?;
+    read_battery_from(Path::new("/sys/class/power_supply"))
+}
+
+fn read_battery_from(root: &Path) -> Option<String> {
+    let entries = fs::read_dir(root).ok()?;
+    let mut energy_now_total = 0u64;
+    let mut energy_full_total = 0u64;
+    let mut charge_now_total = 0u64;
+    let mut charge_full_total = 0u64;
+    let mut energy_count = 0u64;
+    let mut charge_count = 0u64;
+    let mut capacity_sum = 0u64;
+    let mut capacity_count = 0u64;
     for entry in entries.flatten() {
         let path = entry.path();
-        let name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("");
-        if !name.starts_with("BAT") {
+        let device_type = match fs::read_to_string(path.join("type")) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if device_type.trim() != "Battery" {
             continue;
         }
-        let capacity = path.join("capacity");
-        if let Ok(contents) = fs::read_to_string(capacity) {
-            let trimmed = contents.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+        // Skip batteries that report not present to avoid mixing placeholder devices.
+        if let Some(present) = read_power_supply_value(&path.join("present")) {
+            if present == 0 {
+                continue;
             }
         }
+        // Capture capacity regardless of unit family to support mixed-unit fallback.
+        let capacity = read_power_supply_value(&path.join("capacity"));
+        // Prefer energy_* or charge_* pairs so multi-battery systems aggregate correctly.
+        // Capacity alone is a last-resort fallback because it is not weighted by size.
+        if let (Some(now), Some(full)) = (
+            read_power_supply_value(&path.join("energy_now")),
+            read_power_supply_value(&path.join("energy_full")),
+        ) {
+            if full > 0 {
+                energy_now_total = energy_now_total.saturating_add(now);
+                energy_full_total = energy_full_total.saturating_add(full);
+                energy_count = energy_count.saturating_add(1);
+                if let Some(capacity) = capacity {
+                    capacity_sum = capacity_sum.saturating_add(capacity);
+                    capacity_count = capacity_count.saturating_add(1);
+                }
+                continue;
+            }
+        }
+        if let (Some(now), Some(full)) = (
+            read_power_supply_value(&path.join("charge_now")),
+            read_power_supply_value(&path.join("charge_full")),
+        ) {
+            if full > 0 {
+                charge_now_total = charge_now_total.saturating_add(now);
+                charge_full_total = charge_full_total.saturating_add(full);
+                charge_count = charge_count.saturating_add(1);
+                if let Some(capacity) = capacity {
+                    capacity_sum = capacity_sum.saturating_add(capacity);
+                    capacity_count = capacity_count.saturating_add(1);
+                }
+                continue;
+            }
+        }
+        if let Some(capacity) = capacity {
+            capacity_sum = capacity_sum.saturating_add(capacity);
+            capacity_count = capacity_count.saturating_add(1);
+        }
+    }
+    // Do not mix energy and charge units; fall back to capacity if mixed.
+    // If both unit families are present, capacity averaging is the only safe fallback.
+    if energy_full_total > 0 && charge_count == 0 {
+        // Rounded integer percent avoids floating-point drift for repeated reads.
+        let percent = (energy_now_total.saturating_mul(100) + energy_full_total / 2)
+            / energy_full_total;
+        return Some(percent.to_string());
+    }
+    if charge_full_total > 0 && energy_count == 0 {
+        // Charge-based values use the same arithmetic when energy data is absent.
+        let percent = (charge_now_total.saturating_mul(100) + charge_full_total / 2)
+            / charge_full_total;
+        return Some(percent.to_string());
+    }
+    if capacity_count > 0 {
+        // Average capacity is less accurate but avoids returning nothing on minimal systems.
+        let avg = (capacity_sum + capacity_count / 2) / capacity_count;
+        return Some(avg.to_string());
     }
     None
 }
@@ -294,5 +368,137 @@ fn extract_iface(cmd: &str) -> Option<String> {
         None
     } else {
         Some(iface.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_battery_from;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "{}-{}-{}",
+                prefix,
+                std::process::id(),
+                stamp
+            ));
+            fs::create_dir_all(&path).expect("temp dir creation failed");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // Best-effort cleanup to avoid leaving test artifacts on disk.
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_device(root: &Path, name: &str, entries: &[(&str, &str)]) {
+        let device_path = root.join(name);
+        fs::create_dir_all(&device_path).expect("device directory creation failed");
+        for (file, contents) in entries {
+            fs::write(device_path.join(file), contents).expect("device file write failed");
+        }
+    }
+
+    #[test]
+    fn battery_energy_aggregates_weighted() {
+        let temp = TempDir::new("unixnotis-battery-energy");
+        write_device(
+            temp.path(),
+            "BAT0",
+            &[
+                ("type", "Battery"),
+                ("present", "1"),
+                ("energy_now", "30"),
+                ("energy_full", "60"),
+            ],
+        );
+        write_device(
+            temp.path(),
+            "BAT1",
+            &[
+                ("type", "Battery"),
+                ("present", "1"),
+                ("energy_now", "10"),
+                ("energy_full", "40"),
+            ],
+        );
+        let percent = read_battery_from(temp.path()).expect("battery percent missing");
+        assert_eq!(percent, "40");
+    }
+
+    #[test]
+    fn battery_mixed_units_falls_back_to_capacity() {
+        let temp = TempDir::new("unixnotis-battery-mixed");
+        write_device(
+            temp.path(),
+            "BAT0",
+            &[
+                ("type", "Battery"),
+                ("present", "1"),
+                ("energy_now", "30"),
+                ("energy_full", "60"),
+                ("capacity", "80"),
+            ],
+        );
+        write_device(
+            temp.path(),
+            "BAT1",
+            &[
+                ("type", "Battery"),
+                ("present", "1"),
+                ("charge_now", "20"),
+                ("charge_full", "40"),
+                ("capacity", "60"),
+            ],
+        );
+        let percent = read_battery_from(temp.path()).expect("battery percent missing");
+        assert_eq!(percent, "70");
+    }
+
+    #[test]
+    fn battery_skips_not_present_devices() {
+        let temp = TempDir::new("unixnotis-battery-present");
+        write_device(
+            temp.path(),
+            "BAT0",
+            &[
+                ("type", "Battery"),
+                ("present", "0"),
+                ("energy_now", "10"),
+                ("energy_full", "20"),
+                ("capacity", "10"),
+            ],
+        );
+        write_device(
+            temp.path(),
+            "BAT1",
+            &[
+                ("type", "Battery"),
+                ("present", "1"),
+                ("energy_now", "20"),
+                ("energy_full", "40"),
+            ],
+        );
+        let percent = read_battery_from(temp.path()).expect("battery percent missing");
+        assert_eq!(percent, "50");
     }
 }
