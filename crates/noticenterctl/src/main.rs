@@ -154,3 +154,68 @@ fn follow_debug_logs() -> Result<()> {
         Err(anyhow!("journalctl exited with status {}", status))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_open_panel_debug_default() {
+        // Ensures clap default_missing_value maps --debug to the Info level.
+        let args = Args::try_parse_from(["noticenterctl", "open-panel", "--debug"])
+            .expect("parse args");
+        match args.command {
+            Command::OpenPanel { debug } => {
+                assert!(matches!(debug, Some(DebugLevelArg::Info)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_open_panel_debug_value() {
+        // Verifies explicit debug values map to the requested verbosity.
+        let args = Args::try_parse_from([
+            "noticenterctl",
+            "open-panel",
+            "--debug",
+            "verbose",
+        ])
+        .expect("parse args");
+        match args.command {
+            Command::OpenPanel { debug } => {
+                assert!(matches!(debug, Some(DebugLevelArg::Verbose)));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_dnd_toggle() {
+        // Confirms the value enum accepts the toggle state for DND commands.
+        let args = Args::try_parse_from(["noticenterctl", "dnd", "toggle"])
+            .expect("parse args");
+        match args.command {
+            Command::Dnd { state } => {
+                assert!(matches!(state, DndState::Toggle));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_level_arg_into_panel_level() {
+        // Validates CLI debug levels map to the matching control plane enum.
+        let table = [
+            (DebugLevelArg::Critical, PanelDebugLevel::Critical),
+            (DebugLevelArg::Warn, PanelDebugLevel::Warn),
+            (DebugLevelArg::Info, PanelDebugLevel::Info),
+            (DebugLevelArg::Verbose, PanelDebugLevel::Verbose),
+        ];
+        for (arg, expected) in table {
+            let mapped: PanelDebugLevel = arg.into();
+            assert_eq!(mapped, expected);
+        }
+    }
+}
