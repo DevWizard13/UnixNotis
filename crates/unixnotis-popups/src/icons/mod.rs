@@ -247,6 +247,7 @@ pub(super) fn image_data_texture(image: &NotificationImage) -> Option<Texture> {
     )
 }
 
+#[derive(Clone)]
 pub(super) struct RasterIcon {
     pub(super) bytes: Vec<u8>,
     pub(super) width: i32,

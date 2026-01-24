@@ -1,11 +1,11 @@
 //! D-Bus runtime for popup UI events and control updates.
 
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use unixnotis_core::{CloseReason, ControlProxy, ControlState, NotificationView};
 use zbus::{Connection, Result as ZbusResult};
 
@@ -13,6 +13,13 @@ use zbus::{Connection, Result as ZbusResult};
 const BACKOFF_BASE_MS: u64 = 250;
 const BACKOFF_MAX_MS: u64 = 5000;
 const BACKOFF_JITTER_MS: u64 = 120;
+// Retry warnings are rate-limited to avoid noisy logs during long outages.
+const RETRY_WARN_INTERVAL_SECS: u64 = 30;
+// Seed retries tolerate short startup hiccups without blocking indefinitely.
+const SEED_RETRY_BASE_MS: u64 = 250;
+const SEED_RETRY_MAX_MS: u64 = 2000;
+const SEED_RETRY_BUDGET_SECS: u64 = 30;
+const SEED_RETRY_LOG_INTERVAL_SECS: u64 = 10;
 
 struct Backoff {
     base: Duration,
@@ -40,6 +47,61 @@ impl Backoff {
         self.current = (self.current * 2).min(self.max);
         sleep + jitter
     }
+}
+
+// Rate-limited logger used to avoid warning spam during retry loops.
+struct RetryLog {
+    interval: Duration,
+    last_warn: Instant,
+}
+
+impl RetryLog {
+    fn new(interval: Duration) -> Self {
+        let mut log = Self {
+            interval,
+            last_warn: Instant::now(),
+        };
+        log.reset();
+        log
+    }
+
+    fn reset(&mut self) {
+        // Allow the next failure after a success to emit a warning immediately.
+        self.last_warn = Instant::now() - self.interval;
+    }
+
+    fn warn_or_debug<E: std::fmt::Debug>(&mut self, err: &E, message: &str) {
+        if self.last_warn.elapsed() >= self.interval {
+            self.last_warn = Instant::now();
+            warn!(?err, "{message}");
+        } else {
+            debug!(?err, "{message}");
+        }
+    }
+
+    fn warn_or_debug_seed(&mut self, err: &SeedError, message: &str) {
+        if self.last_warn.elapsed() >= self.interval {
+            self.last_warn = Instant::now();
+            warn!(
+                state_error = ?err.state_error,
+                active_error = ?err.active_error,
+                "{message}"
+            );
+        } else {
+            debug!(
+                state_error = ?err.state_error,
+                active_error = ?err.active_error,
+                "{message}"
+            );
+        }
+    }
+}
+
+// Captures seed failures without forcing an immediate reconnect.
+#[derive(Debug)]
+struct SeedError {
+    state_error: Option<String>,
+    active_error: Option<String>,
 }
 
 fn jitter_duration(max_ms: u64) -> Duration {
@@ -91,16 +153,19 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
         runtime.block_on(async move {
             let mut connect_backoff = Backoff::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS);
             let mut subscribe_backoff = Backoff::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS);
+            let mut connect_log = RetryLog::new(Duration::from_secs(RETRY_WARN_INTERVAL_SECS));
+            let mut subscribe_log = RetryLog::new(Duration::from_secs(RETRY_WARN_INTERVAL_SECS));
 
             loop {
                 let connection = loop {
                     match Connection::session().await {
                         Ok(connection) => {
                             connect_backoff.reset();
+                            connect_log.reset();
                             break connection;
                         }
                         Err(err) => {
-                            warn!(?err, "failed to connect to session bus; retrying");
+                            connect_log.warn_or_debug(&err, "failed to connect to session bus; retrying");
                             tokio::time::sleep(connect_backoff.next_sleep()).await;
                         }
                     }
@@ -109,20 +174,21 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                 let proxy = match ControlProxy::new(&connection).await {
                     Ok(proxy) => proxy,
                     Err(err) => {
-                        warn!(?err, "control interface unavailable, retrying");
+                        subscribe_log.warn_or_debug(&err, "control interface unavailable, retrying");
                         drain_offline_commands(&mut command_rx);
                         tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
                 };
                 subscribe_backoff.reset();
+                subscribe_log.reset();
                 info!("connected to unixnotis control interface");
-                seed_state(&proxy, &sender).await;
+                seed_state_with_retry(&proxy, &sender).await;
 
                 let mut added_stream = match proxy.receive_notification_added().await {
                     Ok(stream) => stream,
                     Err(err) => {
-                        warn!(?err, "failed to subscribe to notification_added");
+                        subscribe_log.warn_or_debug(&err, "failed to subscribe to notification_added");
                         tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
@@ -130,7 +196,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                 let mut updated_stream = match proxy.receive_notification_updated().await {
                     Ok(stream) => stream,
                     Err(err) => {
-                        warn!(?err, "failed to subscribe to notification_updated");
+                        subscribe_log.warn_or_debug(&err, "failed to subscribe to notification_updated");
                         tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
@@ -138,7 +204,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                 let mut closed_stream = match proxy.receive_notification_closed().await {
                     Ok(stream) => stream,
                     Err(err) => {
-                        warn!(?err, "failed to subscribe to notification_closed");
+                        subscribe_log.warn_or_debug(&err, "failed to subscribe to notification_closed");
                         tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
@@ -146,7 +212,7 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
                 let mut state_stream = match proxy.receive_state_changed().await {
                     Ok(stream) => stream,
                     Err(err) => {
-                        warn!(?err, "failed to subscribe to state_changed");
+                        subscribe_log.warn_or_debug(&err, "failed to subscribe to state_changed");
                         tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                         continue;
                     }
@@ -223,22 +289,47 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> UnboundedSe
     command_tx
 }
 
-async fn seed_state(proxy: &ControlProxy<'_>, sender: &async_channel::Sender<UiEvent>) {
+async fn seed_state_with_retry(proxy: &ControlProxy<'_>, sender: &async_channel::Sender<UiEvent>) {
+    // Seed retries are bounded to keep startup responsive while tolerating transient failures.
+    let mut backoff = Backoff::new(SEED_RETRY_BASE_MS, SEED_RETRY_MAX_MS);
+    let deadline = Instant::now() + Duration::from_secs(SEED_RETRY_BUDGET_SECS);
+    let mut log = RetryLog::new(Duration::from_secs(SEED_RETRY_LOG_INTERVAL_SECS));
+
+    loop {
+        match seed_state(proxy, sender).await {
+            Ok(()) => return,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    warn!(
+                        state_error = ?err.state_error,
+                        active_error = ?err.active_error,
+                        "failed to seed popup state; giving up until reconnect"
+                    );
+                    return;
+                }
+                log.warn_or_debug_seed(&err, "failed to seed popup state; retrying");
+                tokio::time::sleep(backoff.next_sleep()).await;
+            }
+        }
+    }
+}
+
+async fn seed_state(
+    proxy: &ControlProxy<'_>,
+    sender: &async_channel::Sender<UiEvent>,
+) -> Result<(), SeedError> {
     let state = proxy.get_state().await;
     let active = proxy.list_active().await;
 
     match (state, active) {
         (Ok(state), Ok(active)) => {
             let _ = sender.send(UiEvent::Seed { state, active }).await;
+            Ok(())
         }
-        (state, active) => {
-            if let Err(err) = state {
-                warn!(?err, "failed to fetch popup state");
-            }
-            if let Err(err) = active {
-                warn!(?err, "failed to fetch active notifications for popups");
-            }
-        }
+        (state, active) => Err(SeedError {
+            state_error: state.err().map(|err| err.to_string()),
+            active_error: active.err().map(|err| err.to_string()),
+        }),
     }
 }
 
