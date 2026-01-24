@@ -59,14 +59,12 @@ fn build_snapshot(cache: &HashMap<String, MediaInfo>) -> Vec<MediaInfo> {
         .cloned()
         .collect();
     let original_len = infos.len();
-    infos.sort_by(|left, right| {
-        let left_rank = playback_rank(&left.playback_status);
-        let right_rank = playback_rank(&right.playback_status);
-        left_rank.cmp(&right_rank).then_with(|| {
-            left.identity
-                .to_lowercase()
-                .cmp(&right.identity.to_lowercase())
-        })
+    // Cache sort keys to avoid repeated lowercasing in the comparator.
+    infos.sort_by_cached_key(|info| {
+        (
+            playback_rank(&info.playback_status),
+            info.identity.to_lowercase(),
+        )
     });
     let deduped = dedupe_players(infos);
     if deduped.len() != original_len {
@@ -186,4 +184,85 @@ fn normalize_token(value: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::MediaInfo;
+
+    fn make_info(
+        bus_name: &str,
+        identity: &str,
+        playback_status: &str,
+        art_uri: Option<&str>,
+    ) -> MediaInfo {
+        MediaInfo {
+            bus_name: bus_name.to_string(),
+            identity: identity.to_string(),
+            title: "title".to_string(),
+            artist: "artist".to_string(),
+            playback_status: playback_status.to_string(),
+            art_uri: art_uri.map(|uri| uri.to_string()),
+            can_play: true,
+            can_pause: true,
+            can_next: true,
+            can_prev: true,
+        }
+    }
+
+    #[test]
+    fn build_snapshot_sorts_by_status_then_identity() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "org.mpris.MediaPlayer2.b".to_string(),
+            make_info("org.mpris.MediaPlayer2.b", "Zeta", "Paused", None),
+        );
+        cache.insert(
+            "org.mpris.MediaPlayer2.a".to_string(),
+            make_info("org.mpris.MediaPlayer2.a", "Alpha", "Playing", None),
+        );
+        cache.insert(
+            "org.mpris.MediaPlayer2.c".to_string(),
+            make_info("org.mpris.MediaPlayer2.c", "Beta", "Playing", None),
+        );
+
+        let snapshot = build_snapshot(&cache);
+        let identities: Vec<_> = snapshot.iter().map(|info| info.identity.as_str()).collect();
+        assert_eq!(identities, vec!["Alpha", "Beta", "Zeta"]);
+    }
+
+    #[test]
+    fn build_snapshot_dedupes_browser_family_by_score() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "org.mpris.MediaPlayer2.firefox".to_string(),
+            make_info(
+                "org.mpris.MediaPlayer2.firefox",
+                "Firefox",
+                "Paused",
+                Some("art://paused"),
+            ),
+        );
+        cache.insert(
+            "org.mpris.MediaPlayer2.firefox.instance".to_string(),
+            make_info(
+                "org.mpris.MediaPlayer2.firefox.instance",
+                "Firefox",
+                "Playing",
+                None,
+            ),
+        );
+
+        let snapshot = build_snapshot(&cache);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].playback_status, "Playing");
+    }
+
+    #[test]
+    fn normalize_token_compacts_and_lowercases() {
+        let token = normalize_token("  Foo--Bar\tBaz  ");
+        // Hyphens are treated as punctuation; only whitespace yields word boundaries.
+        assert_eq!(token, "foobar baz");
+    }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_channel::TryRecvError;
+use async_channel::{TryRecvError, TrySendError};
 use gtk::glib;
 use tracing::warn;
 use unixnotis_core::util;
@@ -96,7 +96,8 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
         }
     };
 
-    let (tx, rx) = async_channel::unbounded::<()>();
+    // Single-slot channel coalesces bursts from noisy watch commands.
+    let (tx, rx) = async_channel::bounded::<()>(1);
     let on_event = Rc::new(on_event);
     let debounce = Duration::from_millis(120);
     let active = Arc::new(AtomicBool::new(true));
@@ -137,8 +138,10 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
                     continue;
                 }
                 events += 1;
-                if tx.send_blocking(()).is_err() {
-                    break;
+                match tx.try_send(()) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {}
+                    Err(TrySendError::Closed(_)) => break,
                 }
             }
             active.store(false, Ordering::Release);
@@ -168,7 +171,36 @@ fn should_emit_watch_event(cmd: &str, line: &str) -> bool {
     // pactl subscribe emits events for all server activity; filter to sink/server changes.
     if cmd.trim().starts_with("pactl subscribe") {
         let line = line.to_ascii_lowercase();
-        return line.contains(" on sink ") || line.contains(" on server ");
+        return contains_token(&line, " on sink")
+            || contains_token(&line, " on server");
     }
     true
+}
+
+fn contains_token(line: &str, token: &str) -> bool {
+    // Ensure the token is followed by whitespace or end-of-line to avoid matching "sink-input".
+    let Some(index) = line.find(token) else {
+        return false;
+    };
+    let tail = &line[index + token.len()..];
+    tail.is_empty() || tail.starts_with(char::is_whitespace)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_emit_watch_event;
+
+    #[test]
+    fn pactl_watch_filters_to_sink_and_server() {
+        let cmd = "pactl subscribe";
+        assert!(should_emit_watch_event(cmd, "Event 'change' on sink #1"));
+        assert!(should_emit_watch_event(cmd, "Event 'new' on server"));
+        assert!(!should_emit_watch_event(cmd, "Event 'change' on source #2"));
+        assert!(!should_emit_watch_event(cmd, "Event 'change' on sink-input #3"));
+    }
+
+    #[test]
+    fn non_pactl_commands_always_emit() {
+        assert!(should_emit_watch_event("echo test", "anything"));
+    }
 }

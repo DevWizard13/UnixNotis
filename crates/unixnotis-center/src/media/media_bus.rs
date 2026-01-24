@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use futures_util::StreamExt;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tracing::warn;
 use unixnotis_core::{MediaConfig, PanelDebugLevel};
 use zbus::fdo::{DBusProxy, PropertiesProxy};
@@ -26,7 +26,7 @@ pub(super) async fn refresh_players(
     connection: &Connection,
     dbus_proxy: &DBusProxy<'_>,
     config: &MediaConfig,
-    signal_tx: &UnboundedSender<MediaSignal>,
+    signal_tx: &Sender<MediaSignal>,
     players: &mut HashMap<String, PlayerState>,
 ) -> zbus::Result<()> {
     let names = dbus_proxy.list_names().await?;
@@ -79,7 +79,7 @@ pub(super) async fn refresh_players(
 pub(super) fn spawn_properties_listener(
     properties: PropertiesProxy<'static>,
     bus_name: String,
-    signal_tx: UnboundedSender<MediaSignal>,
+    signal_tx: Sender<MediaSignal>,
 ) {
     tokio::spawn(async move {
         let mut stream = match properties.receive_properties_changed().await {
@@ -102,7 +102,13 @@ pub(super) fn spawn_properties_listener(
             debug::log(PanelDebugLevel::Verbose, || {
                 format!("media properties changed: {bus_name}")
             });
-            let _ = signal_tx.send(MediaSignal::PropertiesChanged(bus_name.clone()));
+            if signal_tx
+                .send(MediaSignal::PropertiesChanged(bus_name.clone()))
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     });
 }
@@ -233,7 +239,8 @@ pub(super) fn is_allowed_player(name: &str, config: &MediaConfig) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_allowed_player;
+    use super::{is_allowed_player, is_relevant_media_change};
+    use std::collections::HashMap;
     use unixnotis_core::MediaConfig;
 
     #[test]
@@ -262,5 +269,34 @@ mod tests {
             "org.mpris.MediaPlayer2.firefox",
             &config
         ));
+    }
+
+    #[test]
+    fn relevant_media_change_detects_updates() {
+        let mut changed = HashMap::new();
+        changed.insert(
+            "Metadata",
+            zbus::zvariant::Value::from("track"),
+        );
+        let invalidated: [&str; 0] = [];
+
+        assert!(is_relevant_media_change(&changed, &invalidated));
+    }
+
+    #[test]
+    fn relevant_media_change_detects_invalidations() {
+        let changed: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+        let invalidated = ["CanPlay"];
+
+        assert!(is_relevant_media_change(&changed, &invalidated));
+    }
+
+    #[test]
+    fn relevant_media_change_ignores_unrelated_updates() {
+        let mut changed = HashMap::new();
+        changed.insert("Volume", zbus::zvariant::Value::from(0.5_f64));
+        let invalidated = ["Position"];
+
+        assert!(!is_relevant_media_change(&changed, &invalidated));
     }
 }

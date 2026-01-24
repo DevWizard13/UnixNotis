@@ -6,7 +6,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use async_channel::Sender;
+use async_channel::{Sender, TrySendError};
 use gtk::prelude::*;
 use gtk::{self, Align};
 use tokio::sync::mpsc::UnboundedSender;
@@ -140,16 +140,22 @@ impl RowWidgets {
             if group.is_empty() {
                 return;
             }
-            // Non-blocking send: the event channel is unbounded, so failure implies shutdown.
-            if event_tx_clone
-                .try_send(UiEvent::GroupToggled(group.to_string()))
-                .is_err()
-            {
-                let snippet = util::log_snippet(&group);
-                debug!(
-                    group = %snippet,
-                    "group toggle dropped because event channel closed (likely shutdown)"
-                );
+            // UI actions are high-priority; if the bounded queue is full, enqueue asynchronously.
+            match event_tx_clone.try_send(UiEvent::GroupToggled(group.to_string())) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    let event_tx = event_tx_clone.clone();
+                    gtk::glib::MainContext::default().spawn_local(async move {
+                        let _ = event_tx.send(event).await;
+                    });
+                }
+                Err(TrySendError::Closed(_)) => {
+                    let snippet = util::log_snippet(&group);
+                    debug!(
+                        group = %snippet,
+                        "group toggle dropped because event channel closed (likely shutdown)"
+                    );
+                }
             }
         });
 

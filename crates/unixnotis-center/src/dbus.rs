@@ -1,16 +1,126 @@
 //! D-Bus runtime for center UI events and control commands.
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use unixnotis_core::{
     CloseReason, ControlProxy, ControlState, Margins, NotificationView, PanelDebugLevel,
     PanelRequest,
 };
 use zbus::{Connection, Result as ZbusResult};
+
+// Backoff settings throttle reconnect attempts while keeping recovery responsive.
+const BACKOFF_BASE_MS: u64 = 250;
+const BACKOFF_MAX_MS: u64 = 5000;
+const BACKOFF_JITTER_MS: u64 = 120;
+// Retry warnings are rate-limited to avoid noisy logs during long outages.
+const RETRY_WARN_INTERVAL_SECS: u64 = 30;
+// Seed retries tolerate short startup hiccups without blocking indefinitely.
+const SEED_RETRY_BASE_MS: u64 = 250;
+const SEED_RETRY_MAX_MS: u64 = 2000;
+const SEED_RETRY_BUDGET_SECS: u64 = 30;
+const SEED_RETRY_LOG_INTERVAL_SECS: u64 = 10;
+
+struct Backoff {
+    base: Duration,
+    current: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(base_ms: u64, max_ms: u64) -> Self {
+        let base = Duration::from_millis(base_ms);
+        Self {
+            base,
+            current: base,
+            max: Duration::from_millis(max_ms),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current = self.base;
+    }
+
+    fn next_sleep(&mut self) -> Duration {
+        let jitter = jitter_duration(BACKOFF_JITTER_MS);
+        let sleep = self.current;
+        self.current = (self.current * 2).min(self.max);
+        sleep + jitter
+    }
+}
+
+fn jitter_duration(max_ms: u64) -> Duration {
+    if max_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    let jitter_ms = (nanos % (max_ms * 1_000_000)) / 1_000_000;
+    Duration::from_millis(jitter_ms)
+}
+
+// Rate-limited logger used to avoid warning spam during retry loops.
+struct RetryLog {
+    interval: Duration,
+    last_warn: Instant,
+}
+
+impl RetryLog {
+    fn new(interval: Duration) -> Self {
+        let mut log = Self {
+            interval,
+            last_warn: Instant::now(),
+        };
+        log.reset();
+        log
+    }
+
+    fn reset(&mut self) {
+        // Allow the next failure after a success to emit a warning immediately.
+        self.last_warn = Instant::now() - self.interval;
+    }
+
+    fn warn_or_debug<E: std::fmt::Debug>(&mut self, err: &E, message: &str) {
+        if self.last_warn.elapsed() >= self.interval {
+            self.last_warn = Instant::now();
+            warn!(?err, "{message}");
+        } else {
+            debug!(?err, "{message}");
+        }
+    }
+
+    fn warn_or_debug_seed(&mut self, err: &SeedError, message: &str) {
+        if self.last_warn.elapsed() >= self.interval {
+            self.last_warn = Instant::now();
+            warn!(
+                state_error = ?err.state_error,
+                active_error = ?err.active_error,
+                history_error = ?err.history_error,
+                "{message}"
+            );
+        } else {
+            debug!(
+                state_error = ?err.state_error,
+                active_error = ?err.active_error,
+                history_error = ?err.history_error,
+                "{message}"
+            );
+        }
+    }
+}
+
+// Captures seed failures without forcing an immediate reconnect.
+#[derive(Debug)]
+struct SeedError {
+    state_error: Option<String>,
+    active_error: Option<String>,
+    history_error: Option<String>,
+}
 
 use crate::debug;
 use crate::media::MediaInfo;
@@ -68,61 +178,69 @@ async fn run_dbus_loop(
 ) {
     // Buffer UI actions during reconnect to avoid losing user intent.
     let mut offline_commands: VecDeque<UiCommand> = VecDeque::new();
+    let mut connect_backoff = Backoff::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS);
+    let mut subscribe_backoff = Backoff::new(BACKOFF_BASE_MS, BACKOFF_MAX_MS);
+    let mut connect_log = RetryLog::new(Duration::from_secs(RETRY_WARN_INTERVAL_SECS));
+    let mut subscribe_log = RetryLog::new(Duration::from_secs(RETRY_WARN_INTERVAL_SECS));
 
     loop {
         let proxy = match ControlProxy::new(&connection).await {
             Ok(proxy) => proxy,
             Err(err) => {
-                warn!(?err, "control interface unavailable, retrying");
+                connect_log.warn_or_debug(&err, "control interface unavailable, retrying");
                 stash_offline_commands(&mut command_rx, &mut offline_commands);
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(connect_backoff.next_sleep()).await;
                 continue;
             }
         };
+        connect_backoff.reset();
+        connect_log.reset();
         info!("connected to unixnotis control interface");
-        seed_state(&proxy, &sender).await;
+        seed_state_with_retry(&proxy, &sender).await;
         flush_offline_commands(&proxy, &sender, &mut offline_commands).await;
 
         let mut added_stream = match proxy.receive_notification_added().await {
             Ok(stream) => stream,
             Err(err) => {
-                warn!(?err, "failed to subscribe to notification_added");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                subscribe_log.warn_or_debug(&err, "failed to subscribe to notification_added");
+                tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                 continue;
             }
         };
         let mut updated_stream = match proxy.receive_notification_updated().await {
             Ok(stream) => stream,
             Err(err) => {
-                warn!(?err, "failed to subscribe to notification_updated");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                subscribe_log.warn_or_debug(&err, "failed to subscribe to notification_updated");
+                tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                 continue;
             }
         };
         let mut closed_stream = match proxy.receive_notification_closed().await {
             Ok(stream) => stream,
             Err(err) => {
-                warn!(?err, "failed to subscribe to notification_closed");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                subscribe_log.warn_or_debug(&err, "failed to subscribe to notification_closed");
+                tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                 continue;
             }
         };
         let mut state_stream = match proxy.receive_state_changed().await {
             Ok(stream) => stream,
             Err(err) => {
-                warn!(?err, "failed to subscribe to state_changed");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                subscribe_log.warn_or_debug(&err, "failed to subscribe to state_changed");
+                tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                 continue;
             }
         };
         let mut panel_stream = match proxy.receive_panel_requested().await {
             Ok(stream) => stream,
             Err(err) => {
-                warn!(?err, "failed to subscribe to panel_requested");
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                subscribe_log.warn_or_debug(&err, "failed to subscribe to panel_requested");
+                tokio::time::sleep(subscribe_backoff.next_sleep()).await;
                 continue;
             }
         };
+        subscribe_backoff.reset();
+        subscribe_log.reset();
 
         loop {
             tokio::select! {
@@ -197,23 +315,60 @@ async fn run_dbus_loop(
             }
         }
         stash_offline_commands(&mut command_rx, &mut offline_commands);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        tokio::time::sleep(subscribe_backoff.next_sleep()).await;
     }
 }
 
-async fn seed_state(proxy: &ControlProxy<'_>, sender: &async_channel::Sender<UiEvent>) {
+async fn seed_state_with_retry(proxy: &ControlProxy<'_>, sender: &async_channel::Sender<UiEvent>) {
+    // Seed retries are bounded to keep startup responsive while tolerating transient failures.
+    let mut backoff = Backoff::new(SEED_RETRY_BASE_MS, SEED_RETRY_MAX_MS);
+    let deadline = Instant::now() + Duration::from_secs(SEED_RETRY_BUDGET_SECS);
+    let mut log = RetryLog::new(Duration::from_secs(SEED_RETRY_LOG_INTERVAL_SECS));
+
+    loop {
+        match seed_state(proxy, sender).await {
+            Ok(()) => return,
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    warn!(
+                        state_error = ?err.state_error,
+                        active_error = ?err.active_error,
+                        history_error = ?err.history_error,
+                        "failed to seed center state; giving up until reconnect"
+                    );
+                    return;
+                }
+                log.warn_or_debug_seed(&err, "failed to seed center state; retrying");
+                tokio::time::sleep(backoff.next_sleep()).await;
+            }
+        }
+    }
+}
+
+async fn seed_state(
+    proxy: &ControlProxy<'_>,
+    sender: &async_channel::Sender<UiEvent>,
+) -> Result<(), SeedError> {
     let state = proxy.get_state().await;
     let active = proxy.list_active().await;
     let history = proxy.list_history().await;
 
-    if let (Ok(state), Ok(active), Ok(history)) = (state, active, history) {
-        let _ = sender
-            .send(UiEvent::Seed {
-                state,
-                active,
-                history,
-            })
-            .await;
+    match (state, active, history) {
+        (Ok(state), Ok(active), Ok(history)) => {
+            let _ = sender
+                .send(UiEvent::Seed {
+                    state,
+                    active,
+                    history,
+                })
+                .await;
+            Ok(())
+        }
+        (state, active, history) => Err(SeedError {
+            state_error: state.err().map(|err| err.to_string()),
+            active_error: active.err().map(|err| err.to_string()),
+            history_error: history.err().map(|err| err.to_string()),
+        }),
     }
 }
 
@@ -227,7 +382,14 @@ async fn handle_command(
         UiCommand::InvokeAction { id, action_key } => proxy.invoke_action(id, &action_key).await,
         UiCommand::ClearAll => {
             proxy.clear_all().await?;
-            seed_state(proxy, sender).await;
+            if let Err(err) = seed_state(proxy, sender).await {
+                warn!(
+                    state_error = ?err.state_error,
+                    active_error = ?err.active_error,
+                    history_error = ?err.history_error,
+                    "failed to refresh center state after clear"
+                );
+            }
             Ok(())
         }
         UiCommand::SetDnd(enabled) => proxy.set_dnd(enabled).await,
@@ -275,5 +437,40 @@ async fn flush_offline_commands(
         if let Err(err) = handle_command(proxy, sender, command).await {
             warn!(?err, "buffered control command failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_resets_to_base() {
+        let mut backoff = Backoff::new(10, 40);
+        let first = backoff.next_sleep();
+        assert!(first >= Duration::from_millis(10));
+
+        backoff.next_sleep();
+        backoff.next_sleep();
+        backoff.reset();
+
+        let reset_sleep = backoff.next_sleep();
+        let max = Duration::from_millis(10 + BACKOFF_JITTER_MS);
+        assert!(reset_sleep <= max);
+    }
+
+    #[test]
+    fn backoff_caps_at_max_with_jitter() {
+        let mut backoff = Backoff::new(10, 40);
+        for _ in 0..10 {
+            let sleep = backoff.next_sleep();
+            let max = Duration::from_millis(40 + BACKOFF_JITTER_MS);
+            assert!(sleep <= max);
+        }
+    }
+
+    #[test]
+    fn jitter_zero_returns_zero() {
+        assert_eq!(jitter_duration(0), Duration::from_millis(0));
     }
 }

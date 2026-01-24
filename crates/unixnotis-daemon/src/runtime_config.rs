@@ -69,6 +69,7 @@ fn detect_wayland_display() -> Option<String> {
         }
     }
 
+    // Fallback scan: prefer wayland-0 when WAYLAND_DISPLAY is unset, otherwise accept any socket.
     let runtime_dir = env::var("XDG_RUNTIME_DIR").ok()?;
     let entries = fs::read_dir(&runtime_dir).ok()?;
     let mut fallback = None;

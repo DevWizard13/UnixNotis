@@ -5,24 +5,24 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use super::{MediaInfo, MediaSignal};
 
 pub(super) fn schedule_delayed_refresh(
-    signal_tx: UnboundedSender<MediaSignal>,
+    signal_tx: Sender<MediaSignal>,
     bus_name: String,
     delay: Duration,
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(delay).await;
-        let _ = signal_tx.send(MediaSignal::PropertiesChanged(bus_name));
+        let _ = signal_tx.send(MediaSignal::PropertiesChanged(bus_name)).await;
     });
 }
 
 pub(super) fn schedule_metadata_fallback(
     cache: &HashMap<String, MediaInfo>,
-    signal_tx: UnboundedSender<MediaSignal>,
+    signal_tx: Sender<MediaSignal>,
     bus_name: &str,
 ) {
     let Some(info) = cache.get(bus_name) else {
@@ -46,7 +46,7 @@ pub(super) fn schedule_metadata_fallback(
 
 pub(super) fn schedule_metadata_fallbacks(
     cache: &HashMap<String, MediaInfo>,
-    signal_tx: UnboundedSender<MediaSignal>,
+    signal_tx: Sender<MediaSignal>,
 ) {
     for (bus_name, info) in cache {
         if info.playback_status == "Playing" && info.title.is_empty() {

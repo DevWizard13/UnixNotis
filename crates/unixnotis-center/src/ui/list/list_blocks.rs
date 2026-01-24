@@ -39,6 +39,7 @@ impl NotificationList {
         items.push(header.clone());
         keys.push(RowKey::GroupHeader { group: key.clone() });
 
+        // Collapsed groups render the first notification plus up to two ghosts to hint stack depth.
         let stacked = !expanded && ids.len() > 1;
         for (index, id) in ids.iter().enumerate() {
             if !expanded && index > 0 {
@@ -141,6 +142,7 @@ impl NotificationList {
 }
 
 pub(super) fn common_prefix_suffix(current: &[RowKey], next: &[RowKey]) -> (usize, usize) {
+    // Compute shared prefix/suffix so list-store splices only touch the minimal changed window.
     let mut prefix = 0;
     let min_len = current.len().min(next.len());
     while prefix < min_len && current[prefix] == next[prefix] {

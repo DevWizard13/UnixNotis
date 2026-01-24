@@ -35,7 +35,8 @@ pub struct IconResolver {
 
 impl IconResolver {
     pub fn new() -> Self {
-        let (update_tx, update_rx) = async_channel::unbounded::<IconUpdate>();
+        // Bound update queue to avoid unbounded memory growth if UI stalls.
+        let (update_tx, update_rx) = async_channel::bounded::<IconUpdate>(ICON_UPDATE_QUEUE_CAPACITY);
         let worker = IconWorker::new(update_tx);
         let inner = Rc::new(IconResolverInner {
             desktop_index: DesktopIconIndex::new(),
@@ -72,6 +73,9 @@ struct IconResolverInner {
     missing_names: RefCell<MissingIconCache>,
     worker: IconWorker,
 }
+
+// Update queue capacity keeps bursts buffered without unbounded growth.
+const ICON_UPDATE_QUEUE_CAPACITY: usize = 256;
 
 impl IconResolverInner {
     fn apply_icon(
@@ -232,12 +236,20 @@ impl IconResolverInner {
             return;
         }
         inflight.insert(request.key.clone(), vec![image.downgrade()]);
-        self.worker.submit_decode(
+        // Release the inflight borrow before handling synchronous errors.
+        drop(inflight);
+        if let Err(err) = self.worker.submit_decode(
             request.key.clone(),
             request.path.clone(),
             request.size,
             request.scale,
-        );
+        ) {
+            // Keep the inflight map consistent by issuing an immediate failure update.
+            self.handle_update(IconUpdate {
+                key: request.key.clone(),
+                result: IconResult::Failed(err.reason().to_string()),
+            });
+        }
     }
 
     fn handle_update(&self, update: IconUpdate) {

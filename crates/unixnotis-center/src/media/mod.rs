@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc;
 use tracing::warn;
 use unixnotis_core::MediaConfig;
 use zbus::fdo::DBusProxy;
@@ -63,37 +63,47 @@ enum MediaSignal {
 
 #[derive(Clone)]
 pub struct MediaHandle {
-    command_tx: Option<UnboundedSender<MediaCommand>>,
+    command_tx: Option<mpsc::Sender<MediaCommand>>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl MediaHandle {
     pub fn refresh(&self) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send(MediaCommand::Refresh);
-        }
+        self.send_command(MediaCommand::Refresh);
     }
 
     pub fn play_pause(&self, bus_name: &str) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send(MediaCommand::PlayPause {
-                bus_name: bus_name.to_string(),
-            });
-        }
+        self.send_command(MediaCommand::PlayPause {
+            bus_name: bus_name.to_string(),
+        });
     }
 
     pub fn next(&self, bus_name: &str) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send(MediaCommand::Next {
-                bus_name: bus_name.to_string(),
-            });
-        }
+        self.send_command(MediaCommand::Next {
+            bus_name: bus_name.to_string(),
+        });
     }
 
     pub fn previous(&self, bus_name: &str) {
-        if let Some(tx) = &self.command_tx {
-            let _ = tx.send(MediaCommand::Previous {
-                bus_name: bus_name.to_string(),
-            });
+        self.send_command(MediaCommand::Previous {
+            bus_name: bus_name.to_string(),
+        });
+    }
+
+    fn send_command(&self, command: MediaCommand) {
+        let Some(tx) = &self.command_tx else {
+            return;
+        };
+        match tx.try_send(command) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(command)) => {
+                let tx = tx.clone();
+                let runtime = self.runtime.clone();
+                runtime.spawn(async move {
+                    let _ = tx.send(command).await;
+                });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 }
@@ -121,7 +131,10 @@ pub fn start_media_task(
         .map(|entry| entry.to_lowercase())
         .collect();
 
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    const MEDIA_COMMAND_CAPACITY: usize = 32;
+    const MEDIA_SIGNAL_CAPACITY: usize = 256;
+
+    let (command_tx, mut command_rx) = mpsc::channel(MEDIA_COMMAND_CAPACITY);
     runtime.spawn(async move {
         let dbus_proxy = match DBusProxy::new(&connection).await {
             Ok(proxy) => proxy,
@@ -140,7 +153,7 @@ pub fn start_media_task(
         };
 
         // Dedicated signal channel keeps property updates out of the UI thread.
-        let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<MediaSignal>();
+        let (signal_tx, mut signal_rx) = mpsc::channel::<MediaSignal>(MEDIA_SIGNAL_CAPACITY);
         let mut players: HashMap<String, PlayerState> = HashMap::new();
         let mut cache: HashMap<String, MediaInfo> = HashMap::new();
         let mut refresh = true;
@@ -227,6 +240,7 @@ pub fn start_media_task(
 
     Some(MediaHandle {
         command_tx: Some(command_tx),
+        runtime: runtime.clone(),
     })
 }
 
@@ -236,7 +250,7 @@ async fn apply_owner_change(
     new_owner: Option<&str>,
     connection: &Connection,
     config: &MediaConfig,
-    signal_tx: &UnboundedSender<MediaSignal>,
+    signal_tx: &mpsc::Sender<MediaSignal>,
     players: &mut HashMap<String, PlayerState>,
     cache: &mut HashMap<String, MediaInfo>,
     sender: &async_channel::Sender<UiEvent>,

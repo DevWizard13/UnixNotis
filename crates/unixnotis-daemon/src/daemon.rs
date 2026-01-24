@@ -186,7 +186,9 @@ impl NotificationServer {
             store.set_expiration(outcome.notification.id, expiration);
             (outcome, expiration)
         };
-        self.scheduler.schedule(outcome.notification.id, expiration);
+        self.scheduler
+            .schedule(outcome.notification.id, expiration)
+            .await;
         // Sound playback is driven by hints plus configured defaults.
         self.state
             .sound
@@ -458,6 +460,7 @@ fn build_notification(
 fn parse_actions(raw: Vec<String>) -> Vec<Action> {
     let mut actions = Vec::new();
     let mut iter = raw.into_iter();
+    // D-Bus actions arrive as [key, label] pairs; drop any trailing key without a label.
     while let Some(key) = iter.next() {
         if let Some(label) = iter.next() {
             actions.push(Action { key, label });

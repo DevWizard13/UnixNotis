@@ -42,7 +42,8 @@ struct IconDecodeJob {
     path: PathBuf,
 }
 
-type IconDecodeResult = Result<RasterIcon, String>;
+// Arc shares decoded bytes across waiters without cloning large buffers.
+type IconDecodeResult = Result<Arc<RasterIcon>, String>;
 type IconReply = async_channel::Sender<IconDecodeResult>;
 type IconWaiters = Arc<Mutex<HashMap<PathBuf, Vec<IconReply>>>>;
 
@@ -168,7 +169,7 @@ fn worker_loop(
 ) {
     while let Ok(job) = rx.recv_blocking() {
         // Decode file-backed icons off the GTK thread to keep animations smooth.
-        let result = decode_icon_file(&job.path);
+        let result = decode_icon_file(&job.path).map(Arc::new);
         let waiters = {
             let mut in_flight = match in_flight.lock() {
                 Ok(guard) => guard,
@@ -543,13 +544,14 @@ impl UiState {
         }
 
         let candidates = collect_icon_candidates(notification);
-        let mut resolved = None;
+        // Keep the first successful resolve to avoid duplicate theme lookups and widget creation.
+        let mut resolved: Option<(String, gtk::Image)> = None;
 
         for candidate in &candidates {
             if let Some(icon_names) = self.desktop_icons.icons_for(candidate) {
                 for icon_name in icon_names {
-                    if resolve_icon_image(icon_name.as_str(), 20).is_some() {
-                        resolved = Some(icon_name.clone());
+                    if let Some(widget) = resolve_icon_image(icon_name.as_str(), 20) {
+                        resolved = Some((icon_name.clone(), widget));
                         break;
                     }
                 }
@@ -561,15 +563,23 @@ impl UiState {
 
         if resolved.is_none() {
             for candidate in &candidates {
-                if resolve_icon_image(candidate, 20).is_some() {
-                    resolved = Some(candidate.clone());
+                if let Some(widget) = resolve_icon_image(candidate, 20) {
+                    resolved = Some((candidate.clone(), widget));
                     break;
                 }
             }
         }
 
-        self.cache_icon(cache_key, resolved.clone());
-        resolved.and_then(|icon_name| resolve_icon_image(&icon_name, 20))
+        match resolved {
+            Some((icon_name, widget)) => {
+                self.cache_icon(cache_key, Some(icon_name));
+                Some(widget)
+            }
+            None => {
+                self.cache_icon(cache_key, None);
+                None
+            }
+        }
     }
 
     fn cache_icon(&mut self, cache_key: String, resolved: Option<String>) {
@@ -594,7 +604,7 @@ impl UiState {
 
     fn spawn_file_icon(&self, path: PathBuf) -> gtk::Image {
         let widget = gtk::Image::new();
-        let (tx, rx) = async_channel::bounded::<Result<RasterIcon, String>>(1);
+        let (tx, rx) = async_channel::bounded::<IconDecodeResult>(1);
         let widget_clone = widget.clone();
         // Apply the texture on the main loop to avoid GTK thread violations.
         glib::MainContext::default().spawn_local(async move {

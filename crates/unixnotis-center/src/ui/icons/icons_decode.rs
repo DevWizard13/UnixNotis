@@ -19,14 +19,47 @@ use super::icons_cache::IconKey;
 // Prevent unbounded reads from untrusted icon paths.
 const MAX_ICON_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ICON_DIMENSION: u32 = 2048;
+const ICON_DECODE_QUEUE_CAPACITY: usize = 128;
+
+enum IconDecodeDropPolicy {
+    DropNewest,
+}
+
+// Bound decode queue growth to protect against bursts of unique icon paths.
+const ICON_DECODE_DROP_POLICY: IconDecodeDropPolicy = IconDecodeDropPolicy::DropNewest;
 
 pub(super) struct IconWorker {
     sender: channel::Sender<IconJob>,
+    // Test-only guard keeps the update channel open when no workers are spawned.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    update_tx_guard: async_channel::Sender<IconUpdate>,
+    // Test-only receiver guard keeps the channel open when no workers are spawned.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    receiver_guard: channel::Receiver<IconJob>,
 }
 
 pub(super) struct IconUpdate {
     pub(super) key: IconKey,
     pub(super) result: IconResult,
+}
+
+// Submission errors indicate overload or shutdown; callers decide how to recover.
+pub(super) enum IconSubmitError {
+    Full,
+    Closed,
+}
+
+impl IconSubmitError {
+    pub(super) fn reason(&self) -> &'static str {
+        match self {
+            IconSubmitError::Full => match ICON_DECODE_DROP_POLICY {
+                IconDecodeDropPolicy::DropNewest => "icon decode queue full (drop-newest)",
+            },
+            IconSubmitError::Closed => "icon decode queue closed",
+        }
+    }
 }
 
 pub(super) enum IconResult {
@@ -52,8 +85,20 @@ enum IconJob {
 
 impl IconWorker {
     pub(super) fn new(update_tx: async_channel::Sender<IconUpdate>) -> Self {
-        // Unbounded job queue; UI thread submits decode work, workers consume.
-        let (sender, receiver) = channel::unbounded::<IconJob>();
+        Self::new_with_capacity(update_tx, ICON_DECODE_QUEUE_CAPACITY, true)
+    }
+
+    fn new_with_capacity(
+        update_tx: async_channel::Sender<IconUpdate>,
+        capacity: usize,
+        spawn_workers: bool,
+    ) -> Self {
+        // Bounded job queue; drop policy applies when overload occurs.
+        let (sender, receiver) = channel::bounded::<IconJob>(capacity);
+        #[cfg(test)]
+        let receiver_guard = receiver.clone();
+        #[cfg(test)]
+        let update_tx_guard = update_tx.clone();
 
         // Keep worker count small (<=2) because decode is CPU-heavy and we don't want to starve GTK.
         // available_parallelism() may fail in constrained environments, so default to 1.
@@ -61,40 +106,66 @@ impl IconWorker {
             .map(|count| count.get().min(2))
             .unwrap_or(1);
 
-        for _ in 0..worker_count {
-            let receiver = receiver.clone();
-            let update_tx = update_tx.clone();
+        if spawn_workers {
+            for _ in 0..worker_count {
+                let receiver = receiver.clone();
+                let update_tx = update_tx.clone();
 
-            thread::spawn(move || {
-                // Blocking worker loop: wait for decode jobs, run decode, report back to UI via update_tx.
-                for job in receiver.iter() {
-                    let IconJob::Decode {
-                        key,
-                        path,
-                        size,
-                        scale,
-                    } = job;
+                thread::spawn(move || {
+                    // Blocking worker loop: wait for decode jobs, run decode, report back to UI via update_tx.
+                    for job in receiver.iter() {
+                        let IconJob::Decode {
+                            key,
+                            path,
+                            size,
+                            scale,
+                        } = job;
 
-                    // Decode off-thread; GTK objects should be created/applied on the main loop later.
-                    let result = decode_raster(&path, size, scale);
+                        // Decode off-thread; GTK objects should be created/applied on the main loop later.
+                        let result = decode_raster(&path, size, scale);
 
-                    // send_blocking is fine here (worker thread), avoids busy looping if UI is momentarily slow.
-                    let _ = update_tx.send_blocking(IconUpdate { key, result });
-                }
-            });
+                        // send_blocking is fine here (worker thread), avoids busy looping if UI is momentarily slow.
+                        let _ = update_tx.send_blocking(IconUpdate { key, result });
+                    }
+                });
+            }
         }
 
-        Self { sender }
+        Self {
+            sender,
+            #[cfg(test)]
+            update_tx_guard,
+            #[cfg(test)]
+            receiver_guard,
+        }
     }
 
-    pub(super) fn submit_decode(&self, key: IconKey, path: PathBuf, size: i32, scale: i32) {
-        // Best-effort enqueue; if the worker is shut down, dropping the job is acceptable.
-        let _ = self.sender.send(IconJob::Decode {
-            key,
+    pub(super) fn submit_decode(
+        &self,
+        key: IconKey,
+        path: PathBuf,
+        size: i32,
+        scale: i32,
+    ) -> Result<(), IconSubmitError> {
+        // Non-blocking submit; overload handling is delegated to the caller.
+        let job = IconJob::Decode {
+            key: key.clone(),
             path,
             size,
             scale,
-        });
+        };
+        match self.sender.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(channel::TrySendError::Full(_job)) => Err(IconSubmitError::Full),
+            Err(channel::TrySendError::Disconnected(_)) => Err(IconSubmitError::Closed),
+        }
+    }
+}
+
+#[cfg(test)]
+impl IconWorker {
+    fn new_for_tests(update_tx: async_channel::Sender<IconUpdate>, capacity: usize) -> Self {
+        Self::new_with_capacity(update_tx, capacity, false)
     }
 }
 
@@ -145,6 +216,18 @@ fn decode_raster(path: &Path, size: i32, scale: i32) -> IconResult {
     if width > i32::MAX as u32 || height > i32::MAX as u32 {
         return IconResult::Failed("decoded icon exceeds supported dimensions".to_string());
     }
+    // Skip the resize path when the source already matches the target size.
+    if width == target && height == target {
+        let width = width as i32;
+        let height = height as i32;
+        let stride = width.saturating_mul(4);
+        return IconResult::Raster(RasterImage {
+            bytes: rgba.into_raw(),
+            width,
+            height,
+            stride,
+        });
+    }
     let src =
         match fir::images::Image::from_vec_u8(width, height, rgba.into_raw(), fir::PixelType::U8x4)
         {
@@ -187,4 +270,53 @@ pub(super) fn texture_from_raster(image: &RasterImage) -> Texture {
         image.stride as usize,       // bytes per row
     )
     .upcast::<Texture>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_worker_queue_overflow_reports_failure() {
+        let (update_tx, update_rx) = async_channel::bounded(2);
+        let worker = IconWorker::new_for_tests(update_tx, 1);
+        let key_a = IconKey::Path {
+            path: "icon-a.png".to_string(),
+            size: 16,
+            scale: 1,
+        };
+        let key_b = IconKey::Path {
+            path: "icon-b.png".to_string(),
+            size: 16,
+            scale: 1,
+        };
+
+        assert!(worker
+            .submit_decode(key_a, PathBuf::from("icon-a.png"), 16, 1)
+            .is_ok());
+        let err = worker
+            .submit_decode(key_b, PathBuf::from("icon-b.png"), 16, 1)
+            .expect_err("queue should be full");
+
+        assert!(matches!(err, IconSubmitError::Full));
+        assert!(matches!(update_rx.try_recv(), Err(async_channel::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn icon_submit_error_reasons_are_stable() {
+        assert_eq!(
+            IconSubmitError::Full.reason(),
+            "icon decode queue full (drop-newest)"
+        );
+        assert_eq!(
+            IconSubmitError::Closed.reason(),
+            "icon decode queue closed"
+        );
+    }
+
+    #[test]
+    fn decode_raster_reports_missing_file() {
+        let result = decode_raster(Path::new("missing-icon.png"), 16, 1);
+        assert!(matches!(result, IconResult::Failed(_)));
+    }
 }

@@ -228,6 +228,7 @@ impl NotificationStore {
     }
 
     fn next_id(&mut self) -> u32 {
+        // Walk the u32 space (skipping 0) to find a free id; wrap around once to avoid loops.
         let start = self.next_id.max(1);
         let mut candidate = start;
         loop {
@@ -251,10 +252,19 @@ impl NotificationStore {
     fn enforce_active_limit(&mut self) -> Vec<u32> {
         let max_active = self.config.history.max_active;
         if max_active == 0 {
-            return Vec::new();
+            // max_active == 0 means "no active list"; archive everything immediately.
+            let mut evicted = Vec::new();
+            // shift_remove_index(0) evicts the oldest entry while preserving insertion order.
+            while let Some((id, notification)) = self.active.shift_remove_index(0) {
+                self.expirations.remove(&id);
+                self.push_history(notification);
+                evicted.push(id);
+            }
+            return evicted;
         }
         let mut evicted = Vec::new();
         while self.active.len() > max_active {
+            // shift_remove_index(0) evicts the oldest entry while preserving insertion order.
             if let Some((id, notification)) = self.active.shift_remove_index(0) {
                 self.expirations.remove(&id);
                 self.push_history(notification);
@@ -374,7 +384,11 @@ fn contains_ci(haystack: &str, needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::contains_ci;
+    use super::{contains_ci, NotificationStore};
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use unixnotis_core::{Config, Notification, NotificationImage, Urgency};
+    use zbus::zvariant::OwnedValue;
 
     #[test]
     fn contains_ci_matches_ascii() {
@@ -383,5 +397,71 @@ mod tests {
         assert!(!contains_ci("signal-desktop", "brave"));
         assert!(contains_ci("mixedCase", "case"));
         assert!(contains_ci("mixedCase", ""));
+    }
+
+    fn make_notification(summary: &str) -> Notification {
+        Notification {
+            id: 0,
+            app_name: "TestApp".to_string(),
+            app_icon: String::new(),
+            summary: summary.to_string(),
+            body: String::new(),
+            actions: Vec::new(),
+            hints: HashMap::<String, OwnedValue>::new(),
+            urgency: Urgency::Normal,
+            category: None,
+            is_transient: false,
+            is_resident: false,
+            suppress_popup: false,
+            suppress_sound: false,
+            image: NotificationImage::default(),
+            expire_timeout: 0,
+            received_at: Utc::now(),
+        }
+    }
+
+    fn make_store_with_limits(max_active: usize, max_entries: usize) -> NotificationStore {
+        let mut config = Config::default();
+        config.history.max_active = max_active;
+        config.history.max_entries = max_entries;
+        NotificationStore::new(config)
+    }
+
+    #[test]
+    fn max_active_zero_archives_immediately() {
+        let mut store = make_store_with_limits(0, 10);
+
+        let outcome = store.insert(make_notification("first"), 0);
+        assert_eq!(outcome.evicted.len(), 1);
+        assert!(store.list_active().is_empty());
+        assert_eq!(store.history_len(), 1);
+
+        store.insert(make_notification("second"), 0);
+        assert!(store.list_active().is_empty());
+        assert_eq!(store.history_len(), 2);
+    }
+
+    #[test]
+    fn max_active_evicts_oldest_to_history() {
+        let mut store = make_store_with_limits(1, 10);
+
+        store.insert(make_notification("first"), 0);
+        let outcome = store.insert(make_notification("second"), 0);
+
+        assert_eq!(outcome.evicted.len(), 1);
+        let active = store.list_active();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].summary, "second");
+        assert_eq!(store.history_len(), 1);
+    }
+
+    #[test]
+    fn max_entries_zero_drops_history_on_close() {
+        let mut store = make_store_with_limits(10, 0);
+
+        let outcome = store.insert(make_notification("first"), 0);
+        store.close(outcome.notification.id);
+
+        assert_eq!(store.history_len(), 0);
     }
 }
