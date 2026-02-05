@@ -50,17 +50,15 @@ pub(super) fn apply_popup_config(
     window.set_exclusive_zone(0);
     window.set_keyboard_mode(KeyboardMode::None);
 
-    if let Some(output) = config.popups.output.as_ref() {
-        if let Some(monitor) = find_monitor(output) {
-            window.set_monitor(Some(&monitor));
-        }
+    let monitor = if let Some(output) = config.popups.output.as_ref() {
+        find_monitor(output).or_else(default_monitor)
     } else {
-        // Fall back to a deterministic default monitor when no output is configured.
-        if let Some(monitor) = default_monitor() {
-            window.set_monitor(Some(&monitor));
-        } else {
-            window.set_monitor(None);
-        }
+        default_monitor()
+    };
+    if let Some(monitor) = monitor.as_ref() {
+        window.set_monitor(Some(monitor));
+    } else {
+        window.set_monitor(None);
     }
     apply_input_region(window, config.popups.allow_click_through);
 }
@@ -131,19 +129,43 @@ fn apply_anchor(window: &impl IsA<gtk::Window>, anchor: Anchor, margin: Margins)
     window.set_margin(Edge::Left, margin.left);
 }
 
-fn find_monitor(name: &str) -> Option<gtk::gdk::Monitor> {
+fn find_monitor(output: &str) -> Option<gtk::gdk::Monitor> {
     let display = gtk::gdk::Display::default()?;
     let monitors = display.monitors();
     for index in 0..monitors.n_items() {
-        let item = monitors.item(index)?;
-        let monitor = item.downcast::<gtk::gdk::Monitor>().ok()?;
-        if let Some(model) = monitor.model() {
-            if model == name {
-                return Some(monitor);
-            }
+        let Some(item) = monitors.item(index) else {
+            continue;
+        };
+        let Ok(monitor) = item.downcast::<gtk::gdk::Monitor>() else {
+            continue;
+        };
+        if monitor_matches_output(&monitor, output) {
+            return Some(monitor);
         }
     }
     None
+}
+
+fn monitor_matches_output(monitor: &gtk::gdk::Monitor, output: &str) -> bool {
+    let output = output.trim();
+    if output.is_empty() {
+        return false;
+    }
+
+    // Prefer connector identifiers because they match compositor output names.
+    if monitor
+        .connector()
+        .as_deref()
+        .is_some_and(|connector| connector.eq_ignore_ascii_case(output))
+    {
+        return true;
+    }
+
+    // Keep model matching for compatibility with existing configs.
+    monitor
+        .model()
+        .as_deref()
+        .is_some_and(|model| model.eq_ignore_ascii_case(output))
 }
 
 fn default_monitor() -> Option<gtk::gdk::Monitor> {

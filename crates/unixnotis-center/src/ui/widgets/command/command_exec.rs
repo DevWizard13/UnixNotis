@@ -10,13 +10,16 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Runtime;
 use tracing::warn;
 use wait_timeout::ChildExt;
 
 use super::command_parse::parse_simple_command;
+
+// Bound captured command output to prevent large stdout/stderr from ballooning memory.
+const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 pub(super) fn build_command_runtime() -> Option<Runtime> {
     // A lightweight runtime enables async pipe reads without spawning extra threads,
@@ -63,26 +66,24 @@ async fn run_command_with_timeout_inner(cmd: &str, timeout: Duration) -> Result<
 
     // Drain stdout/stderr on the runtime to avoid per-command reader threads.
     let stdout_handle = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut stdout) = stdout {
-            let _ = stdout.read_to_end(&mut buf).await;
+        if let Some(stdout) = stdout {
+            return read_to_end_limited_async(stdout).await;
         }
-        buf
+        Ok(Vec::new())
     });
     let stderr_handle = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_end(&mut buf).await;
+        if let Some(stderr) = stderr {
+            return read_to_end_limited_async(stderr).await;
         }
-        buf
+        Ok(Vec::new())
     });
 
-    let status = if timeout.is_zero() {
+    let status_result = if timeout.is_zero() {
         // Zero timeout indicates "no timeout" rather than "immediate timeout."
-        child.wait().await?
+        child.wait().await
     } else {
         match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(status) => status?,
+            Ok(status) => status,
             Err(_) => {
                 // Kill on timeout to keep worker throughput predictable.
                 kill_child_process(&mut child).await;
@@ -92,9 +93,17 @@ async fn run_command_with_timeout_inner(cmd: &str, timeout: Duration) -> Result<
             }
         }
     };
+    let status = match status_result {
+        Ok(status) => status,
+        Err(err) => {
+            stdout_handle.abort();
+            stderr_handle.abort();
+            return Err(err);
+        }
+    };
 
-    let stdout = stdout_handle.await.unwrap_or_default();
-    let stderr = stderr_handle.await.unwrap_or_default();
+    let stdout = join_async_reader(stdout_handle, "stdout").await?;
+    let stderr = join_async_reader(stderr_handle, "stderr").await?;
     Ok(Output {
         status,
         stdout,
@@ -113,38 +122,39 @@ async fn kill_child_process(child: &mut tokio::process::Child) {
 
 fn run_command_with_timeout_blocking(cmd: &str, timeout: Duration) -> Result<Output, io::Error> {
     let mut child = spawn_capture_command(cmd)?;
-    if timeout.is_zero() {
-        // Consistent with async path: 0 means no timeout.
-        return child.wait_with_output();
-    }
 
     let stdout_handle = match child.stdout.take() {
         Some(stdout) => spawn_reader(stdout),
-        None => std::thread::spawn(Vec::new),
+        None => std::thread::spawn(|| Ok(Vec::new())),
     };
     let stderr_handle = match child.stderr.take() {
         Some(stderr) => spawn_reader(stderr),
-        None => std::thread::spawn(Vec::new),
+        None => std::thread::spawn(|| Ok(Vec::new())),
     };
 
     let pid = child.id() as i32;
     // Block on the OS wait call with a timeout instead of polling in a tight loop.
     // This keeps idle CPU near zero while preserving deterministic timeouts.
-    let status = match child.wait_timeout(timeout)? {
-        Some(status) => status,
-        None => {
-            // Kill on timeout to keep worker throughput predictable.
-            kill_process_group(pid);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
+    let status = if timeout.is_zero() {
+        // Consistent with async path: 0 means no timeout.
+        child.wait()?
+    } else {
+        match child.wait_timeout(timeout)? {
+            Some(status) => status,
+            None => {
+                // Kill on timeout to keep worker throughput predictable.
+                kill_process_group(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.join();
+                let _ = stderr_handle.join();
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "command timed out"));
+            }
         }
     };
 
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
+    let stdout = join_blocking_reader(stdout_handle, "stdout")?;
+    let stderr = join_blocking_reader(stderr_handle, "stderr")?;
     Ok(Output {
         status,
         stdout,
@@ -152,13 +162,71 @@ fn run_command_with_timeout_blocking(cmd: &str, timeout: Duration) -> Result<Out
     })
 }
 
-fn spawn_reader<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
+fn spawn_reader<R: Read + Send + 'static>(
+    reader: R,
+) -> std::thread::JoinHandle<io::Result<Vec<u8>>> {
     // Dedicated reader thread avoids blocking command worker while draining pipes.
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = reader.read_to_end(&mut buf);
-        buf
-    })
+    std::thread::spawn(move || read_to_end_limited(reader))
+}
+
+fn join_blocking_reader(
+    handle: std::thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream: &str,
+) -> io::Result<Vec<u8>> {
+    match handle.join() {
+        Ok(result) => result.map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("failed to read command {stream} stream: {err}"),
+            )
+        }),
+        Err(_) => Err(io::Error::other(format!(
+            "command {stream} reader thread panicked"
+        ))),
+    }
+}
+
+async fn join_async_reader(
+    handle: tokio::task::JoinHandle<io::Result<Vec<u8>>>,
+    stream: &str,
+) -> io::Result<Vec<u8>> {
+    match handle.await {
+        Ok(result) => result.map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("failed to read command {stream} stream: {err}"),
+            )
+        }),
+        Err(err) => Err(io::Error::other(format!(
+            "command {stream} reader task failed: {err}"
+        ))),
+    }
+}
+
+fn read_to_end_limited<R: Read>(reader: R) -> io::Result<Vec<u8>> {
+    let mut limited = reader.take((MAX_CAPTURE_BYTES as u64) + 1);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+    if buf.len() > MAX_CAPTURE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("command output exceeded {MAX_CAPTURE_BYTES} bytes"),
+        ));
+    }
+    Ok(buf)
+}
+
+async fn read_to_end_limited_async<R: AsyncRead + Unpin>(reader: R) -> io::Result<Vec<u8>> {
+    let mut limited = reader.take((MAX_CAPTURE_BYTES as u64) + 1);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf).await?;
+    if buf.len() > MAX_CAPTURE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("command output exceeded {MAX_CAPTURE_BYTES} bytes"),
+        ));
+    }
+    Ok(buf)
 }
 
 pub(super) fn spawn_capture_command(cmd: &str) -> io::Result<Child> {
@@ -240,5 +308,26 @@ pub(in crate::ui::widgets) fn kill_process_group(pid: i32) {
     #[cfg(unix)]
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Cursor};
+
+    use super::{read_to_end_limited, MAX_CAPTURE_BYTES};
+
+    #[test]
+    fn read_to_end_limited_accepts_small_payloads() {
+        let payload = b"ok".to_vec();
+        let result = read_to_end_limited(Cursor::new(payload.clone())).expect("small payload");
+        assert_eq!(result, payload);
+    }
+
+    #[test]
+    fn read_to_end_limited_rejects_oversized_payloads() {
+        let payload = vec![0u8; MAX_CAPTURE_BYTES + 1];
+        let err = read_to_end_limited(Cursor::new(payload)).expect_err("oversized payload");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

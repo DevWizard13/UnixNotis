@@ -332,17 +332,41 @@ fn map_keyboard_mode(mode: PanelKeyboardInteractivity) -> KeyboardMode {
     }
 }
 
-fn find_monitor(name: &str) -> Option<gdk::Monitor> {
+fn find_monitor(output: &str) -> Option<gdk::Monitor> {
     let display = gdk::Display::default()?;
     let monitors = display.monitors();
     for index in 0..monitors.n_items() {
-        let item = monitors.item(index)?;
-        let monitor = item.downcast::<gdk::Monitor>().ok()?;
-        if let Some(model) = monitor.model() {
-            if model == name {
-                return Some(monitor);
-            }
+        let Some(item) = monitors.item(index) else {
+            continue;
+        };
+        let Ok(monitor) = item.downcast::<gdk::Monitor>() else {
+            continue;
+        };
+        if monitor_matches_output(&monitor, output) {
+            return Some(monitor);
         }
     }
     None
+}
+
+fn monitor_matches_output(monitor: &gdk::Monitor, output: &str) -> bool {
+    let output = output.trim();
+    if output.is_empty() {
+        return false;
+    }
+
+    // Prefer connector identifiers because they match compositor output names.
+    if monitor
+        .connector()
+        .as_deref()
+        .is_some_and(|connector| connector.eq_ignore_ascii_case(output))
+    {
+        return true;
+    }
+
+    // Keep model matching for compatibility with existing configs.
+    monitor
+        .model()
+        .as_deref()
+        .is_some_and(|model| model.eq_ignore_ascii_case(output))
 }

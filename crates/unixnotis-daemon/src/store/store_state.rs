@@ -64,11 +64,11 @@ impl DndStateStore {
         let mut file = fs::File::create(&temp_path)?;
         // Write and flush the file before renaming to avoid partially written state files.
         io::Write::write_all(&mut file, &body)?;
-        // Best-effort fsync keeps the temp file durable across sudden power loss.
-        let _ = file.sync_all();
+        // Ensure temp contents are durable before the atomic rename.
+        file.sync_all()?;
         fs::rename(&temp_path, &self.path)?;
-        // Sync the directory entry to keep the rename durable on supported filesystems.
-        let _ = sync_parent_dir(parent);
+        // Sync the directory entry so the rename survives sudden power loss.
+        sync_parent_dir(parent)?;
         Ok(())
     }
 

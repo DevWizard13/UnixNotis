@@ -181,11 +181,8 @@ pub(super) fn reserved_work_area_sync(output: Option<&str>) -> Option<Margins> {
     let monitors = value.as_array()?;
     // Walk monitors until the matching output is found; fall back to first when no output is requested.
     for monitor in monitors {
-        let Some(name) = monitor.get("name").and_then(Value::as_str) else {
-            continue;
-        };
         if let Some(output_name) = output {
-            if output_name != name {
+            if !monitor_matches_output(monitor, output_name) {
                 continue;
             }
         }
@@ -195,6 +192,24 @@ pub(super) fn reserved_work_area_sync(output: Option<&str>) -> Option<Margins> {
         return parse_reserved(reserved);
     }
     None
+}
+
+fn monitor_matches_output(monitor: &Value, output: &str) -> bool {
+    let output = output.trim();
+    if output.is_empty() {
+        return false;
+    }
+
+    // Hyprland uses connector-style names in "name"; model/description are kept for compatibility.
+    value_matches_output(monitor.get("name").and_then(Value::as_str), output)
+        || value_matches_output(monitor.get("model").and_then(Value::as_str), output)
+        || value_matches_output(monitor.get("description").and_then(Value::as_str), output)
+}
+
+fn value_matches_output(candidate: Option<&str>, output: &str) -> bool {
+    candidate
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case(output))
 }
 
 fn parse_reserved(value: &Value) -> Option<Margins> {
@@ -275,7 +290,7 @@ fn send_command(command: &str) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_reserved;
+    use super::{monitor_matches_output, parse_reserved};
 
     #[test]
     fn parse_reserved_array_order() {
@@ -286,5 +301,23 @@ mod tests {
         assert_eq!(margins.right, 20);
         assert_eq!(margins.bottom, 30);
         assert_eq!(margins.left, 40);
+    }
+
+    #[test]
+    fn monitor_matches_output_supports_connector_name() {
+        let monitor = serde_json::json!({
+            "name": "DP-1",
+            "description": "LG Display"
+        });
+        assert!(monitor_matches_output(&monitor, "dp-1"));
+    }
+
+    #[test]
+    fn monitor_matches_output_supports_model_fallback() {
+        let monitor = serde_json::json!({
+            "name": "eDP-1",
+            "model": "Laptop Screen"
+        });
+        assert!(monitor_matches_output(&monitor, "laptop screen"));
     }
 }
