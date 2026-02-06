@@ -5,6 +5,7 @@
 
 mod list_blocks;
 mod list_grouping;
+mod list_index;
 mod list_item;
 mod list_row_empty;
 mod list_row_ghost;
@@ -50,6 +51,9 @@ pub struct NotificationList {
     group_order: Vec<Rc<str>>,
     group_order_scratch: Vec<Rc<str>>,
     grouped_cache: HashMap<Rc<str>, Vec<u32>>,
+    // Incremental per-group indices keep regrouping costs local to changed ids.
+    group_active_index: HashMap<Rc<str>, VecDeque<u32>>,
+    group_history_index: HashMap<Rc<str>, VecDeque<u32>>,
     // Tracks the row span for each group to support incremental list updates.
     group_ranges: HashMap<Rc<str>, GroupRange>,
     ghost_items: HashMap<(Rc<str>, u8), RowItem>,
@@ -61,6 +65,8 @@ pub struct NotificationList {
     needs_rebuild: bool,
     // Groups with pending content/visibility changes since the last flush.
     dirty_groups: HashSet<Rc<str>>,
+    // Lowercased filter query for notification search in the panel header.
+    filter_query: Option<String>,
     max_active: usize,
     max_entries: usize,
 }
@@ -173,6 +179,8 @@ impl NotificationList {
             group_order: Vec::new(),
             group_order_scratch: Vec::new(),
             grouped_cache: HashMap::new(),
+            group_active_index: HashMap::new(),
+            group_history_index: HashMap::new(),
             group_ranges: HashMap::new(),
             ghost_items: HashMap::new(),
             interned: HashSet::new(),
@@ -182,6 +190,7 @@ impl NotificationList {
             objects_scratch: Vec::new(),
             needs_rebuild: false,
             dirty_groups: HashSet::new(),
+            filter_query: None,
             max_active: config.max_active,
             max_entries: config.max_entries,
         }

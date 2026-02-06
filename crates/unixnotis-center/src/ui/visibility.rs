@@ -15,6 +15,26 @@ use crate::debug;
 use super::{try_send_command, UiState};
 
 impl UiState {
+    pub(super) fn has_any_widgets(&self) -> bool {
+        self.volume.is_some()
+            || self.brightness.is_some()
+            || self.toggles.is_some()
+            || self.stats.is_some()
+            || self.cards.is_some()
+            || (self.media.is_some() && self.config.media.enabled)
+    }
+
+    pub(super) fn set_widgets_collapsed(&mut self, collapsed: bool) {
+        self.widgets_collapsed = collapsed;
+        if self.panel.focus_toggle.is_active() != collapsed {
+            // Mirror external collapse requests into the header toggle state.
+            self.panel.focus_toggle.set_active(collapsed);
+        }
+        self.panel.widget_revealer.set_reveal_child(!collapsed);
+        self.list
+            .set_empty_layout(!collapsed && self.has_any_widgets());
+    }
+
     pub(super) fn update_state(&mut self, state: unixnotis_core::ControlState) {
         // Avoid re-entrant DND toggles while applying daemon state.
         self.dnd_guard.set(true);
@@ -83,6 +103,7 @@ impl UiState {
             if let Some(toggles) = self.toggles.as_ref() {
                 toggles.set_watch_active(true);
             }
+            self.set_widgets_collapsed(self.widgets_collapsed);
             // Pull focus so keyboard navigation starts inside the panel.
             self.panel.root.grab_focus();
             if let Some(handle) = self.media_handle.as_ref() {
@@ -129,6 +150,13 @@ impl UiState {
         } else {
             // Hide first so any teardown work does not trigger visible reflow.
             self.panel.window.set_visible(false);
+            // Reset transient search UI so each open starts from the full notification list.
+            if self.panel.search_toggle.is_active() {
+                self.panel.search_toggle.set_active(false);
+            } else if !self.panel.search_entry.text().is_empty() {
+                // Clearing text also removes any active list filter.
+                self.panel.search_entry.set_text("");
+            }
             // Disable watch-based polling when hidden to reduce background load.
             if let Some(volume) = self.volume.as_ref() {
                 volume.set_watch_active(false);

@@ -60,6 +60,7 @@ pub struct UiState {
     cards: Option<widgets::cards::CardGrid>,
     command_tx: mpsc::Sender<UiCommand>,
     event_tx: async_channel::Sender<UiEvent>,
+    widgets_collapsed: bool,
     refresh_source: Option<gtk::glib::SourceId>,
     last_fast_refresh: Option<Instant>,
     last_slow_refresh: Option<Instant>,

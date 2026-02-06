@@ -74,6 +74,10 @@ impl RefreshBackoff {
         }
         self.next_due = Some(now + scale_duration(base, self.backoff_mult.max(1)));
     }
+
+    pub(super) fn next_due_in(&self, now: Instant) -> Option<Duration> {
+        self.next_due.map(|due| due.saturating_duration_since(now))
+    }
 }
 
 fn scale_duration(base: Duration, mult: u64) -> Duration {

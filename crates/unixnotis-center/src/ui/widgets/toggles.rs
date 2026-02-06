@@ -101,7 +101,8 @@ impl ToggleItem {
                 button.add_css_class(&class);
             }
         }
-        button.set_focusable(false);
+        button.set_focusable(true);
+        button.set_tooltip_text(Some(&config.label));
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         content.set_halign(Align::Center);

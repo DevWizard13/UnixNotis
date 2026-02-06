@@ -154,10 +154,22 @@ impl UiState {
                 self.log_debug(PanelDebugLevel::Info, move || message);
             }
             UiEvent::RefreshWidgets => {
+                // One-shot timers are re-armed after each refresh tick.
+                self.refresh_source = None;
                 if self.panel_visible {
-                    // Timer ticks should be ignored while the panel is hidden.
                     self.refresh_widgets(false);
+                    self.start_refresh_timer();
                 }
+            }
+            UiEvent::FilterChanged(query) => {
+                if self.list.set_filter_query(&query) {
+                    self.log_debug(PanelDebugLevel::Verbose, || {
+                        format!("notification filter updated: '{}'", query)
+                    });
+                }
+            }
+            UiEvent::WidgetsCollapsed(collapsed) => {
+                self.set_widgets_collapsed(collapsed);
             }
             UiEvent::CssReload => {
                 debug!("css reload requested");

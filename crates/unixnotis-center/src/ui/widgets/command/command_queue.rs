@@ -3,8 +3,9 @@
 //! Owns thread spawning, backpressure, and dispatch so command execution
 //! stays responsive under load without unbounded memory growth.
 
-use std::sync::OnceLock;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel as channel;
 use tracing::warn;
@@ -22,6 +23,9 @@ const COMMAND_QUEUE_CAPACITY: usize = 128;
 const COMMAND_FALLBACK_QUEUE_CAPACITY: usize = 32;
 // Rate-limit queue saturation warnings to avoid log spam under misconfiguration.
 const COMMAND_QUEUE_WARN_INTERVAL_SECS: u64 = 5;
+// Coalesced refresh backlog cap to prevent unbounded memory under persistent overload.
+const COALESCED_REFRESH_CAPACITY: usize = 256;
+const COALESCED_RETRY_DELAY_MS: u64 = 25;
 
 struct CommandJob {
     // Command text is stored once per job to keep worker threads independent.
@@ -104,8 +108,13 @@ pub(super) fn enqueue_command(
                 if FallbackWorker::global().submit(job).is_err() && should_warn_queue_full() {
                     warn!("fallback command queue full; dropping action");
                 }
-            } else if should_warn_queue_full() {
-                warn!("command queue full; dropping refresh command");
+            } else {
+                if should_warn_queue_full() {
+                    warn!("command queue full; coalescing refresh command");
+                }
+                let coalescer = CoalescedRefreshQueue::global();
+                coalescer.ensure_drain_thread(worker.tx.clone());
+                coalescer.enqueue(job);
             }
         }
         Err(channel::TrySendError::Disconnected(_job)) => {
@@ -141,6 +150,126 @@ impl FallbackWorker {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct RefreshCommandKey {
+    cmd: String,
+    kind: CommandKind,
+    timeout_ms: Option<u64>,
+}
+
+impl RefreshCommandKey {
+    fn from_job(job: &CommandJob) -> Self {
+        Self {
+            cmd: job.cmd.clone(),
+            kind: job.plan.kind,
+            timeout_ms: job
+                .plan
+                .timeout_override
+                .map(|timeout| timeout.as_millis().min(u64::MAX as u128) as u64),
+        }
+    }
+}
+
+struct CoalescedRefreshState {
+    pending: HashMap<RefreshCommandKey, CommandJob>,
+    order: VecDeque<RefreshCommandKey>,
+}
+
+struct CoalescedRefreshQueue {
+    state: Mutex<CoalescedRefreshState>,
+    wake: Condvar,
+}
+
+impl CoalescedRefreshQueue {
+    fn global() -> &'static Self {
+        static QUEUE: OnceLock<CoalescedRefreshQueue> = OnceLock::new();
+        QUEUE.get_or_init(|| CoalescedRefreshQueue {
+            state: Mutex::new(CoalescedRefreshState {
+                pending: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+            wake: Condvar::new(),
+        })
+    }
+
+    fn ensure_drain_thread(&'static self, worker_tx: channel::Sender<CommandJob>) {
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let queue = self;
+            if let Err(err) = std::thread::Builder::new()
+                .name("unixnotis-command-coalescer".to_string())
+                .spawn(move || queue.drain_loop(worker_tx))
+            {
+                warn!(?err, "failed to spawn refresh coalescer thread");
+            }
+        });
+    }
+
+    fn enqueue(&self, job: CommandJob) {
+        let mut state = self.state.lock().expect("coalesced refresh lock poisoned");
+        insert_coalesced_job(&mut state, job);
+        self.wake.notify_one();
+    }
+
+    fn drain_loop(&'static self, worker_tx: channel::Sender<CommandJob>) {
+        loop {
+            let (key, job) = {
+                let mut state = self.state.lock().expect("coalesced refresh lock poisoned");
+                while state.order.is_empty() {
+                    state = self
+                        .wake
+                        .wait(state)
+                        .expect("coalesced refresh wait lock poisoned");
+                }
+                let Some(key) = state.order.pop_front() else {
+                    continue;
+                };
+                let Some(job) = state.pending.remove(&key) else {
+                    continue;
+                };
+                (key, job)
+            };
+
+            match worker_tx.try_send(job) {
+                Ok(()) => {}
+                Err(channel::TrySendError::Full(job)) => {
+                    let mut state = self.state.lock().expect("coalesced refresh lock poisoned");
+                    if !state.pending.contains_key(&key)
+                        && state.pending.len() >= COALESCED_REFRESH_CAPACITY
+                    {
+                        if let Some(oldest) = state.order.pop_front() {
+                            state.pending.remove(&oldest);
+                        }
+                    }
+                    if !state.pending.contains_key(&key) {
+                        state.order.push_front(key.clone());
+                    }
+                    state.pending.insert(key, job);
+                    drop(state);
+                    std::thread::sleep(Duration::from_millis(COALESCED_RETRY_DELAY_MS));
+                }
+                Err(channel::TrySendError::Disconnected(_job)) => return,
+            }
+        }
+    }
+}
+
+fn insert_coalesced_job(state: &mut CoalescedRefreshState, job: CommandJob) {
+    let key = RefreshCommandKey::from_job(&job);
+    if !state.pending.contains_key(&key) {
+        if state.pending.len() >= COALESCED_REFRESH_CAPACITY {
+            if let Some(oldest) = state.order.pop_front() {
+                // Drop the oldest queued refresh to preserve bounded memory usage.
+                state.pending.remove(&oldest);
+            }
+        }
+        // FIFO order keeps refresh fairness across widget keys.
+        state.order.push_back(key.clone());
+    }
+    // Existing key replacement keeps only the newest payload per refresh key.
+    state.pending.insert(key, job);
+}
+
 fn should_warn_queue_full() -> bool {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -151,6 +280,7 @@ fn should_warn_queue_full() -> bool {
         .as_secs();
     let last = LAST_WARN.load(AtomicOrdering::Relaxed);
     if now.saturating_sub(last) >= COMMAND_QUEUE_WARN_INTERVAL_SECS {
+        // Relaxed ordering is sufficient because this is best-effort log throttling.
         LAST_WARN.store(now, AtomicOrdering::Relaxed);
         return true;
     }
@@ -181,6 +311,7 @@ fn handle_job(job: CommandJob, runtime: Option<&tokio::runtime::Runtime>) {
     let result = run_command_with_timeout(&job.cmd, job.plan.timeout(), runtime);
     let elapsed_ms = started.elapsed().as_millis();
     if let Some(tx) = job.respond {
+        // Direct responses skip warning paths because the caller owns error handling.
         let _ = tx.send_blocking(result);
         return;
     }
@@ -214,5 +345,50 @@ fn handle_job(job: CommandJob, runtime: Option<&tokio::runtime::Runtime>) {
                 )
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        insert_coalesced_job, CoalescedRefreshState, CommandJob, CommandKind, CommandPlan,
+    };
+    use std::collections::{HashMap, VecDeque};
+
+    fn job(cmd: &str, kind: CommandKind) -> CommandJob {
+        CommandJob {
+            cmd: cmd.to_string(),
+            plan: CommandPlan {
+                kind,
+                timeout_override: None,
+            },
+            respond: None,
+        }
+    }
+
+    #[test]
+    fn coalesced_insert_replaces_existing_key() {
+        let mut state = CoalescedRefreshState {
+            pending: HashMap::new(),
+            order: VecDeque::new(),
+        };
+        insert_coalesced_job(&mut state, job("echo a", CommandKind::Fast));
+        insert_coalesced_job(&mut state, job("echo a", CommandKind::Fast));
+
+        assert_eq!(state.pending.len(), 1);
+        assert_eq!(state.order.len(), 1);
+    }
+
+    #[test]
+    fn coalesced_insert_keeps_distinct_keys() {
+        let mut state = CoalescedRefreshState {
+            pending: HashMap::new(),
+            order: VecDeque::new(),
+        };
+        insert_coalesced_job(&mut state, job("echo a", CommandKind::Fast));
+        insert_coalesced_job(&mut state, job("echo a", CommandKind::Slow));
+
+        assert_eq!(state.pending.len(), 2);
+        assert_eq!(state.order.len(), 2);
     }
 }

@@ -33,27 +33,12 @@ impl NotificationList {
 
     fn rebuild_list(&mut self) {
         let mut group_order = std::mem::take(&mut self.group_order_scratch);
-        group_order.clear();
-        let mut grouped = std::mem::take(&mut self.grouped_cache);
-        grouped.clear();
-
-        // Build app-based groups in active+history order for stable UI layout.
-        for id in self.active_order.iter().chain(self.history_order.iter()) {
-            let Some(entry) = self.entries.get(id) else {
-                continue;
-            };
-            let key = entry.app_key.clone();
-            let bucket = grouped.entry(key.clone()).or_insert_with(|| {
-                group_order.push(key.clone());
-                Vec::new()
-            });
-            bucket.push(*id);
-        }
+        self.collect_group_order(&mut group_order);
 
         self.group_headers
-            .retain(|key, _| grouped.contains_key(key));
+            .retain(|key, _| self.grouped_cache.contains_key(key));
         self.group_expanded
-            .retain(|key, _| grouped.contains_key(key));
+            .retain(|key, _| self.grouped_cache.contains_key(key));
 
         let mut items = std::mem::take(&mut self.items_scratch);
         items.clear();
@@ -61,11 +46,16 @@ impl NotificationList {
         keys.clear();
         let mut group_ranges = HashMap::new();
         for key in &group_order {
-            let Some(ids) = grouped.get(key) else {
+            let Some(ids) = self.grouped_cache.get(key) else {
                 continue;
             };
+            let visible_ids = self.visible_ids_for_group(ids).into_owned();
+            if visible_ids.is_empty() {
+                continue;
+            }
+            // Range map allows incremental updates to splice only changed groups later.
             let start = items.len();
-            let (block_items, block_keys) = self.build_group_block(key, ids);
+            let (block_items, block_keys) = self.build_group_block(key, &visible_ids);
             items.extend(block_items);
             keys.extend(block_keys);
             let end = items.len();
@@ -104,8 +94,7 @@ impl NotificationList {
         items.clear();
         self.items_scratch = items;
 
-        let group_count = grouped.len();
-        self.grouped_cache = grouped;
+        let group_count = group_order.len();
         let mut old_group_order = std::mem::replace(&mut self.group_order, group_order);
         // Drop stale group keys while keeping the scratch capacity for reuse.
         old_group_order.clear();
@@ -131,40 +120,34 @@ impl NotificationList {
     fn apply_updates(&mut self) {
         // Rebuild only affected group blocks while keeping stable spans intact.
         let mut group_order = std::mem::take(&mut self.group_order_scratch);
-        group_order.clear();
-        let mut grouped = std::mem::take(&mut self.grouped_cache);
-        grouped.clear();
-
-        for id in self.active_order.iter().chain(self.history_order.iter()) {
-            let Some(entry) = self.entries.get(id) else {
-                continue;
-            };
-            let key = entry.app_key.clone();
-            let bucket = grouped.entry(key.clone()).or_insert_with(|| {
-                group_order.push(key.clone());
-                Vec::new()
-            });
-            bucket.push(*id);
-        }
+        self.collect_group_order(&mut group_order);
 
         self.group_headers
-            .retain(|key, _| grouped.contains_key(key));
+            .retain(|key, _| self.grouped_cache.contains_key(key));
         self.group_expanded
-            .retain(|key, _| grouped.contains_key(key));
+            .retain(|key, _| self.grouped_cache.contains_key(key));
 
         let mut keep_groups: HashSet<Rc<str>> = HashSet::new();
         let mut removed_groups: HashSet<Rc<str>> = HashSet::new();
         let mut remove_ranges: Vec<GroupRange> = Vec::new();
         for (key, range) in self.group_ranges.iter() {
-            let Some(ids) = grouped.get(key) else {
+            let Some(ids) = self.grouped_cache.get(key) else {
                 remove_ranges.push(*range);
                 removed_groups.insert(key.clone());
                 continue;
             };
-            let desired_len = self.group_block_len(key, ids);
+            let visible_ids = self.visible_ids_for_group(ids);
+            if visible_ids.is_empty() {
+                remove_ranges.push(*range);
+                removed_groups.insert(key.clone());
+                continue;
+            }
+            let desired_len = self.group_block_len(key, visible_ids.as_ref());
             if !self.dirty_groups.contains(key) && range.len == desired_len {
+                // Stable groups with identical span lengths are kept in place.
                 keep_groups.insert(key.clone());
             } else {
+                // Dirty or shape-changed groups are removed and rebuilt.
                 remove_ranges.push(*range);
                 removed_groups.insert(key.clone());
             }
@@ -175,6 +158,7 @@ impl NotificationList {
         for range in remove_ranges {
             if let Some(last) = merged.last_mut() {
                 if last.start + last.len == range.start {
+                    // Adjacent removals are merged to reduce ListStore splice calls.
                     last.len += range.len;
                     continue;
                 }
@@ -195,10 +179,14 @@ impl NotificationList {
         let mut pending_start = 0usize;
 
         for key in &group_order {
-            let Some(ids) = grouped.get(key) else {
+            let Some(ids) = self.grouped_cache.get(key) else {
                 continue;
             };
-            let desired_len = self.group_block_len(key, ids);
+            let visible_ids = self.visible_ids_for_group(ids).into_owned();
+            if visible_ids.is_empty() {
+                continue;
+            }
+            let desired_len = self.group_block_len(key, &visible_ids);
             if keep_groups.contains(key) {
                 if !pending_items.is_empty() {
                     let inserted_len =
@@ -217,7 +205,8 @@ impl NotificationList {
                 cursor += desired_len;
                 pending_start = cursor;
             } else {
-                let (items, keys) = self.build_group_block(key, ids);
+                // Rebuild changed groups into a contiguous insertion batch.
+                let (items, keys) = self.build_group_block(key, &visible_ids);
                 pending_items.extend(items);
                 pending_keys.extend(keys);
             }
@@ -228,7 +217,6 @@ impl NotificationList {
         }
 
         self.group_ranges = new_ranges;
-        self.grouped_cache = grouped;
         let mut old_group_order = std::mem::replace(&mut self.group_order, group_order);
         old_group_order.clear();
         self.group_order_scratch = old_group_order;
@@ -257,7 +245,7 @@ impl NotificationList {
     }
 
     fn update_empty_overlay(&self) {
-        let is_empty = self.active_order.is_empty() && self.history_order.is_empty();
+        let is_empty = self.store.n_items() == 0;
         self.empty_overlay.set_visible(is_empty);
     }
 }

@@ -28,7 +28,7 @@ const ACTION_TIMEOUT_MS: u64 = 1200;
 // Slow command jitter avoids synchronized polling across widgets.
 const SLOW_JITTER_MS: u64 = 200;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(in crate::ui::widgets) enum CommandKind {
     Fast,
     Slow,

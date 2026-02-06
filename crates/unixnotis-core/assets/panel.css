@@ -31,6 +31,18 @@
     inset 0 0 0 1px alpha(#ffffff, 0.03);
 }
 
+.unixnotis-panel-header-top {
+  min-height: 32px;
+}
+
+.unixnotis-panel-title-stack {
+  min-width: 0;
+}
+
+.unixnotis-panel-title-row {
+  min-height: 30px;
+}
+
 .unixnotis-panel-title {
   font-weight: 700;
   font-size: 16px;
@@ -51,6 +63,16 @@
   box-shadow: 0 0 12px -10px @unixnotis-glow-cyan;
 }
 
+.unixnotis-panel-actions {
+  /* Dedicated control row avoids widening the title row on narrow panels. */
+  border-radius: 999px;
+  margin-top: 2px;
+}
+
+.unixnotis-panel-action-group {
+  border-radius: 999px;
+}
+
 .unixnotis-panel-action {
   background-image: linear-gradient(160deg, @unixnotis-action-bg, alpha(@unixnotis-surface, 0.9));
   color: @unixnotis-text;
@@ -63,6 +85,42 @@
     0 0 18px -16px @unixnotis-glow-cyan,
     inset 0 0 0 1px alpha(#ffffff, 0.04);
   font-size: 11px;
+}
+
+.unixnotis-panel-action-focus,
+.unixnotis-panel-action-muted {
+  /* Keep compact labels readable while honoring fixed panel width. */
+  min-width: 86px;
+}
+
+.unixnotis-panel-action-primary {
+  /* DND text is intentionally short ("DND") to cap horizontal growth. */
+  min-width: 78px;
+}
+
+.unixnotis-panel-action-search {
+  /* Search toggle is icon-only; expanded search input is revealed below. */
+  min-width: 32px;
+}
+
+.unixnotis-panel-action-with-icon {
+  padding-left: 9px;
+  padding-right: 9px;
+}
+
+.unixnotis-panel-action-content {
+  min-height: 18px;
+}
+
+.unixnotis-panel-action-glyph {
+  min-width: 14px;
+  min-height: 14px;
+}
+
+.unixnotis-panel-action-label {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  font-size: 10px;
 }
 
 .unixnotis-panel-action:hover {
@@ -78,6 +136,53 @@
 .unixnotis-panel-action:checked {
   background-image: linear-gradient(140deg, @unixnotis-action-bg-active, alpha(@unixnotis-accent-2, 0.3));
   border-color: alpha(@unixnotis-accent, 0.75);
+}
+
+.unixnotis-panel-action:checked .unixnotis-panel-action-glyph,
+.unixnotis-panel-action:checked .unixnotis-panel-action-label {
+  color: @unixnotis-text;
+}
+
+.unixnotis-panel-action-icon {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+}
+
+.unixnotis-panel-action-close {
+  /* Close action is visually isolated from destructive list actions. */
+  margin-left: 6px;
+  background-image: linear-gradient(160deg, alpha(@unixnotis-surface-strong, 0.88), alpha(@unixnotis-surface-soft, 0.84));
+  border-color: alpha(@unixnotis-accent, 0.26);
+  box-shadow:
+    0 8px 14px -12px @unixnotis-shadow-soft,
+    0 0 14px -14px @unixnotis-glow-cyan,
+    inset 0 0 0 1px alpha(#ffffff, 0.05);
+}
+
+.unixnotis-panel-action-close:hover {
+  background-image: linear-gradient(160deg, alpha(@unixnotis-action-bg-hover, 0.88), alpha(@unixnotis-accent-2, 0.18));
+  border-color: alpha(@unixnotis-accent, 0.58);
+}
+
+.unixnotis-panel-search-revealer {
+  margin-top: 2px;
+}
+
+.unixnotis-panel-search {
+  min-height: 34px;
+  border-radius: 12px;
+  background-image: linear-gradient(150deg, alpha(@unixnotis-surface-soft, 0.84), alpha(@unixnotis-surface-strong, 0.92));
+  border: 1px solid alpha(@unixnotis-accent, 0.18);
+  padding: 0 10px;
+  box-shadow: inset 0 0 0 1px alpha(#ffffff, 0.03);
+}
+
+.unixnotis-panel-search:focus-within {
+  border-color: alpha(@unixnotis-accent, 0.45);
+  box-shadow:
+    inset 0 0 0 1px alpha(#ffffff, 0.05),
+    0 0 20px -16px @unixnotis-glow-cyan;
 }
 
 .unixnotis-panel-close,

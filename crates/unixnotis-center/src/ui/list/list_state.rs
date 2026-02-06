@@ -36,7 +36,7 @@ impl NotificationList {
         self.group_headers.clear();
         self.group_order.clear();
         self.group_order_scratch.clear();
-        self.grouped_cache.clear();
+        self.clear_group_indices();
         self.group_ranges.clear();
         self.ghost_items.clear();
         self.interned.clear();
@@ -112,6 +112,7 @@ impl NotificationList {
             && !group_changed
             && old_is_active == Some(is_active)
             && !ordering_changed
+            && self.filter_query.is_none()
             && !self.needs_rebuild
         {
             if let Some(entry) = self.entries.get(&id) {
@@ -158,9 +159,29 @@ impl NotificationList {
             return;
         }
 
+        if existing {
+            if let Some(entry) = self.entries.get(&id) {
+                let current_key = entry.app_key.clone();
+                let current_active = entry.is_active;
+                if let (Some(old_key), Some(old_active)) = (old_group.as_ref(), old_is_active) {
+                    if old_key.as_ref() != current_key.as_ref() {
+                        // App-name changes can move the notification between groups.
+                        // Rebuild only the two affected group indices.
+                        self.rebuild_group_index_for_key(old_key);
+                        self.rebuild_group_index_for_key(&current_key);
+                    } else if old_active != current_active {
+                        self.index_remove(&current_key, id, old_active);
+                        self.index_insert_front(&current_key, id, current_active);
+                    } else if ordering_changed {
+                        self.index_move_to_front(&current_key, id, current_active);
+                    }
+                }
+            }
+        }
+
         let current_key = self.entries.get(&id).map(|entry| entry.app_key.clone());
-        if let Some(key) = current_key.as_ref() {
-            self.dirty_groups.insert(key.clone());
+        if let Some(key) = current_key {
+            self.dirty_groups.insert(key);
         }
         if group_changed {
             if let Some(old_key) = old_group {
@@ -175,6 +196,7 @@ impl NotificationList {
     pub fn mark_closed(&mut self, id: u32, reason: CloseReason) {
         let group_key = self.entries.get(&id).map(|entry| entry.app_key.clone());
         if matches!(reason, CloseReason::DismissedByUser) {
+            // User-dismissed notifications are removed entirely rather than archived.
             self.remove_entry(id);
             if let Some(key) = group_key {
                 self.dirty_groups.insert(key);
@@ -189,8 +211,11 @@ impl NotificationList {
         }
         self.active_order.retain(|entry| *entry != id);
         self.history_order.retain(|entry| *entry != id);
+        // Closed notifications are moved to history front to preserve recency ordering.
         self.history_order.push_front(id);
         if let Some(key) = group_key {
+            self.index_remove(&key, id, true);
+            self.index_insert_front(&key, id, false);
             self.dirty_groups.insert(key);
         }
         debug!(id, ?reason, "notification archived");
@@ -211,10 +236,25 @@ impl NotificationList {
         self.active_order.len() + self.history_order.len()
     }
 
+    pub fn set_filter_query(&mut self, query: &str) -> bool {
+        let normalized = self.normalize_filter_query(query);
+        if self.filter_query == normalized {
+            return false;
+        }
+        self.filter_query = normalized;
+        // Filter changes affect every group; force a full pass to avoid stale ranges.
+        self.group_ranges.clear();
+        self.request_rebuild();
+        true
+    }
+
     fn trim_to_limits(&mut self) {
         if self.max_active == 0 {
-            for id in self.active_order.drain(..) {
+            // Zero active capacity behaves like hard-drop for active notifications.
+            let drained: Vec<u32> = self.active_order.drain(..).collect();
+            for id in drained {
                 if let Some(entry) = self.entries.remove(&id) {
+                    self.index_remove(&entry.app_key, id, entry.is_active);
                     self.dirty_groups.insert(entry.app_key);
                 }
             }
@@ -222,6 +262,7 @@ impl NotificationList {
             while self.active_order.len() > self.max_active {
                 if let Some(id) = self.active_order.pop_back() {
                     if let Some(entry) = self.entries.remove(&id) {
+                        self.index_remove(&entry.app_key, id, entry.is_active);
                         self.dirty_groups.insert(entry.app_key);
                     }
                 }
@@ -229,8 +270,11 @@ impl NotificationList {
         }
 
         if self.max_entries == 0 {
-            for id in self.history_order.drain(..) {
+            // Zero history capacity keeps history storage fully disabled.
+            let drained: Vec<u32> = self.history_order.drain(..).collect();
+            for id in drained {
                 if let Some(entry) = self.entries.remove(&id) {
+                    self.index_remove(&entry.app_key, id, entry.is_active);
                     self.dirty_groups.insert(entry.app_key);
                 }
             }
@@ -238,6 +282,7 @@ impl NotificationList {
             while self.history_order.len() > self.max_entries {
                 if let Some(id) = self.history_order.pop_back() {
                     if let Some(entry) = self.entries.remove(&id) {
+                        self.index_remove(&entry.app_key, id, entry.is_active);
                         self.dirty_groups.insert(entry.app_key);
                     }
                 }
@@ -267,11 +312,14 @@ impl NotificationList {
         } else {
             self.history_order.push_front(id);
         }
+        self.index_insert_front(&app_key, id, is_active);
         app_key
     }
 
     fn remove_entry(&mut self, id: u32) {
-        self.entries.remove(&id);
+        if let Some(entry) = self.entries.remove(&id) {
+            self.index_remove(&entry.app_key, id, entry.is_active);
+        }
         self.active_order.retain(|entry| *entry != id);
         self.history_order.retain(|entry| *entry != id);
     }

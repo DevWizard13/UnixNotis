@@ -179,7 +179,8 @@ fn update_body_label(label: &gtk::Label, body: &str) {
         return;
     }
     label.set_visible(true);
-    label.set_markup(body);
+    // Notification bodies are treated as plain text to avoid markup rendering surprises.
+    label.set_text(body);
 }
 
 fn update_actions(

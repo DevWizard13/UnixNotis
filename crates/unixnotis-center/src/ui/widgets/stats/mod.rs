@@ -158,6 +158,19 @@ impl StatGrid {
             item.refresh(base_interval, force);
         }
     }
+
+    pub fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
+        self.items
+            .iter()
+            .filter_map(|item| item.next_refresh_in(now))
+            .min()
+    }
+
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.next_refresh_in(now)
+            .map(|delay| delay.is_zero())
+            .unwrap_or(false)
+    }
 }
 
 impl StatItem {
@@ -354,6 +367,20 @@ impl StatItem {
                     .note_success(Instant::now(), base_interval, changed);
             }
         });
+    }
+
+    fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
+        if !self.root.is_visible() {
+            return None;
+        }
+        if self.inflight.get() {
+            // Keep a short retry window while a command is still running.
+            return Some(Duration::from_millis(250));
+        }
+        self.refresh_backoff
+            .borrow()
+            .next_due_in(now)
+            .or(Some(Duration::ZERO))
     }
 
     fn refresh_plugin(&self, plugin: &WidgetPluginConfig, base_interval: Duration) {

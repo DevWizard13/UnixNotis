@@ -26,6 +26,10 @@ pub enum UiEvent {
     /// Hyprland reserved work area update for panel sizing.
     WorkAreaUpdated(Option<Margins>),
     RefreshWidgets,
+    /// Search/filter query entered in the panel header.
+    FilterChanged(String),
+    /// Toggle compact mode that hides non-notification widgets.
+    WidgetsCollapsed(bool),
     CssReload,
     ConfigReload,
 }

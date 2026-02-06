@@ -30,7 +30,8 @@ pub(super) fn build_group_row(event_tx: Sender<UiEvent>) -> (gtk::Box, GroupRowW
     let button = gtk::Button::new();
     button.add_css_class("unixnotis-group-header");
     button.set_has_frame(false);
-    button.set_focusable(false);
+    button.set_focusable(true);
+    button.set_tooltip_text(Some("Toggle group"));
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let icon = gtk::Image::new();

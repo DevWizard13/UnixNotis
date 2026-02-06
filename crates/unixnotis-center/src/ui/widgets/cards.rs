@@ -33,6 +33,8 @@ struct CardItem {
     refresh_backoff: Rc<RefCell<RefreshBackoff>>,
     // Calendar only changes daily; track the last rendered day to avoid redundant updates.
     last_calendar_day: Rc<Cell<Option<(i32, i32, i32)>>>,
+    // Schedules the next calendar update directly at the next local midnight.
+    calendar_next_due: Rc<Cell<Option<Instant>>>,
 }
 
 impl CardGrid {
@@ -73,6 +75,20 @@ impl CardGrid {
         for item in &self.items {
             item.refresh(base_interval, force);
         }
+    }
+
+    pub fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
+        // The grid wakes when the earliest card wakes.
+        self.items
+            .iter()
+            .filter_map(|item| item.next_refresh_in(now))
+            .min()
+    }
+
+    pub fn is_due(&self, now: Instant) -> bool {
+        self.next_refresh_in(now)
+            .map(|delay| delay.is_zero())
+            .unwrap_or(false)
     }
 }
 
@@ -146,6 +162,7 @@ impl CardItem {
             last_value: Rc::new(RefCell::new(None)),
             refresh_backoff: Rc::new(RefCell::new(RefreshBackoff::default())),
             last_calendar_day: Rc::new(Cell::new(None)),
+            calendar_next_due: Rc::new(Cell::new(None)),
         }
     }
 
@@ -153,9 +170,14 @@ impl CardItem {
         if self.is_calendar {
             debug::log(PanelDebugLevel::Verbose, || "calendar refresh".to_string());
             let now = Instant::now();
-            // Skip calendar refresh while within the backoff window.
-            if !self.refresh_backoff.borrow().should_refresh(now, force) {
-                return;
+            if !force {
+                // Calendar content only changes at day boundaries, so skip all
+                // work until the scheduled midnight deadline.
+                if let Some(next_due) = self.calendar_next_due.get() {
+                    if now < next_due {
+                        return;
+                    }
+                }
             }
             self.refresh_calendar(base_interval);
             return;
@@ -172,6 +194,7 @@ impl CardItem {
             format!("card refresh: {}", self.config.title)
         });
         if self.inflight.get() {
+            // Avoid overlapping command executions for the same card.
             return;
         }
         if let Some(plugin) = self.config.plugin.as_ref() {
@@ -209,6 +232,7 @@ impl CardItem {
                 Ok(output) => output,
                 Err(err) => {
                     warn!(?cmd, ?err, "info card command failed");
+                    // Keep last value visible on transient failures to avoid blank flashes.
                     apply_cached_value(&label, &last_value);
                     refresh_backoff
                         .borrow_mut()
@@ -218,6 +242,7 @@ impl CardItem {
             };
             if !output.status.success() {
                 warn!(?cmd, "info card command failed");
+                // Keep stale-but-valid data rather than replacing with empty/error text.
                 apply_cached_value(&label, &last_value);
                 refresh_backoff
                     .borrow_mut()
@@ -242,6 +267,28 @@ impl CardItem {
                     .note_success(Instant::now(), base_interval, changed);
             }
         });
+    }
+
+    fn next_refresh_in(&self, now: Instant) -> Option<Duration> {
+        if !self.root.is_visible() {
+            return None;
+        }
+        if self.is_calendar {
+            return self
+                .calendar_next_due
+                .get()
+                .map(|due| due.saturating_duration_since(now))
+                // Missing due time means the calendar has not been initialized yet.
+                .or(Some(Duration::ZERO));
+        }
+        if self.inflight.get() {
+            // Keep a short retry window while a command is still running.
+            return Some(Duration::from_millis(250));
+        }
+        self.refresh_backoff
+            .borrow()
+            .next_due_in(now)
+            .or(Some(Duration::ZERO))
     }
 
     fn refresh_plugin(&self, plugin: &WidgetPluginConfig, base_interval: Duration) {
@@ -284,6 +331,7 @@ impl CardItem {
             };
             if !output.status.success() {
                 warn!(command = %command, "card plugin command returned non-zero status");
+                // Preserve prior value when the plugin command exits non-zero.
                 apply_cached_value(&body_label, &last_value);
                 refresh_backoff
                     .borrow_mut()
@@ -295,7 +343,7 @@ impl CardItem {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     warn!(command = %command, %err, "failed to parse card plugin payload");
-                    // Parse failures are treated as transient command failures.
+                    // Ignore malformed payloads and keep the previous stable state.
                     apply_cached_value(&body_label, &last_value);
                     refresh_backoff
                         .borrow_mut()
@@ -334,17 +382,16 @@ impl CardItem {
                     calendar.select_day(&now);
                     self.last_calendar_day.set(Some(date_key));
                 }
-                self.refresh_backoff.borrow_mut().note_success(
-                    Instant::now(),
-                    base_interval,
-                    changed,
-                );
+                let delay = next_local_midnight_delay(&now)
+                    .unwrap_or_else(|| base_interval.max(Duration::from_secs(60)));
+                // Store an absolute instant so the caller can use one-shot scheduling.
+                self.calendar_next_due.set(Some(Instant::now() + delay));
             }
             Err(err) => {
                 warn!(?err, "calendar refresh failed");
-                self.refresh_backoff
-                    .borrow_mut()
-                    .note_error(Instant::now(), base_interval);
+                self.calendar_next_due.set(Some(
+                    Instant::now() + base_interval.max(Duration::from_secs(30)),
+                ));
             }
         }
     }
@@ -357,5 +404,43 @@ fn apply_cached_value(label: &gtk::Label, cache: &Rc<RefCell<Option<String>>>) {
         }
     } else if label.text().as_str() != "n/a" {
         label.set_text("n/a");
+    }
+}
+
+fn next_local_midnight_delay(now: &glib::DateTime) -> Option<Duration> {
+    let next_day = now.add_days(1).ok()?;
+    let timezone = glib::TimeZone::local();
+    let midnight = glib::DateTime::new(
+        &timezone,
+        next_day.year(),
+        next_day.month(),
+        next_day.day_of_month(),
+        0,
+        0,
+        0.0,
+    )
+    .ok()?;
+    let now_unix = now.to_unix();
+    let midnight_unix = midnight.to_unix();
+    let seconds = midnight_unix.checked_sub(now_unix)?;
+    if seconds <= 0 {
+        return Some(Duration::from_secs(60));
+    }
+    Some(Duration::from_secs(seconds as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_local_midnight_delay;
+    use gtk::glib;
+    use std::time::Duration;
+
+    #[test]
+    fn midnight_delay_targets_next_day_boundary() {
+        let timezone = glib::TimeZone::local();
+        let now = glib::DateTime::new(&timezone, 2026, 2, 6, 23, 59, 30.0).expect("valid datetime");
+        let delay = next_local_midnight_delay(&now).expect("delay");
+        assert!(delay <= Duration::from_secs(31));
+        assert!(delay >= Duration::from_secs(29));
     }
 }
