@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use unixnotis_core::WidgetPluginConfig;
 
+// UI-facing limits cap rendered payload size independently from command output limits.
 const MAX_STAT_TEXT_CHARS: usize = 256;
 const MAX_CARD_TITLE_CHARS: usize = 64;
 const MAX_CARD_TEXT_CHARS: usize = 4096;
@@ -40,11 +41,14 @@ pub(in crate::ui::widgets) fn parse_stat_plugin_payload(
     payload: &[u8],
     limits: PluginOutputLimits,
 ) -> Result<StatPluginData, String> {
+    // Bounds check first to reject empty/oversized payloads before JSON parsing work.
     validate_payload_bounds(payload, limits)?;
     let parsed: StatPayload = serde_json::from_slice(payload)
         .map_err(|err| format!("invalid stat plugin JSON payload: {err}"))?;
+    // Version gating keeps future schema changes from being interpreted incorrectly.
     validate_api_version(parsed.api_version)?;
 
+    // Trim and clamp text to keep rendering stable even with noisy plugin output.
     let text = clamp_chars(parsed.text.trim(), MAX_STAT_TEXT_CHARS);
     if text.is_empty() {
         return Err("stat plugin payload field \"text\" is empty".to_string());
@@ -56,16 +60,20 @@ pub(in crate::ui::widgets) fn parse_card_plugin_payload(
     payload: &[u8],
     limits: PluginOutputLimits,
 ) -> Result<CardPluginData, String> {
+    // Bounds check first to reject empty/oversized payloads before JSON parsing work.
     validate_payload_bounds(payload, limits)?;
     let parsed: CardPayload = serde_json::from_slice(payload)
         .map_err(|err| format!("invalid card plugin JSON payload: {err}"))?;
+    // Version gating keeps future schema changes from being interpreted incorrectly.
     validate_api_version(parsed.api_version)?;
 
+    // Trim and clamp body text to keep card layout bounded.
     let text = clamp_chars(parsed.text.trim(), MAX_CARD_TEXT_CHARS);
     if text.is_empty() {
         return Err("card plugin payload field \"text\" is empty".to_string());
     }
 
+    // Title override is optional; empty values are ignored so configured title remains.
     let title = parsed
         .title
         .as_deref()
@@ -80,6 +88,7 @@ fn validate_payload_bounds(payload: &[u8], limits: PluginOutputLimits) -> Result
     if payload.is_empty() {
         return Err("plugin payload is empty".to_string());
     }
+    // Payload byte cap is enforced before JSON decoding to avoid large allocations.
     if payload.len() > limits.max_output_bytes {
         return Err(format!(
             "plugin payload exceeded configured max_output_bytes ({} > {})",

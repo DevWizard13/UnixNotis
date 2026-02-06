@@ -43,6 +43,7 @@ pub(in crate::ui::widgets) struct CommandPlan {
 
 impl CommandPlan {
     fn timeout(self) -> Duration {
+        // Explicit timeout override is used by plugin-backed widgets.
         if let Some(timeout) = self.timeout_override {
             return timeout;
         }
@@ -145,12 +146,14 @@ pub(in crate::ui::widgets) fn run_command_capture_with_timeout_async(
     let (tx, rx) = async_channel::bounded(1);
     let cmd = cmd.trim();
     if cmd.is_empty() {
+        // Preserve receiver error semantics on invalid input.
         let _ = tx.send_blocking(Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "command was empty",
         )));
         return rx;
     }
+    // Reuse queueing and slow-command heuristics with only timeout overridden.
     let plan = resolve_command_plan(cmd, CommandKind::Slow).with_timeout(timeout);
     debug::log(PanelDebugLevel::Verbose, || {
         let snippet = util::log_snippet(cmd);

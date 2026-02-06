@@ -192,6 +192,7 @@ impl StatItem {
         card.append(&value_label);
 
         let builtin = if config.plugin.is_some() {
+            // Plugin-backed stats bypass builtin readers to avoid dual data sources.
             None
         } else {
             config
@@ -228,6 +229,7 @@ impl StatItem {
             return;
         }
         if let Some(plugin) = self.config.plugin.as_ref() {
+            // Plugin source has higher priority than legacy cmd/builtin paths.
             self.refresh_plugin(plugin, base_interval);
             return;
         }
@@ -358,6 +360,7 @@ impl StatItem {
         self.inflight.set(true);
         let command = plugin.command.clone();
         let timeout = Duration::from_millis(plugin.timeout_ms);
+        // Output byte cap mirrors sanitized config limits and guards parser memory use.
         let output_limits = PluginOutputLimits {
             max_output_bytes: plugin.max_output_bytes,
         };
@@ -382,6 +385,7 @@ impl StatItem {
                 Ok(output) => output,
                 Err(err) => {
                     warn!(command = %command, ?err, "stat plugin command failed");
+                    // Preserve last good value to avoid visual thrash on transient failures.
                     apply_cached_value(&label, &last_value);
                     refresh_backoff
                         .borrow_mut()
@@ -402,6 +406,7 @@ impl StatItem {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     warn!(command = %command, %err, "failed to parse stat plugin payload");
+                    // Parse failures are treated as transient command failures.
                     apply_cached_value(&label, &last_value);
                     refresh_backoff
                         .borrow_mut()

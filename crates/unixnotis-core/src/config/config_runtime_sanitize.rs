@@ -160,6 +160,7 @@ fn sanitize_widget_plugin(
         return;
     };
     if plugin_cfg.api_version != WidgetPluginConfig::API_VERSION_V1 {
+        // Unknown contract versions are disabled rather than best-effort parsed.
         warn!(
             widget_type,
             widget_label,
@@ -191,15 +192,19 @@ fn sanitize_widget_plugin(
     plugin_cfg.command = command.to_string();
 
     if plugin_cfg.timeout_ms == 0 {
+        // Zero timeout falls back to the canonical plugin default.
         plugin_cfg.timeout_ms = WidgetPluginConfig::default().timeout_ms;
     }
+    // Clamp timeout to bounded runtime to protect the widget worker queue.
     plugin_cfg.timeout_ms = plugin_cfg
         .timeout_ms
         .clamp(MIN_PLUGIN_TIMEOUT_MS, MAX_PLUGIN_TIMEOUT_MS);
 
     if plugin_cfg.max_output_bytes == 0 {
+        // Zero output budget falls back to the canonical plugin default.
         plugin_cfg.max_output_bytes = WidgetPluginConfig::default().max_output_bytes;
     }
+    // Clamp output budget to prevent unbounded buffering in command capture paths.
     plugin_cfg.max_output_bytes = plugin_cfg
         .max_output_bytes
         .clamp(MIN_PLUGIN_OUTPUT_BYTES, MAX_PLUGIN_OUTPUT_BYTES);

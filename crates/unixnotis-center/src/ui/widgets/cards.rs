@@ -175,6 +175,7 @@ impl CardItem {
             return;
         }
         if let Some(plugin) = self.config.plugin.as_ref() {
+            // Plugin source has higher priority than legacy cmd path.
             self.refresh_plugin(plugin, base_interval);
             return;
         }
@@ -247,6 +248,7 @@ impl CardItem {
         self.inflight.set(true);
         let command = plugin.command.clone();
         let timeout = Duration::from_millis(plugin.timeout_ms);
+        // Output byte cap mirrors sanitized config limits and guards parser memory use.
         let output_limits = PluginOutputLimits {
             max_output_bytes: plugin.max_output_bytes,
         };
@@ -272,6 +274,7 @@ impl CardItem {
                 Ok(output) => output,
                 Err(err) => {
                     warn!(command = %command, ?err, "card plugin command failed");
+                    // Preserve last good value to avoid visual churn on transient failures.
                     apply_cached_value(&body_label, &last_value);
                     refresh_backoff
                         .borrow_mut()
@@ -292,6 +295,7 @@ impl CardItem {
                 Ok(parsed) => parsed,
                 Err(err) => {
                     warn!(command = %command, %err, "failed to parse card plugin payload");
+                    // Parse failures are treated as transient command failures.
                     apply_cached_value(&body_label, &last_value);
                     refresh_backoff
                         .borrow_mut()
@@ -300,6 +304,7 @@ impl CardItem {
                 }
             };
             if let Some(title) = parsed.title.as_deref() {
+                // Optional runtime title allows plugins to annotate current state.
                 if title_label.text().as_str() != title {
                     title_label.set_text(title);
                 }
