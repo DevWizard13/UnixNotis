@@ -1,6 +1,6 @@
 //! Runtime sanitization and validation for configuration values.
 
-use super::{Config, PanelConfig, PopupConfig, ThemeConfig};
+use super::{Config, PanelConfig, PopupConfig, ThemeConfig, WidgetPluginConfig};
 use crate::{program_in_path, util};
 use tracing::warn;
 
@@ -16,6 +16,10 @@ const MAX_CARD_HEIGHT: i32 = 2048;
 // Theme guard rails keep layout values within reasonable bounds.
 const MAX_BORDER_WIDTH: u8 = 16;
 const MAX_CARD_RADIUS: u8 = 64;
+const MIN_PLUGIN_TIMEOUT_MS: u64 = 100;
+const MAX_PLUGIN_TIMEOUT_MS: u64 = 30_000;
+const MIN_PLUGIN_OUTPUT_BYTES: usize = 128;
+const MAX_PLUGIN_OUTPUT_BYTES: usize = 128 * 1024;
 
 pub(super) fn sanitize_config(config: &mut Config) {
     // Clamp refresh intervals to avoid busy loops or runaway timers.
@@ -76,9 +80,11 @@ pub(super) fn sanitize_config(config: &mut Config) {
     // Clamp min-height values directly; clamp covers negative inputs.
     for stat in &mut config.widgets.stats {
         stat.min_height = stat.min_height.clamp(0, MAX_CARD_HEIGHT);
+        sanitize_widget_plugin(&mut stat.plugin, "stat", &stat.label);
     }
     for card in &mut config.widgets.cards {
         card.min_height = card.min_height.clamp(0, MAX_CARD_HEIGHT);
+        sanitize_widget_plugin(&mut card.plugin, "card", &card.title);
     }
 
     let theme = &mut config.theme;
@@ -145,6 +151,60 @@ fn clamp_refresh_interval(value: u64, min: u64, max: u64) -> u64 {
     value.clamp(min, max)
 }
 
+fn sanitize_widget_plugin(
+    plugin: &mut Option<WidgetPluginConfig>,
+    widget_type: &str,
+    widget_label: &str,
+) {
+    let Some(plugin_cfg) = plugin.as_mut() else {
+        return;
+    };
+    if plugin_cfg.api_version != WidgetPluginConfig::API_VERSION_V1 {
+        warn!(
+            widget_type,
+            widget_label,
+            version = plugin_cfg.api_version,
+            "unsupported widget plugin api_version; disabling plugin"
+        );
+        *plugin = None;
+        return;
+    }
+
+    let command = plugin_cfg.command.trim();
+    if command.is_empty() {
+        warn!(
+            widget_type,
+            widget_label, "empty widget plugin command; disabling plugin"
+        );
+        *plugin = None;
+        return;
+    }
+    if !util::is_simple_command(command) {
+        // External widget plugins intentionally disallow shell meta syntax for security.
+        warn!(
+            widget_type,
+            widget_label, "widget plugin command must be a simple command; disabling plugin"
+        );
+        *plugin = None;
+        return;
+    }
+    plugin_cfg.command = command.to_string();
+
+    if plugin_cfg.timeout_ms == 0 {
+        plugin_cfg.timeout_ms = WidgetPluginConfig::default().timeout_ms;
+    }
+    plugin_cfg.timeout_ms = plugin_cfg
+        .timeout_ms
+        .clamp(MIN_PLUGIN_TIMEOUT_MS, MAX_PLUGIN_TIMEOUT_MS);
+
+    if plugin_cfg.max_output_bytes == 0 {
+        plugin_cfg.max_output_bytes = WidgetPluginConfig::default().max_output_bytes;
+    }
+    plugin_cfg.max_output_bytes = plugin_cfg
+        .max_output_bytes
+        .clamp(MIN_PLUGIN_OUTPUT_BYTES, MAX_PLUGIN_OUTPUT_BYTES);
+}
+
 fn warn_missing_shell(config: &Config) {
     if program_in_path("sh") {
         return;
@@ -185,20 +245,23 @@ fn config_requires_shell(config: &Config) -> bool {
         return true;
     }
 
-    if config
-        .widgets
-        .stats
-        .iter()
-        .any(|stat| command_requires_shell_opt(&stat.cmd))
-    {
+    if config.widgets.stats.iter().any(|stat| {
+        command_requires_shell_opt(&stat.cmd)
+            || stat
+                .plugin
+                .as_ref()
+                .is_some_and(|plugin| command_requires_shell(&plugin.command))
+    }) {
         return true;
     }
 
-    config
-        .widgets
-        .cards
-        .iter()
-        .any(|card| command_requires_shell_opt(&card.cmd))
+    config.widgets.cards.iter().any(|card| {
+        command_requires_shell_opt(&card.cmd)
+            || card
+                .plugin
+                .as_ref()
+                .is_some_and(|plugin| command_requires_shell(&plugin.command))
+    })
 }
 
 fn command_requires_shell_opt(value: &Option<String>) -> bool {
@@ -220,7 +283,7 @@ fn command_requires_shell(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config_widgets::{CardWidgetConfig, StatWidgetConfig};
+    use super::super::config_widgets::{CardWidgetConfig, StatWidgetConfig, WidgetPluginConfig};
     use super::*;
 
     #[test]
@@ -404,5 +467,36 @@ mod tests {
         assert_eq!(config.theme.card_alpha, 0.2);
         assert_eq!(config.theme.shadow_soft_alpha, 1.0);
         assert_eq!(config.theme.shadow_strong_alpha, 0.0);
+    }
+
+    #[test]
+    fn sanitize_widget_plugin_clamps_bounds_and_trim_command() {
+        let mut config = Config::default();
+        config.widgets.stats[0].plugin = Some(WidgetPluginConfig {
+            command: "  script arg  ".to_string(),
+            timeout_ms: MAX_PLUGIN_TIMEOUT_MS + 1,
+            max_output_bytes: MAX_PLUGIN_OUTPUT_BYTES + 10,
+            ..WidgetPluginConfig::default()
+        });
+        sanitize_config(&mut config);
+
+        let plugin = config.widgets.stats[0]
+            .plugin
+            .as_ref()
+            .expect("plugin should remain enabled");
+        assert_eq!(plugin.command, "script arg");
+        assert_eq!(plugin.timeout_ms, MAX_PLUGIN_TIMEOUT_MS);
+        assert_eq!(plugin.max_output_bytes, MAX_PLUGIN_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn sanitize_widget_plugin_rejects_shell_meta_commands() {
+        let mut config = Config::default();
+        config.widgets.cards[0].plugin = Some(WidgetPluginConfig {
+            command: "sh -c 'echo pwned | cat'".to_string(),
+            ..WidgetPluginConfig::default()
+        });
+        sanitize_config(&mut config);
+        assert!(config.widgets.cards[0].plugin.is_none());
     }
 }

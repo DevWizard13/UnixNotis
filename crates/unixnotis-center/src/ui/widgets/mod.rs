@@ -2,6 +2,7 @@
 
 pub mod brightness;
 pub mod cards;
+mod plugin;
 pub mod stats;
 pub mod toggles;
 pub mod volume;

@@ -20,6 +20,7 @@ use unixnotis_core::{util, NumericParseMode, PanelDebugLevel, SliderWidgetConfig
 use crate::debug;
 pub(super) use command_utils::{
     run_command, run_command_capture_async, run_command_capture_status_async,
+    run_command_capture_with_timeout_async,
 };
 pub(super) use watch_utils::{start_command_watch, CommandWatch};
 

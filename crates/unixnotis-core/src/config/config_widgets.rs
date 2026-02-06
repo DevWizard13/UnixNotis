@@ -243,12 +243,44 @@ impl Default for ToggleWidgetConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
+pub struct WidgetPluginConfig {
+    /// Versioned widget plugin contract.
+    pub api_version: u32,
+    /// Plugin command executed by the widget worker.
+    pub command: String,
+    /// Maximum allowed command runtime before timeout (milliseconds).
+    pub timeout_ms: u64,
+    /// Maximum accepted stdout payload size before parse rejection.
+    pub max_output_bytes: usize,
+}
+
+impl WidgetPluginConfig {
+    pub const API_VERSION_V1: u32 = 1;
+    const DEFAULT_TIMEOUT_MS: u64 = 2_000;
+    const DEFAULT_MAX_OUTPUT_BYTES: usize = 16 * 1024;
+}
+
+impl Default for WidgetPluginConfig {
+    fn default() -> Self {
+        Self {
+            api_version: Self::API_VERSION_V1,
+            command: String::new(),
+            timeout_ms: Self::DEFAULT_TIMEOUT_MS,
+            max_output_bytes: Self::DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
 pub struct StatWidgetConfig {
     pub enabled: bool,
     pub label: String,
     pub icon: Option<String>,
     pub kind: Option<String>,
     pub cmd: Option<String>,
+    /// External plugin source for this stat (preferred over cmd when set).
+    pub plugin: Option<WidgetPluginConfig>,
     pub min_height: i32,
 }
 
@@ -260,6 +292,7 @@ impl StatWidgetConfig {
             icon: Some("utilities-system-monitor-symbolic".to_string()),
             kind: None,
             cmd: Some("builtin:cpu".to_string()),
+            plugin: None,
             min_height: 72,
         }
     }
@@ -271,6 +304,7 @@ impl StatWidgetConfig {
             icon: Some("drive-harddisk-symbolic".to_string()),
             kind: None,
             cmd: Some("builtin:memory".to_string()),
+            plugin: None,
             min_height: 72,
         }
     }
@@ -282,6 +316,7 @@ impl StatWidgetConfig {
             icon: Some("battery-full-symbolic".to_string()),
             kind: None,
             cmd: Some("builtin:battery".to_string()),
+            plugin: None,
             min_height: 72,
         }
     }
@@ -295,6 +330,7 @@ impl Default for StatWidgetConfig {
             icon: None,
             kind: None,
             cmd: None,
+            plugin: None,
             min_height: 72,
         }
     }
@@ -309,6 +345,8 @@ pub struct CardWidgetConfig {
     pub subtitle: Option<String>,
     pub icon: Option<String>,
     pub cmd: Option<String>,
+    /// External plugin source for this card (preferred over cmd when set).
+    pub plugin: Option<WidgetPluginConfig>,
     pub min_height: i32,
     pub monospace: bool,
 }
@@ -322,6 +360,7 @@ impl CardWidgetConfig {
             subtitle: None,
             icon: Some("x-office-calendar-symbolic".to_string()),
             cmd: None,
+            plugin: None,
             min_height: 180,
             monospace: false,
         }
@@ -335,6 +374,7 @@ impl CardWidgetConfig {
             subtitle: Some("No data".to_string()),
             icon: Some("weather-clear-symbolic".to_string()),
             cmd: None,
+            plugin: None,
             min_height: 160,
             monospace: false,
         }
@@ -350,6 +390,7 @@ impl Default for CardWidgetConfig {
             subtitle: None,
             icon: None,
             cmd: None,
+            plugin: None,
             min_height: 120,
             monospace: false,
         }

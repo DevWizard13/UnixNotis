@@ -11,12 +11,15 @@ use std::time::{Duration, Instant};
 use gtk::prelude::*;
 use gtk::{glib, Align};
 use tracing::warn;
-use unixnotis_core::{PanelDebugLevel, StatWidgetConfig};
+use unixnotis_core::{PanelDebugLevel, StatWidgetConfig, WidgetPluginConfig};
 
 use crossbeam_channel as channel;
 
 use self::stats_builtin::BuiltinStat;
-use super::util::{run_command_capture_async, RefreshBackoff};
+use super::plugin::{parse_stat_plugin_payload, PluginOutputLimits};
+use super::util::{
+    run_command_capture_async, run_command_capture_with_timeout_async, RefreshBackoff,
+};
 use crate::debug;
 
 pub struct StatGrid {
@@ -188,10 +191,14 @@ impl StatItem {
         card.append(&header);
         card.append(&value_label);
 
-        let builtin = config
-            .cmd
-            .as_ref()
-            .and_then(|cmd| BuiltinStat::from_command(cmd));
+        let builtin = if config.plugin.is_some() {
+            None
+        } else {
+            config
+                .cmd
+                .as_ref()
+                .and_then(|cmd| BuiltinStat::from_command(cmd))
+        };
         // Builtin stats are cached so repeated refreshes avoid redundant parsing.
 
         Self {
@@ -218,6 +225,10 @@ impl StatItem {
             format!("stat refresh: {}", self.config.label)
         });
         if self.inflight.get() {
+            return;
+        }
+        if let Some(plugin) = self.config.plugin.as_ref() {
+            self.refresh_plugin(plugin, base_interval);
             return;
         }
         if let Some(builtin) = self.builtin.borrow_mut().take() {
@@ -340,6 +351,74 @@ impl StatItem {
                     .borrow_mut()
                     .note_success(Instant::now(), base_interval, changed);
             }
+        });
+    }
+
+    fn refresh_plugin(&self, plugin: &WidgetPluginConfig, base_interval: Duration) {
+        self.inflight.set(true);
+        let command = plugin.command.clone();
+        let timeout = Duration::from_millis(plugin.timeout_ms);
+        let output_limits = PluginOutputLimits {
+            max_output_bytes: plugin.max_output_bytes,
+        };
+        let rx = run_command_capture_with_timeout_async(&command, timeout);
+        let label = self.value_label.clone();
+        let inflight = self.inflight.clone();
+        let last_value = self.last_value.clone();
+        let refresh_backoff = self.refresh_backoff.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let output = match rx.recv().await {
+                Ok(output) => output,
+                Err(_) => {
+                    inflight.set(false);
+                    refresh_backoff
+                        .borrow_mut()
+                        .note_error(Instant::now(), base_interval);
+                    return;
+                }
+            };
+            inflight.set(false);
+            let output = match output {
+                Ok(output) => output,
+                Err(err) => {
+                    warn!(command = %command, ?err, "stat plugin command failed");
+                    apply_cached_value(&label, &last_value);
+                    refresh_backoff
+                        .borrow_mut()
+                        .note_error(Instant::now(), base_interval);
+                    return;
+                }
+            };
+            if !output.status.success() {
+                warn!(command = %command, "stat plugin command returned non-zero status");
+                apply_cached_value(&label, &last_value);
+                refresh_backoff
+                    .borrow_mut()
+                    .note_error(Instant::now(), base_interval);
+                return;
+            }
+
+            let parsed = match parse_stat_plugin_payload(&output.stdout, output_limits) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    warn!(command = %command, %err, "failed to parse stat plugin payload");
+                    apply_cached_value(&label, &last_value);
+                    refresh_backoff
+                        .borrow_mut()
+                        .note_error(Instant::now(), base_interval);
+                    return;
+                }
+            };
+            let changed = if last_value.borrow().as_deref() != Some(parsed.text.as_str()) {
+                label.set_text(&parsed.text);
+                *last_value.borrow_mut() = Some(parsed.text);
+                true
+            } else {
+                false
+            };
+            refresh_backoff
+                .borrow_mut()
+                .note_success(Instant::now(), base_interval, changed);
         });
     }
 

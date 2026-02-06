@@ -38,10 +38,14 @@ pub(in crate::ui::widgets) enum CommandKind {
 #[derive(Clone, Copy, Debug)]
 pub(in crate::ui::widgets) struct CommandPlan {
     kind: CommandKind,
+    timeout_override: Option<Duration>,
 }
 
 impl CommandPlan {
     fn timeout(self) -> Duration {
+        if let Some(timeout) = self.timeout_override {
+            return timeout;
+        }
         match self.kind {
             CommandKind::Fast => Duration::from_millis(FAST_TIMEOUT_MS),
             CommandKind::Slow => Duration::from_millis(SLOW_TIMEOUT_MS),
@@ -70,6 +74,13 @@ impl CommandPlan {
             .stderr(std::process::Stdio::null());
         command.spawn()
     }
+
+    fn with_timeout(self, timeout: Duration) -> Self {
+        Self {
+            timeout_override: Some(timeout),
+            ..self
+        }
+    }
 }
 
 pub(in crate::ui::widgets) fn resolve_command_plan(
@@ -81,7 +92,10 @@ pub(in crate::ui::widgets) fn resolve_command_plan(
     if default_kind != CommandKind::Action && is_probably_slow(cmd) {
         kind = CommandKind::Slow;
     }
-    CommandPlan { kind }
+    CommandPlan {
+        kind,
+        timeout_override: None,
+    }
 }
 
 pub(in crate::ui::widgets) fn run_command(cmd: &str) {
@@ -119,6 +133,28 @@ pub(in crate::ui::widgets) fn run_command_capture_async(
     debug::log(PanelDebugLevel::Verbose, || {
         let snippet = util::log_snippet(cmd);
         format!("enqueue slow command: {snippet}")
+    });
+    enqueue_command(cmd.to_string(), plan, Some(tx));
+    rx
+}
+
+pub(in crate::ui::widgets) fn run_command_capture_with_timeout_async(
+    cmd: &str,
+    timeout: Duration,
+) -> async_channel::Receiver<Result<Output, io::Error>> {
+    let (tx, rx) = async_channel::bounded(1);
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        let _ = tx.send_blocking(Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "command was empty",
+        )));
+        return rx;
+    }
+    let plan = resolve_command_plan(cmd, CommandKind::Slow).with_timeout(timeout);
+    debug::log(PanelDebugLevel::Verbose, || {
+        let snippet = util::log_snippet(cmd);
+        format!("enqueue custom-timeout command: {snippet}")
     });
     enqueue_command(cmd.to_string(), plan, Some(tx));
     rx

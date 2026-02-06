@@ -7,9 +7,12 @@ use std::time::{Duration, Instant};
 use gtk::prelude::*;
 use gtk::{glib, Align};
 use tracing::warn;
-use unixnotis_core::{CardWidgetConfig, PanelDebugLevel};
+use unixnotis_core::{CardWidgetConfig, PanelDebugLevel, WidgetPluginConfig};
 
-use super::util::{run_command_capture_async, RefreshBackoff};
+use super::plugin::{parse_card_plugin_payload, PluginOutputLimits};
+use super::util::{
+    run_command_capture_async, run_command_capture_with_timeout_async, RefreshBackoff,
+};
 use crate::debug;
 
 pub struct CardGrid {
@@ -20,6 +23,7 @@ pub struct CardGrid {
 struct CardItem {
     config: CardWidgetConfig,
     root: gtk::Box,
+    title_label: gtk::Label,
     body_label: gtk::Label,
     calendar: Option<gtk::Calendar>,
     is_calendar: bool,
@@ -105,10 +109,10 @@ impl CardItem {
             header.append(&icon);
         }
 
-        let title = gtk::Label::new(Some(&config.title));
-        title.add_css_class("unixnotis-info-title");
-        title.set_xalign(0.0);
-        header.append(&title);
+        let title_label = gtk::Label::new(Some(&config.title));
+        title_label.add_css_class("unixnotis-info-title");
+        title_label.set_xalign(0.0);
+        header.append(&title_label);
 
         let body_label = gtk::Label::new(Some(config.subtitle.as_deref().unwrap_or("")));
         body_label.add_css_class("unixnotis-info-body");
@@ -134,6 +138,7 @@ impl CardItem {
         Self {
             config,
             root,
+            title_label,
             body_label,
             calendar,
             is_calendar,
@@ -166,6 +171,13 @@ impl CardItem {
         debug::log(PanelDebugLevel::Verbose, || {
             format!("card refresh: {}", self.config.title)
         });
+        if self.inflight.get() {
+            return;
+        }
+        if let Some(plugin) = self.config.plugin.as_ref() {
+            self.refresh_plugin(plugin, base_interval);
+            return;
+        }
         let Some(cmd) = self.config.cmd.as_ref() else {
             // Static cards do not need repeated refresh work once visible.
             self.refresh_backoff
@@ -173,9 +185,6 @@ impl CardItem {
                 .note_success(Instant::now(), base_interval, false);
             return;
         };
-        if self.inflight.get() {
-            return;
-        }
         self.inflight.set(true);
         let cmd = cmd.clone();
         let rx = run_command_capture_async(&cmd);
@@ -231,6 +240,80 @@ impl CardItem {
                     .borrow_mut()
                     .note_success(Instant::now(), base_interval, changed);
             }
+        });
+    }
+
+    fn refresh_plugin(&self, plugin: &WidgetPluginConfig, base_interval: Duration) {
+        self.inflight.set(true);
+        let command = plugin.command.clone();
+        let timeout = Duration::from_millis(plugin.timeout_ms);
+        let output_limits = PluginOutputLimits {
+            max_output_bytes: plugin.max_output_bytes,
+        };
+        let rx = run_command_capture_with_timeout_async(&command, timeout);
+        let title_label = self.title_label.clone();
+        let body_label = self.body_label.clone();
+        let inflight = self.inflight.clone();
+        let last_value = self.last_value.clone();
+        let refresh_backoff = self.refresh_backoff.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let output = match rx.recv().await {
+                Ok(output) => output,
+                Err(_) => {
+                    inflight.set(false);
+                    refresh_backoff
+                        .borrow_mut()
+                        .note_error(Instant::now(), base_interval);
+                    return;
+                }
+            };
+            inflight.set(false);
+            let output = match output {
+                Ok(output) => output,
+                Err(err) => {
+                    warn!(command = %command, ?err, "card plugin command failed");
+                    apply_cached_value(&body_label, &last_value);
+                    refresh_backoff
+                        .borrow_mut()
+                        .note_error(Instant::now(), base_interval);
+                    return;
+                }
+            };
+            if !output.status.success() {
+                warn!(command = %command, "card plugin command returned non-zero status");
+                apply_cached_value(&body_label, &last_value);
+                refresh_backoff
+                    .borrow_mut()
+                    .note_error(Instant::now(), base_interval);
+                return;
+            }
+
+            let parsed = match parse_card_plugin_payload(&output.stdout, output_limits) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    warn!(command = %command, %err, "failed to parse card plugin payload");
+                    apply_cached_value(&body_label, &last_value);
+                    refresh_backoff
+                        .borrow_mut()
+                        .note_error(Instant::now(), base_interval);
+                    return;
+                }
+            };
+            if let Some(title) = parsed.title.as_deref() {
+                if title_label.text().as_str() != title {
+                    title_label.set_text(title);
+                }
+            }
+            let changed = if last_value.borrow().as_deref() != Some(parsed.text.as_str()) {
+                body_label.set_text(&parsed.text);
+                *last_value.borrow_mut() = Some(parsed.text);
+                true
+            } else {
+                false
+            };
+            refresh_backoff
+                .borrow_mut()
+                .note_success(Instant::now(), base_interval, changed);
         });
     }
 
