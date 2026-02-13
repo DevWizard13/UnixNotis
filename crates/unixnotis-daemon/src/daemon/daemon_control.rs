@@ -2,6 +2,7 @@
 //!
 //! Provides panel control, state queries, and inhibitor management.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt, TryStreamExt};
@@ -22,10 +23,54 @@ pub struct ControlServer {
 }
 
 const CLEAR_ALL_CONCURRENCY: usize = 64;
+// Restrict privileged control calls to known UnixNotis frontends.
+const TRUSTED_CONTROL_EXECUTABLES: [&str; 4] = [
+    "noticenterctl",
+    "unixnotis-center",
+    "unixnotis-popups",
+    "unixnotis-daemon",
+];
 
 impl ControlServer {
     pub fn new(state: Arc<DaemonState>) -> Self {
         Self { state }
+    }
+
+    async fn authorize_control_call(
+        &self,
+        header: &Header<'_>,
+        method: &'static str,
+    ) -> zbus::fdo::Result<()> {
+        let sender = header
+            .sender()
+            .ok_or_else(|| zbus::fdo::Error::AccessDenied("missing sender".to_string()))?;
+        let sender_name = sender.as_str().to_string();
+        let proxy = DBusProxy::new(self.state.connection())
+            .await
+            .map_err(to_fdo_error)?;
+        let bus_name = zbus::names::BusName::try_from(sender_name.as_str())
+            .map_err(|_| zbus::fdo::Error::AccessDenied("invalid sender".to_string()))?;
+        let pid = proxy.get_connection_unix_process_id(bus_name).await?;
+        let exe_path = read_process_executable_path(pid).await;
+        if !exe_path
+            .as_deref()
+            .is_some_and(is_trusted_control_executable_path)
+        {
+            warn!(
+                method,
+                sender = %sender_name,
+                pid,
+                executable = exe_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                "rejected untrusted control caller"
+            );
+            return Err(zbus::fdo::Error::AccessDenied(
+                "caller is not authorized for control operation".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -42,19 +87,28 @@ impl ControlServer {
         }
     }
 
-    async fn list_active(&self) -> Vec<NotificationView> {
+    async fn list_active(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<Vec<NotificationView>> {
+        self.authorize_control_call(&header, "ListActive").await?;
         let store = self.state.store.lock().await;
         // Active list is used for popup seeding and panel hydration.
-        store.list_active()
+        Ok(store.list_active())
     }
 
-    async fn list_history(&self) -> Vec<NotificationView> {
+    async fn list_history(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<Vec<NotificationView>> {
+        self.authorize_control_call(&header, "ListHistory").await?;
         let store = self.state.store.lock().await;
         // History list is used for panel hydration and pagination.
-        store.list_history()
+        Ok(store.list_history())
     }
 
-    async fn open_panel(&self) -> zbus::fdo::Result<()> {
+    async fn open_panel(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "OpenPanel").await?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Use a signal to keep UI and daemon loosely coupled.
@@ -63,7 +117,13 @@ impl ControlServer {
             .map_err(to_fdo_error)
     }
 
-    async fn open_panel_debug(&self, level: PanelDebugLevel) -> zbus::fdo::Result<()> {
+    async fn open_panel_debug(
+        &self,
+        level: PanelDebugLevel,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "OpenPanelDebug")
+            .await?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Debug open keeps the same panel request path with extra verbosity metadata.
@@ -72,7 +132,8 @@ impl ControlServer {
             .map_err(to_fdo_error)
     }
 
-    async fn close_panel(&self) -> zbus::fdo::Result<()> {
+    async fn close_panel(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "ClosePanel").await?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Close is a signal so the UI can apply its own visibility rules.
@@ -81,7 +142,8 @@ impl ControlServer {
             .map_err(to_fdo_error)
     }
 
-    async fn toggle_panel(&self) -> zbus::fdo::Result<()> {
+    async fn toggle_panel(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "TogglePanel").await?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Toggle is emitted as a request to avoid tight coupling to UI state.
@@ -90,7 +152,12 @@ impl ControlServer {
             .map_err(to_fdo_error)
     }
 
-    async fn set_dnd(&self, enabled: bool) -> zbus::fdo::Result<()> {
+    async fn set_dnd(
+        &self,
+        enabled: bool,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "SetDnd").await?;
         let (changed, persist) = {
             let mut store = self.state.store.lock().await;
             store.set_dnd(enabled)
@@ -180,20 +247,32 @@ impl ControlServer {
         Ok(())
     }
 
-    async fn list_inhibitors(&self) -> Vec<InhibitorInfo> {
+    async fn list_inhibitors(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<Vec<InhibitorInfo>> {
+        self.authorize_control_call(&header, "ListInhibitors")
+            .await?;
         let store = self.state.store.lock().await;
         // Returned list is already sorted for deterministic output.
-        store.list_inhibitors()
+        Ok(store.list_inhibitors())
     }
 
-    async fn dismiss(&self, id: u32) -> zbus::fdo::Result<()> {
+    async fn dismiss(&self, id: u32, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "Dismiss").await?;
         self.state
             .dismiss_from_panel(id)
             .await
             .map_err(to_fdo_error)
     }
 
-    async fn invoke_action(&self, id: u32, action_key: &str) -> zbus::fdo::Result<()> {
+    async fn invoke_action(
+        &self,
+        id: u32,
+        action_key: &str,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "InvokeAction").await?;
         let ctx = SignalContext::new(self.state.connection(), NOTIFICATIONS_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Action signals re-use the freedesktop notification interface path.
@@ -202,7 +281,8 @@ impl ControlServer {
             .map_err(to_fdo_error)
     }
 
-    async fn clear_all(&self) -> zbus::fdo::Result<()> {
+    async fn clear_all(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "ClearAll").await?;
         // Drain active notifications in one lock to avoid quadratic scans.
         let ids = {
             let mut store = self.state.store.lock().await;
@@ -333,4 +413,87 @@ pub async fn spawn_inhibitor_owner_watch(state: Arc<DaemonState>) -> zbus::Resul
         }
     });
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn read_process_executable_path(pid: u32) -> Option<PathBuf> {
+    // Resolve /proc/<pid>/exe so authorization is based on the real executable name.
+    let path = format!("/proc/{pid}/exe");
+    tokio::fs::read_link(path).await.ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn read_process_executable_path(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn is_trusted_control_executable_path(path: &Path) -> bool {
+    let observed = canonicalize_best_effort(path);
+    trusted_control_executable_paths()
+        .into_iter()
+        .any(|candidate| canonicalize_best_effort(&candidate) == observed)
+}
+
+fn trusted_control_executable_paths() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            directories.push(parent.to_path_buf());
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            directories.push(PathBuf::from(home).join(".local").join("bin"));
+        }
+    }
+    directories.push(PathBuf::from("/usr/local/bin"));
+    directories.push(PathBuf::from("/usr/bin"));
+    directories.push(PathBuf::from("/bin"));
+
+    let mut candidates = Vec::new();
+    for directory in directories {
+        for executable in TRUSTED_CONTROL_EXECUTABLES {
+            candidates.push(directory.join(executable));
+            candidates.push(directory.join(format!("{executable}.exe")));
+        }
+    }
+    candidates
+}
+
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::is_trusted_control_executable_path;
+
+    #[test]
+    fn trusted_control_executable_paths_in_known_dirs() {
+        let current_dir = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+            .expect("current exe parent");
+        assert!(is_trusted_control_executable_path(
+            &current_dir.join("noticenterctl")
+        ));
+        assert!(is_trusted_control_executable_path(
+            &current_dir.join("unixnotis-center")
+        ));
+        assert!(is_trusted_control_executable_path(
+            &current_dir.join("unixnotis-popups")
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_or_untrusted_paths() {
+        assert!(!is_trusted_control_executable_path(Path::new(
+            "/tmp/noticenterctl"
+        )));
+        assert!(!is_trusted_control_executable_path(Path::new(
+            "/usr/bin/python3"
+        )));
+    }
 }

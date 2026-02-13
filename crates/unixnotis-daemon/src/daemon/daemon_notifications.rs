@@ -17,6 +17,16 @@ use crate::expire::ExpirationScheduler;
 
 use super::{to_fdo_error, ControlServer, DaemonState, NOTIFICATIONS_OBJECT_PATH};
 
+// Defensive caps for untrusted D-Bus payload fields.
+const MAX_APP_NAME_BYTES: usize = 256;
+const MAX_APP_ICON_BYTES: usize = 1024;
+const MAX_SUMMARY_BYTES: usize = 1024;
+const MAX_BODY_BYTES: usize = 16 * 1024;
+const MAX_CATEGORY_BYTES: usize = 256;
+const MAX_ACTIONS: usize = 32;
+const MAX_ACTION_KEY_BYTES: usize = 128;
+const MAX_ACTION_LABEL_BYTES: usize = 256;
+
 /// D-Bus server for org.freedesktop.Notifications.
 pub struct NotificationServer {
     state: Arc<DaemonState>,
@@ -203,7 +213,10 @@ fn build_notification(
 ) -> Notification {
     // Derive common hints first so the UI and rule engine can make decisions.
     let urgency = Urgency::from_hint(hints.get("urgency"));
-    let category = hints.get("category").and_then(owned_to_string);
+    let category = hints
+        .get("category")
+        .and_then(owned_to_string)
+        .map(|value| truncate_utf8_bytes(&value, MAX_CATEGORY_BYTES));
     let is_transient = hints
         .get("transient")
         .and_then(|value| bool::try_from(value).ok())
@@ -219,11 +232,11 @@ fn build_notification(
         app_name: if app_name.is_empty() {
             "Unknown".to_string()
         } else {
-            app_name
+            truncate_utf8_bytes(&app_name, MAX_APP_NAME_BYTES)
         },
-        app_icon,
-        summary,
-        body,
+        app_icon: truncate_utf8_bytes(&app_icon, MAX_APP_ICON_BYTES),
+        summary: truncate_utf8_bytes(&summary, MAX_SUMMARY_BYTES),
+        body: truncate_utf8_bytes(&body, MAX_BODY_BYTES),
         actions: parse_actions(actions),
         hints,
         urgency,
@@ -239,15 +252,36 @@ fn build_notification(
 }
 
 fn parse_actions(raw: Vec<String>) -> Vec<Action> {
-    let mut actions = Vec::new();
+    let mut actions = Vec::with_capacity(raw.len().min(MAX_ACTIONS));
     let mut iter = raw.into_iter();
     // D-Bus actions arrive as [key, label] pairs; drop any trailing key without a label.
     while let Some(key) = iter.next() {
         if let Some(label) = iter.next() {
-            actions.push(Action { key, label });
+            if actions.len() >= MAX_ACTIONS {
+                break;
+            }
+            actions.push(Action {
+                key: truncate_utf8_bytes(&key, MAX_ACTION_KEY_BYTES),
+                label: truncate_utf8_bytes(&label, MAX_ACTION_LABEL_BYTES),
+            });
         }
     }
     actions
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    // Backtrack to the nearest UTF-8 boundary so truncation never produces invalid text.
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn resolve_expiration(config: &Config, notification: &Notification) -> Option<Instant> {
@@ -278,4 +312,51 @@ fn owned_to_string(value: &OwnedValue) -> Option<String> {
         .try_clone()
         .ok()
         .and_then(|owned| String::try_from(owned).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use zbus::zvariant::OwnedValue;
+
+    use super::{
+        build_notification, parse_actions, truncate_utf8_bytes, MAX_ACTIONS, MAX_BODY_BYTES,
+        MAX_SUMMARY_BYTES,
+    };
+
+    #[test]
+    fn truncate_utf8_bytes_preserves_character_boundaries() {
+        let value = "abc🙂def";
+        let truncated = truncate_utf8_bytes(value, 5);
+        assert_eq!(truncated, "abc");
+    }
+
+    #[test]
+    fn build_notification_clamps_summary_and_body_sizes() {
+        let summary = "S".repeat(MAX_SUMMARY_BYTES + 128);
+        let body = "B".repeat(MAX_BODY_BYTES + 512);
+        let notification = build_notification(
+            "app".to_string(),
+            "icon".to_string(),
+            summary,
+            body,
+            Vec::new(),
+            HashMap::<String, OwnedValue>::new(),
+            0,
+        );
+        assert!(notification.summary.len() <= MAX_SUMMARY_BYTES);
+        assert!(notification.body.len() <= MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn parse_actions_caps_pairs() {
+        let mut raw = Vec::new();
+        for idx in 0..(MAX_ACTIONS + 10) {
+            raw.push(format!("key-{idx}"));
+            raw.push(format!("label-{idx}"));
+        }
+        let actions = parse_actions(raw);
+        assert_eq!(actions.len(), MAX_ACTIONS);
+    }
 }
