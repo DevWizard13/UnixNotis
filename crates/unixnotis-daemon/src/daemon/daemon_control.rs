@@ -9,7 +9,7 @@ use futures_util::stream::{self, StreamExt, TryStreamExt};
 use tracing::warn;
 use unixnotis_core::{
     CloseReason, ControlState, InhibitorInfo, NotificationView, PanelDebugLevel, PanelRequest,
-    CONTROL_OBJECT_PATH,
+    CONTROL_OBJECT_PATH, INHIBIT_SCOPE_ALL, INHIBIT_SCOPE_POPUPS,
 };
 use zbus::fdo::DBusProxy;
 use zbus::message::Header;
@@ -30,6 +30,8 @@ const TRUSTED_CONTROL_EXECUTABLES: [&str; 4] = [
     "unixnotis-popups",
     "unixnotis-daemon",
 ];
+const MAX_INHIBITOR_REASON_BYTES: usize = 256;
+const MAX_ACTIVE_INHIBITORS: u32 = 128;
 
 impl ControlServer {
     pub fn new(state: Arc<DaemonState>) -> Self {
@@ -183,13 +185,21 @@ impl ControlServer {
         scope: u32,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<u64> {
+        self.authorize_control_call(&header, "Inhibit").await?;
         let sender = header
             .sender()
             .ok_or_else(|| zbus::fdo::Error::Failed("missing sender".to_string()))?;
+        let normalized_scope = normalize_inhibit_scope(scope)?;
+        let sanitized_reason = sanitize_inhibit_reason(reason);
         // Track inhibitors by unique bus name so cleanup on disconnect is reliable.
         let (id, active, count) = {
             let mut store = self.state.store.lock().await;
-            let id = store.add_inhibitor(sender.to_string(), reason.to_string(), scope);
+            if store.inhibitor_count() >= MAX_ACTIVE_INHIBITORS {
+                return Err(zbus::fdo::Error::Failed(format!(
+                    "inhibitor limit reached ({MAX_ACTIVE_INHIBITORS})"
+                )));
+            }
+            let id = store.add_inhibitor(sender.to_string(), sanitized_reason, normalized_scope);
             let active = store.inhibited();
             let count = store.inhibitor_count();
             (id, active, count)
@@ -464,11 +474,50 @@ fn canonicalize_best_effort(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn sanitize_inhibit_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return "manual".to_string();
+    }
+    truncate_utf8_bytes(trimmed, MAX_INHIBITOR_REASON_BYTES)
+}
+
+fn normalize_inhibit_scope(scope: u32) -> zbus::fdo::Result<u32> {
+    if scope == INHIBIT_SCOPE_ALL {
+        return Ok(INHIBIT_SCOPE_ALL);
+    }
+    let normalized = scope & INHIBIT_SCOPE_POPUPS;
+    if normalized == 0 {
+        return Err(zbus::fdo::Error::Failed(
+            "unsupported inhibit scope".to_string(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return String::new();
+    }
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::is_trusted_control_executable_path;
+    use unixnotis_core::{INHIBIT_SCOPE_ALL, INHIBIT_SCOPE_POPUPS};
+
+    use super::{
+        is_trusted_control_executable_path, normalize_inhibit_scope, sanitize_inhibit_reason,
+    };
 
     #[test]
     fn trusted_control_executable_paths_in_known_dirs() {
@@ -495,5 +544,26 @@ mod tests {
         assert!(!is_trusted_control_executable_path(Path::new(
             "/usr/bin/python3"
         )));
+    }
+
+    #[test]
+    fn sanitize_inhibit_reason_trims_and_bounds() {
+        assert_eq!(sanitize_inhibit_reason("   "), "manual");
+        let long = format!("{}🙂", "a".repeat(512));
+        let bounded = sanitize_inhibit_reason(&long);
+        assert!(bounded.len() <= 256);
+    }
+
+    #[test]
+    fn normalize_inhibit_scope_accepts_supported_values() {
+        assert_eq!(
+            normalize_inhibit_scope(INHIBIT_SCOPE_ALL).expect("scope"),
+            0
+        );
+        assert_eq!(
+            normalize_inhibit_scope(INHIBIT_SCOPE_POPUPS).expect("scope"),
+            INHIBIT_SCOPE_POPUPS
+        );
+        assert!(normalize_inhibit_scope(2).is_err());
     }
 }

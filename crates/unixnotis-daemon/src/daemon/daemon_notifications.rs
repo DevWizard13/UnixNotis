@@ -10,7 +10,7 @@ use tracing::debug;
 use unixnotis_core::{
     Action, CloseReason, Config, Notification, NotificationImage, Urgency, CONTROL_OBJECT_PATH,
 };
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{OwnedValue, Value};
 use zbus::{interface, SignalContext};
 
 use crate::expire::ExpirationScheduler;
@@ -26,6 +26,9 @@ const MAX_CATEGORY_BYTES: usize = 256;
 const MAX_ACTIONS: usize = 32;
 const MAX_ACTION_KEY_BYTES: usize = 128;
 const MAX_ACTION_LABEL_BYTES: usize = 256;
+const MAX_HINT_ENTRIES: usize = 16;
+const MAX_HINT_KEY_BYTES: usize = 64;
+const MAX_HINT_STRING_BYTES: usize = 2048;
 
 /// D-Bus server for org.freedesktop.Notifications.
 pub struct NotificationServer {
@@ -238,7 +241,7 @@ fn build_notification(
         summary: truncate_utf8_bytes(&summary, MAX_SUMMARY_BYTES),
         body: truncate_utf8_bytes(&body, MAX_BODY_BYTES),
         actions: parse_actions(actions),
-        hints,
+        hints: sanitize_hints_for_storage(hints),
         urgency,
         category,
         is_transient,
@@ -267,6 +270,49 @@ fn parse_actions(raw: Vec<String>) -> Vec<Action> {
         }
     }
     actions
+}
+
+fn sanitize_hints_for_storage(hints: HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
+    let mut sanitized = HashMap::with_capacity(hints.len().min(MAX_HINT_ENTRIES));
+    for (key, value) in hints {
+        if sanitized.len() >= MAX_HINT_ENTRIES {
+            break;
+        }
+        let key = truncate_utf8_bytes(key.trim(), MAX_HINT_KEY_BYTES);
+        if key.is_empty() {
+            continue;
+        }
+        let value = match key.as_str() {
+            // Keep only scalar hints that are actively used by sound logic and metadata derivation.
+            "sound-name" | "sound-file" | "category" => owned_to_string(&value).and_then(|text| {
+                let bounded = truncate_utf8_bytes(&text, MAX_HINT_STRING_BYTES);
+                string_to_owned_value(&bounded)
+            }),
+            "transient" | "resident" | "suppress-sound" => {
+                bool::try_from(&value).ok().map(OwnedValue::from)
+            }
+            "urgency" => parse_urgency_hint(&value).map(OwnedValue::from),
+            _ => None,
+        };
+        if let Some(value) = value {
+            sanitized.insert(key, value);
+        }
+    }
+    sanitized
+}
+
+fn string_to_owned_value(value: &str) -> Option<OwnedValue> {
+    OwnedValue::try_from(Value::from(value)).ok()
+}
+
+fn parse_urgency_hint(value: &OwnedValue) -> Option<u32> {
+    if let Ok(raw) = u8::try_from(value) {
+        return Some((raw as u32).min(2));
+    }
+    if let Ok(raw) = u32::try_from(value) {
+        return Some(raw.min(2));
+    }
+    None
 }
 
 fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
@@ -321,8 +367,8 @@ mod tests {
     use zbus::zvariant::OwnedValue;
 
     use super::{
-        build_notification, parse_actions, truncate_utf8_bytes, MAX_ACTIONS, MAX_BODY_BYTES,
-        MAX_SUMMARY_BYTES,
+        build_notification, owned_to_string, parse_actions, sanitize_hints_for_storage,
+        string_to_owned_value, truncate_utf8_bytes, MAX_ACTIONS, MAX_BODY_BYTES, MAX_SUMMARY_BYTES,
     };
 
     #[test]
@@ -358,5 +404,32 @@ mod tests {
         }
         let actions = parse_actions(raw);
         assert_eq!(actions.len(), MAX_ACTIONS);
+    }
+
+    #[test]
+    fn sanitize_hints_drops_untrusted_and_bounds_strings() {
+        let mut hints = HashMap::<String, OwnedValue>::new();
+        hints.insert("transient".to_string(), OwnedValue::from(true));
+        hints.insert(
+            "sound-name".to_string(),
+            string_to_owned_value(&"n".repeat(5000)).expect("sound-name"),
+        );
+        hints.insert("image-data".to_string(), OwnedValue::from(123u32));
+        hints.insert(
+            "x-custom".to_string(),
+            string_to_owned_value("custom").expect("custom"),
+        );
+
+        let sanitized = sanitize_hints_for_storage(hints);
+        assert_eq!(sanitized.len(), 2);
+        assert!(sanitized.contains_key("transient"));
+        assert!(sanitized.contains_key("sound-name"));
+        let sound_name = owned_to_string(
+            sanitized
+                .get("sound-name")
+                .expect("sound-name should remain"),
+        )
+        .expect("sound-name should be string");
+        assert!(sound_name.len() <= 2048);
     }
 }

@@ -299,6 +299,17 @@ pub(crate) fn restore_config(ctx: &mut ActionContext) -> Result<()> {
             );
             continue;
         }
+        if !is_restore_target_allowed(&config_dir, &target) {
+            log_line(
+                ctx,
+                format!(
+                    "Warning: skipped restoring {} because target escapes config dir ({})",
+                    name,
+                    format_with_home(&target)
+                ),
+            );
+            continue;
+        }
         if let Some(parent) = target.parent() {
             // Create parent directories for custom theme paths before restoring content.
             fs::create_dir_all(parent)
@@ -321,6 +332,48 @@ fn backup_stamp_from_system_time() -> Result<String> {
     Ok(Local::now().format("%Y-%m-%d").to_string())
 }
 
+fn is_restore_target_allowed(config_dir: &Path, target: &Path) -> bool {
+    let base = normalize_path_for_compare(config_dir);
+    let target = normalize_path_for_compare(target);
+    target.starts_with(&base)
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    // Canonicalize when possible and fall back to lexical normalization for missing paths.
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
+        return canonical;
+    }
+    if let Some(parent) = absolute.parent() {
+        if let Ok(parent_canonical) = fs::canonicalize(parent) {
+            if let Some(name) = absolute.file_name() {
+                return parent_canonical.join(name);
+            }
+            return parent_canonical;
+        }
+    }
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
 pub(super) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     // Write to a sibling temp file, then rename to avoid partial writes.
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -338,125 +391,5 @@ pub(super) fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{list_backup_dirs, prune_old_backups, BackupConfig};
-    use crate::detect::Detection;
-    use crate::events::UiMessage;
-    use crate::model::ActionMode;
-    use crate::paths::InstallPaths;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::mpsc;
-
-    #[test]
-    fn prune_old_backups_keeps_newest() {
-        // Ensures backup pruning keeps only the newest N directories by name.
-        let root = PathBuf::from("target").join(format!(
-            "unixnotis-installer-backup-prune-test-{}",
-            std::process::id()
-        ));
-        let _ = fs::create_dir_all(&root);
-        let names = [
-            "Backup-2024-01-01",
-            "Backup-2024-01-02",
-            "Backup-2024-01-03",
-            "Backup-2024-01-04",
-        ];
-        for name in names {
-            let _ = fs::create_dir_all(root.join(name));
-        }
-
-        let detection = Detection {
-            owner: None,
-            daemons: Vec::new(),
-        };
-        let paths = InstallPaths::discover().expect("paths should resolve in repo tests");
-        let (tx, _rx) = mpsc::sync_channel::<UiMessage>(8);
-        let mut ctx = crate::actions::ActionContext {
-            detection: &detection,
-            paths: &paths,
-            install_state: None,
-            log_tx: tx,
-            action_mode: ActionMode::Install,
-            restore_backup: None,
-        };
-        prune_old_backups(&mut ctx, &root, 2).expect("prune should succeed");
-
-        let mut remaining = list_backup_dirs(&root)
-            .into_iter()
-            .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        remaining.sort();
-        assert_eq!(
-            remaining,
-            vec![
-                "Backup-2024-01-03".to_string(),
-                "Backup-2024-01-04".to_string()
-            ]
-        );
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn backup_config_defaults_to_three() {
-        let config = BackupConfig::default();
-        assert_eq!(config.keep, 3);
-    }
-
-    #[test]
-    fn restore_config_uses_restored_theme_paths() {
-        let root = PathBuf::from("target").join(format!(
-            "unixnotis-installer-restore-test-{}",
-            std::process::id()
-        ));
-        let config_dir = root.join("unixnotis");
-        let _ = fs::create_dir_all(&config_dir);
-        let backup_dir = config_dir.join("Backup-2024-01-01");
-        let _ = fs::create_dir_all(&backup_dir);
-
-        let config_toml = r#"
-[theme]
-base_css = "themes/custom/base.css"
-panel_css = "themes/custom/panel.css"
-popup_css = "themes/custom/popup.css"
-widgets_css = "themes/custom/widgets.css"
-"#;
-        fs::write(backup_dir.join("config.toml"), config_toml).expect("write config");
-        fs::write(backup_dir.join("base.css"), "base").expect("write base");
-        fs::write(backup_dir.join("panel.css"), "panel").expect("write panel");
-        fs::write(backup_dir.join("popup.css"), "popup").expect("write popup");
-        fs::write(backup_dir.join("widgets.css"), "widgets").expect("write widgets");
-
-        let detection = Detection {
-            owner: None,
-            daemons: Vec::new(),
-        };
-        let paths = InstallPaths::discover().expect("paths should resolve in repo tests");
-        let (tx, _rx) = mpsc::sync_channel::<UiMessage>(8);
-        let mut ctx = crate::actions::ActionContext {
-            detection: &detection,
-            paths: &paths,
-            install_state: None,
-            log_tx: tx,
-            action_mode: ActionMode::Install,
-            restore_backup: Some(backup_dir.clone()),
-        };
-
-        super::restore_config(&mut ctx).expect("restore should succeed");
-
-        let config_path = config_dir.join("config.toml");
-        assert!(config_path.exists());
-        let custom_base = config_dir.join("themes").join("custom").join("base.css");
-        let custom_panel = config_dir.join("themes").join("custom").join("panel.css");
-        let custom_popup = config_dir.join("themes").join("custom").join("popup.css");
-        let custom_widgets = config_dir.join("themes").join("custom").join("widgets.css");
-        assert!(custom_base.exists());
-        assert!(custom_panel.exists());
-        assert!(custom_popup.exists());
-        assert!(custom_widgets.exists());
-
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(&root);
-    }
-}
+#[path = "actions_config_backup_tests.rs"]
+mod tests;
