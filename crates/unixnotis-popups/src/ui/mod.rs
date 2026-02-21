@@ -138,6 +138,7 @@ impl UiState {
     }
 
     fn reload_config(&mut self) {
+        // Config reload must fail soft so popup runtime stays alive on parse errors
         let config = match Config::load_from_path(&self.config_path) {
             Ok(config) => config,
             Err(err) => {
@@ -145,6 +146,7 @@ impl UiState {
                 return;
             }
         };
+        // Theme resolution uses config directory as the base for relative paths
         let theme_base = self
             .config_path
             .parent()
@@ -152,6 +154,7 @@ impl UiState {
             .unwrap_or_else(|| {
                 Config::default_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
+        // Theme path errors are reported without interrupting existing runtime state
         let theme_paths = match config.resolve_theme_paths_from(&theme_base) {
             Ok(paths) => paths,
             Err(err) => {
@@ -160,11 +163,10 @@ impl UiState {
             }
         };
 
+        // Swap config first so follow-up apply calls read coherent values
         self.config = config.clone();
-        // Keep click mode in sync before applying layout updates
-        self.popup_input_region
-            .set_allow_click_through(config.popups.allow_click_through);
         debug!("popup config reloaded");
+        // CSS updates are applied before window geometry so visual updates are atomic
         self.css.update_theme(theme_paths, config.theme.clone());
         self.css.reload(css::DEFAULT_CSS);
         apply_popup_config(

@@ -1,39 +1,52 @@
-//! Toggle widgets and state synchronization logic.
+//! Toggle widgets and state synchronization logic
+//!
+//! This module owns toggle widget construction and interaction wiring
+//! Heavy helper logic is split into focused submodules for maintainability
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::Duration;
 
 use gtk::prelude::*;
-use gtk::{glib, Align};
+use gtk::Align;
 use tracing::warn;
 use unixnotis_core::{PanelDebugLevel, ToggleWidgetConfig};
 
-use super::util::{
-    run_command, run_command_capture_status_async, start_command_watch, CommandWatch,
-};
+use super::util::{run_command, start_command_watch, CommandWatch};
 use crate::debug;
 
+mod css;
+mod icons;
+mod state;
+
+use self::css::toggle_kind_css_class;
+use self::icons::resolve_toggle_icon_name;
+use self::state::{refresh_toggle_state, schedule_toggle_refresh_with_retry};
+
 pub struct ToggleGrid {
+    // FlowBox root is exposed to the panel layout
     root: gtk::FlowBox,
+    // Item list is kept for refresh and watch lifecycle control
     items: Vec<ToggleItem>,
 }
 
-// Staggered delays keep post-action refreshes responsive without continuous polling.
-const TOGGLE_REFRESH_DELAYS_MS: &[u64] = &[0, 50, 100, 200, 400, 800];
-
 struct ToggleItem {
+    // Raw config is retained for watch/state command reuse
     config: ToggleWidgetConfig,
+    // Toggle button is the interactive control rendered in the grid
     button: gtk::ToggleButton,
+    // Guard blocks signal recursion when state updates set the button programmatically
     guard: Rc<Cell<bool>>,
+    // Monotonic generation token drops stale async refresh completions
     refresh_gen: Arc<AtomicU64>,
+    // Optional long-lived watch command handle for event-driven refresh paths
     watch_handle: Rc<RefCell<Option<CommandWatch>>>,
 }
 
 impl ToggleGrid {
     pub fn new(configs: &[ToggleWidgetConfig]) -> Option<Self> {
+        // Keep only enabled entries so UI wiring stays small and deterministic
         let mut items = Vec::new();
         for config in configs {
             if !config.enabled {
@@ -42,9 +55,11 @@ impl ToggleGrid {
             items.push(ToggleItem::new(config.clone()));
         }
         if items.is_empty() {
+            // Caller skips widget wiring entirely when no toggles are enabled
             return None;
         }
 
+        // FlowBox keeps toggle cards in a stable responsive row layout
         let root = gtk::FlowBox::new();
         root.add_css_class("unixnotis-toggle-grid");
         root.set_selection_mode(gtk::SelectionMode::None);
@@ -56,6 +71,7 @@ impl ToggleGrid {
         root.set_hexpand(true);
 
         for item in &items {
+            // Insert in config order so visual layout remains predictable
             root.insert(&item.button, -1);
         }
 
@@ -67,6 +83,7 @@ impl ToggleGrid {
     }
 
     pub fn refresh(&self) {
+        // Poll only items that are not currently watch-driven
         for item in &self.items {
             if item.needs_polling() {
                 item.refresh();
@@ -75,10 +92,12 @@ impl ToggleGrid {
     }
 
     pub fn needs_polling(&self) -> bool {
+        // Shared scheduler uses this to decide whether periodic refresh is needed
         self.items.iter().any(|item| item.needs_polling())
     }
 
     pub fn set_watch_active(&self, active: bool) {
+        // Panel visibility can enable or disable watches for all items in one pass
         for item in &self.items {
             item.set_watch_active(active);
         }
@@ -87,29 +106,29 @@ impl ToggleGrid {
 
 impl ToggleItem {
     fn new(config: ToggleWidgetConfig) -> Self {
+        // Guard and generation tokens are per-item to isolate async updates
         let guard = Rc::new(Cell::new(false));
         let refresh_gen = Arc::new(AtomicU64::new(0));
+
+        // Build base toggle card
         let button = gtk::ToggleButton::new();
         button.add_css_class("unixnotis-toggle");
-        // Add a stable kind-specific CSS class so themes can style per-toggle colors.
-        //
-        // The identifier is treated as user-controlled input, so it is sanitized
-        // into a conservative CSS-safe token before being used. This prevents
-        // invalid selectors and ensures the output remains deterministic.
+        button.set_focusable(true);
+        button.set_tooltip_text(Some(&config.label));
+
+        // Stable per-kind CSS classes let themes target each toggle consistently
         if let Some(kind) = config.kind.as_deref() {
             if let Some(class) = toggle_kind_css_class(kind) {
                 button.add_css_class(&class);
             }
         }
-        button.set_focusable(true);
-        button.set_tooltip_text(Some(&config.label));
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         content.set_halign(Align::Center);
         content.set_valign(Align::Center);
         content.add_css_class("unixnotis-toggle-content");
 
-        // Resolve missing symbolic names to theme-supported fallbacks
+        // Resolve themed icon names before creating the image so fallback is explicit
         let icon_name = resolve_toggle_icon_name(&config);
         if icon_name != config.icon {
             warn!(
@@ -121,6 +140,7 @@ impl ToggleItem {
         }
         let icon = gtk::Image::from_icon_name(&icon_name);
         icon.add_css_class("unixnotis-toggle-icon");
+
         let label = gtk::Label::new(Some(&config.label));
         label.add_css_class("unixnotis-toggle-label");
         label.set_xalign(0.0);
@@ -130,32 +150,39 @@ impl ToggleItem {
         content.append(&label);
         button.set_child(Some(&content));
 
+        // Clone command fields once so toggle callback stays allocation-light
         let guard_clone = guard.clone();
         let state_cmd = config.state_cmd.clone();
         let on_cmd = config.on_cmd.clone();
         let off_cmd = config.off_cmd.clone();
         let refresh_gen_for_toggle = refresh_gen.clone();
         let label = config.label.clone();
+
         button.connect_toggled(move |button| {
+            // Programmatic updates should not retrigger command execution
             if guard_clone.get() {
                 return;
             }
+
             debug::log(PanelDebugLevel::Info, || {
                 format!("toggle '{}' set to {}", label, button.is_active())
             });
+
             let command = if button.is_active() {
                 on_cmd.as_ref()
             } else {
                 off_cmd.as_ref()
             };
             if let Some(cmd) = command {
+                // Immediate command dispatch keeps UI interaction snappy
                 run_command(cmd);
             }
+
+            // Reconcile optimistic UI state with command result via short bounded retries
             if let Some(state_cmd) = state_cmd.clone() {
                 let guard = guard_clone.clone();
                 let refresh_gen = refresh_gen_for_toggle.clone();
                 let button = button.clone();
-                // The button state reflects user intent; the retries reconcile it with reality.
                 let expected = button.is_active();
                 schedule_toggle_refresh_with_retry(state_cmd, expected, button, guard, refresh_gen);
             }
@@ -168,11 +195,13 @@ impl ToggleItem {
             refresh_gen,
             watch_handle: Rc::new(RefCell::new(None)),
         };
+        // Prime initial state once after widget construction
         item.refresh();
         item
     }
 
     fn refresh(&self) {
+        // Items without state commands are display-only and skip refresh work
         if let Some(state_cmd) = self.config.state_cmd.as_ref() {
             refresh_toggle_state(state_cmd, &self.button, &self.guard, &self.refresh_gen);
         }
@@ -181,7 +210,7 @@ impl ToggleItem {
     fn needs_polling(&self) -> bool {
         let mut handle = self.watch_handle.borrow_mut();
         if let Some(watch) = handle.as_ref() {
-            // Drop inactive watches so polling can keep the toggle state in sync.
+            // Drop inactive watch handles so polling can backfill state updates
             if !watch.is_active() {
                 handle.take();
                 return true;
@@ -195,6 +224,7 @@ impl ToggleItem {
         if self.config.watch_cmd.is_none() || self.config.state_cmd.is_none() {
             return;
         }
+
         let mut handle = self.watch_handle.borrow_mut();
         if active {
             if handle.is_none() {
@@ -209,278 +239,22 @@ impl ToggleItem {
                     format!("toggle watch disabled: {}", self.config.label)
                 });
             }
+            // Dropping the handle stops the background watcher
             handle.take();
         }
     }
 
     fn start_watch(&self) -> Option<CommandWatch> {
+        // Watch mode requires both watch and state commands
         let watch_cmd = self.config.watch_cmd.as_ref()?;
         let state_cmd = self.config.state_cmd.as_ref()?.clone();
         let button = self.button.clone();
         let guard = self.guard.clone();
         let refresh_gen = self.refresh_gen.clone();
+
+        // Watch callbacks trigger the same refresh path as polling so semantics stay identical
         start_command_watch(watch_cmd, move || {
             refresh_toggle_state(&state_cmd, &button, &guard, &refresh_gen);
         })
-    }
-}
-
-fn resolve_toggle_icon_name(config: &ToggleWidgetConfig) -> String {
-    let requested = config.icon.trim();
-    // Empty configured icon should still produce a stable themed glyph
-    if requested.is_empty() {
-        return "applications-system-symbolic".to_string();
-    }
-    // Display can be unavailable during early startup paths
-    let Some(display) = gtk::gdk::Display::default() else {
-        return requested.to_string();
-    };
-    let theme = gtk::IconTheme::for_display(&display);
-    // Keep configured icon when the active theme provides it
-    if theme.has_icon(requested) {
-        return requested.to_string();
-    }
-
-    // Prefer kind-specific fallbacks so semantics stay recognizable
-    for fallback in toggle_icon_fallbacks(config) {
-        if theme.has_icon(fallback) {
-            return fallback.to_string();
-        }
-    }
-
-    // Last-resort generic system glyphs avoid red missing-icon placeholders
-    for fallback in [
-        "applications-system-symbolic",
-        "preferences-system-symbolic",
-    ] {
-        if theme.has_icon(fallback) {
-            return fallback.to_string();
-        }
-    }
-
-    requested.to_string()
-}
-
-fn toggle_icon_fallbacks(config: &ToggleWidgetConfig) -> &'static [&'static str] {
-    let kind = config.kind.as_deref().unwrap_or_default();
-    let kind = kind.trim().to_ascii_lowercase();
-    // Order matters here because the first present icon is selected
-    match kind.as_str() {
-        "wifi" => &[
-            "network-wireless-signal-excellent-symbolic",
-            "network-wireless-symbolic",
-            "network-workgroup-symbolic",
-        ],
-        "bluetooth" => &[
-            "bluetooth-active-symbolic",
-            "bluetooth-symbolic",
-            "network-wireless-symbolic",
-        ],
-        "airplane" => &[
-            "airplane-mode-symbolic",
-            "airplane-mode-disabled-symbolic",
-            "network-wireless-offline-symbolic",
-        ],
-        "night" => &[
-            "weather-clear-night-symbolic",
-            "display-brightness-symbolic",
-            "preferences-system-symbolic",
-        ],
-        _ => &[],
-    }
-}
-
-fn toggle_kind_css_class(kind: &str) -> Option<String> {
-    // Convert the configured kind into a CSS-safe class suffix.
-    //
-    // Constraints:
-    // - GTK CSS class names behave like identifiers; spaces and punctuation are invalid.
-    // - This function must be deterministic so user themes can rely on stable names.
-    //
-    // Output format:
-    // - "unixnotis-toggle-kind-<token>" where <token> is lowercase ascii [a-z0-9-].
-    let mut out = String::new();
-    let mut last_dash = false;
-    for ch in kind.chars() {
-        let mapped = match ch {
-            'a'..='z' | '0'..='9' => Some(ch),
-            'A'..='Z' => Some(ch.to_ascii_lowercase()),
-            '-' | '_' => Some('-'),
-            _ => Some('-'),
-        };
-        let ch = mapped?;
-        if ch == '-' {
-            if last_dash {
-                continue;
-            }
-            last_dash = true;
-        } else {
-            last_dash = false;
-        }
-        out.push(ch);
-    }
-    let token = out.trim_matches('-');
-    if token.is_empty() {
-        return None;
-    }
-    Some(format!("unixnotis-toggle-kind-{token}"))
-}
-
-fn refresh_toggle_state(
-    cmd: &str,
-    button: &gtk::ToggleButton,
-    guard: &Rc<Cell<bool>>,
-    refresh_gen: &Arc<AtomicU64>,
-) {
-    let cmd = cmd.to_string();
-    // Generation tokens prevent stale refreshes from overwriting newer state.
-    let gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
-    let button = button.clone();
-    let guard = guard.clone();
-    let refresh_gen = Arc::clone(refresh_gen);
-    glib::MainContext::default().spawn_local(async move {
-        let Some(active) = fetch_toggle_state(&cmd, true).await else {
-            return;
-        };
-        if refresh_gen.load(Ordering::Relaxed) != gen {
-            return;
-        }
-        if button.is_active() != active {
-            guard.set(true);
-            button.set_active(active);
-            guard.set(false);
-        }
-    });
-}
-
-fn schedule_toggle_refresh_with_retry(
-    state_cmd: String,
-    expected: bool,
-    button: gtk::ToggleButton,
-    guard: Rc<Cell<bool>>,
-    refresh_gen: Arc<AtomicU64>,
-) {
-    // Bounded retry keeps the UI honest for slow toggles without long-lived polling.
-    let gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
-    // Weak refs prevent the retry task from keeping the widget tree alive.
-    let button_weak = button.downgrade();
-    let guard_weak = Rc::downgrade(&guard);
-    let refresh_gen_weak = Arc::downgrade(&refresh_gen);
-    glib::MainContext::default().spawn_local(async move {
-        for (attempt, delay_ms) in TOGGLE_REFRESH_DELAYS_MS.iter().enumerate() {
-            if *delay_ms > 0 {
-                glib::timeout_future(Duration::from_millis(*delay_ms)).await;
-            }
-            let Some(refresh_gen) = refresh_gen_weak.upgrade() else {
-                return;
-            };
-            if refresh_gen.load(Ordering::Relaxed) != gen {
-                return;
-            }
-            // Limit warnings to the first attempt to avoid log spam during retries.
-            let log_failures = attempt == 0;
-            let Some(active) = fetch_toggle_state(&state_cmd, log_failures).await else {
-                continue;
-            };
-            if refresh_gen.load(Ordering::Relaxed) != gen {
-                return;
-            }
-            let (Some(button), Some(guard)) = (button_weak.upgrade(), guard_weak.upgrade()) else {
-                // Stop retries if the UI has been dropped to avoid needless work.
-                return;
-            };
-            if button.is_active() != active {
-                guard.set(true);
-                button.set_active(active);
-                guard.set(false);
-            }
-            if active == expected {
-                return;
-            }
-        }
-    });
-}
-
-async fn fetch_toggle_state(cmd: &str, log_failures: bool) -> Option<bool> {
-    let rx = run_command_capture_status_async(cmd);
-    let output = match rx.recv().await {
-        Ok(output) => output,
-        Err(_) => return None,
-    };
-    let output = match output {
-        Ok(output) => output,
-        Err(err) => {
-            if log_failures {
-                warn!(?cmd, ?err, "toggle state command failed");
-            }
-            return None;
-        }
-    };
-    let success = output.status.success();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Empty stdout is treated as success/failure status, otherwise parse text.
-    let active = if stdout.trim().is_empty() {
-        success
-    } else {
-        parse_toggle_state(&stdout)
-    };
-    Some(active)
-}
-
-fn parse_toggle_state(output: &str) -> bool {
-    for line in output.lines() {
-        let lower = line.trim().to_ascii_lowercase();
-        if lower.contains("powered") || lower.contains("powerstate") {
-            if lower.contains("no")
-                || lower.contains("off")
-                || lower.contains("false")
-                || lower.contains("disabled")
-            {
-                return false;
-            }
-            if lower.contains("yes")
-                || lower.contains("on")
-                || lower.contains("true")
-                || lower.contains("enabled")
-            {
-                return true;
-            }
-        }
-    }
-
-    let value = output.trim().to_ascii_lowercase();
-    // systemctl is-active returns "active"/"inactive"/"failed".
-    if matches!(value.as_str(), "active" | "activated") {
-        return true;
-    }
-    if matches!(value.as_str(), "inactive" | "failed" | "dead") {
-        return false;
-    }
-    if matches!(
-        value.as_str(),
-        "1" | "on" | "yes" | "true" | "enabled" | "up"
-    ) {
-        return true;
-    }
-    value
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|token| matches!(token, "on" | "yes" | "true" | "enabled" | "up" | "active"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::toggle_kind_css_class;
-
-    #[test]
-    fn kind_css_class_sanitizes_to_stable_token() {
-        assert_eq!(
-            toggle_kind_css_class("WiFi"),
-            Some("unixnotis-toggle-kind-wifi".to_string())
-        );
-        assert_eq!(
-            toggle_kind_css_class("airplane_mode"),
-            Some("unixnotis-toggle-kind-airplane-mode".to_string())
-        );
-        assert_eq!(toggle_kind_css_class("  !!!  "), None);
     }
 }
