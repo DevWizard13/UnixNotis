@@ -204,6 +204,7 @@ async fn join_async_reader(
 }
 
 fn read_to_end_limited<R: Read>(reader: R) -> io::Result<Vec<u8>> {
+    // Read at most limit + 1 so overflow can be detected without extra passes
     let mut limited = reader.take((MAX_CAPTURE_BYTES as u64) + 1);
     let mut buf = Vec::new();
     limited.read_to_end(&mut buf)?;
@@ -217,6 +218,7 @@ fn read_to_end_limited<R: Read>(reader: R) -> io::Result<Vec<u8>> {
 }
 
 async fn read_to_end_limited_async<R: AsyncRead + Unpin>(reader: R) -> io::Result<Vec<u8>> {
+    // Mirror blocking implementation so size limits are identical in both paths
     let mut limited = reader.take((MAX_CAPTURE_BYTES as u64) + 1);
     let mut buf = Vec::new();
     limited.read_to_end(&mut buf).await?;

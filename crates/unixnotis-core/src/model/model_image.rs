@@ -27,8 +27,9 @@ pub struct NotificationImage {
     pub icon_name: String,
 }
 
-const MAX_IMAGE_BYTES: usize = 1024 * 1024;
-const MAX_IMAGE_DIMENSION: i32 = 512;
+// Bound untrusted image payloads to keep daemon/UI memory predictable under floods.
+const MAX_IMAGE_BYTES: usize = 256 * 1024;
+const MAX_IMAGE_DIMENSION: i32 = 256;
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn has_ssse3() -> bool {

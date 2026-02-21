@@ -13,6 +13,8 @@ const MAX_POPUP_WIDTH: i32 = 2048;
 const MAX_SPACING: i32 = 256;
 const MAX_MARGIN: i32 = 512;
 const MAX_CARD_HEIGHT: i32 = 2048;
+const MAX_HISTORY_ENTRIES: usize = 5_000;
+const MAX_HISTORY_ACTIVE: usize = 1_000;
 // Theme guard rails keep layout values within reasonable bounds.
 const MAX_BORDER_WIDTH: u8 = 16;
 const MAX_CARD_RADIUS: u8 = 64;
@@ -76,6 +78,10 @@ pub(super) fn sanitize_config(config: &mut Config) {
     config.media.allowlist = normalize_media_tokens(&config.media.allowlist);
     config.media.denylist = normalize_media_tokens(&config.media.denylist);
     config.media.browser_tokens = normalize_media_tokens(&config.media.browser_tokens);
+
+    // Bound history settings so misconfigurations cannot create unbounded retention pressure.
+    config.history.max_active = config.history.max_active.min(MAX_HISTORY_ACTIVE);
+    config.history.max_entries = config.history.max_entries.min(MAX_HISTORY_ENTRIES);
 
     // Clamp min-height values directly; clamp covers negative inputs.
     for stat in &mut config.widgets.stats {
@@ -367,6 +373,16 @@ mod tests {
         assert_eq!(config.panel.height, MAX_PANEL_HEIGHT);
         assert_eq!(config.popups.width, MAX_POPUP_WIDTH);
         assert_eq!(config.popups.spacing, MAX_SPACING);
+    }
+
+    #[test]
+    fn sanitize_clamps_history_limits() {
+        let mut config = Config::default();
+        config.history.max_active = MAX_HISTORY_ACTIVE + 1_000;
+        config.history.max_entries = MAX_HISTORY_ENTRIES + 10_000;
+        sanitize_config(&mut config);
+        assert_eq!(config.history.max_active, MAX_HISTORY_ACTIVE);
+        assert_eq!(config.history.max_entries, MAX_HISTORY_ENTRIES);
     }
 
     #[test]

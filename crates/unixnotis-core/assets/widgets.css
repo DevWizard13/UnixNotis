@@ -297,6 +297,10 @@
 
 .unixnotis-toggle-icon {
   -gtk-icon-size: 18px;
+  /* Force symbolic rendering so toggle icons follow accent tint consistently */
+  -gtk-icon-style: symbolic;
+  /* Palette pins symbolic icon channels to the shared accent color */
+  -gtk-icon-palette: success @unixnotis-accent, warning @unixnotis-accent, error @unixnotis-accent;
   min-width: 24px;
   min-height: 24px;
   /* Icons inherit widget state; base color uses the cyan accent for clarity. */

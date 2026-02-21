@@ -20,17 +20,19 @@ pub(super) fn resolve_toggle_icon_name(config: &ToggleWidgetConfig) -> String {
         return requested.to_string();
     };
     let theme = gtk::IconTheme::for_display(&display);
-    // Kind is inferred once and reused across preference and fallback paths
+    // Kind is inferred once and reused across airplane overrides and fallbacks
     let kind = infer_toggle_icon_kind(config, requested);
 
-    // Some themes ship a low-quality airplane-mode glyph while also providing
-    // better flight-mode status icons. Prefer the status-style icon family for
-    // default airplane requests so visuals stay consistent with other toggles
-    if let Some(preferred) = preferred_airplane_icon(kind, requested, &theme) {
-        return preferred;
+    // Prefer flightmode aliases for airplane when available.
+    // Several icon themes provide better airplane visuals under these names.
+    if kind == ToggleIconKind::Airplane {
+        if let Some(preferred) = preferred_airplane_icon_name(requested, &theme) {
+            return preferred;
+        }
     }
 
     // Keep configured icon when the active theme has it
+    // This preserves user and default config intent, including airplane styling
     if theme.has_icon(requested) {
         return requested.to_string();
     }
@@ -47,36 +49,16 @@ pub(super) fn resolve_toggle_icon_name(config: &ToggleWidgetConfig) -> String {
         }
     }
 
-    // Keep original request when no safe semantic fallback exists
-    requested.to_string()
-}
-
-fn preferred_airplane_icon(
-    kind: ToggleIconKind,
-    requested: &str,
-    theme: &gtk::IconTheme,
-) -> Option<String> {
-    // Restrict override to airplane toggles only
-    if kind != ToggleIconKind::Airplane {
-        return None;
-    }
-    // Respect custom explicit icon names outside default airplane requests
-    if !matches!(requested, "airplane-mode-symbolic" | "airplane-mode") {
-        return None;
-    }
-
-    // Flightmode status icons usually look better with modern theme packs
-    for candidate in [
-        "network-flightmode-on",
-        "flightmode-on",
-        "airplane-mode-symbolic",
-        "airplane-mode",
-    ] {
-        if theme.has_icon(candidate) {
-            return Some(candidate.to_string());
+    // Always attempt safe generic symbols before returning a possibly-missing request
+    // This prevents red missing-icon placeholders when themes omit airplane aliases
+    for fallback in common_icon_fallbacks() {
+        if theme.has_icon(fallback) {
+            return fallback.to_string();
         }
     }
-    None
+
+    // Keep original request as the absolute final fallback
+    requested.to_string()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,13 +71,13 @@ enum ToggleIconKind {
 }
 
 fn resolve_symbolic_alias(requested: &str, theme: &gtk::IconTheme) -> Option<String> {
-    // First try dropping -symbolic for themes that only expose full-color names
-    if let Some(base) = requested.strip_suffix("-symbolic") {
-        if theme.has_icon(base) {
-            return Some(base.to_string());
-        }
-    } else {
-        // Then try adding -symbolic for themes that only expose symbolic names
+    // Preserve symbolic icon intent for toggle styling consistency
+    if requested.ends_with("-symbolic") {
+        return None;
+    }
+
+    // Try adding -symbolic for themes that only expose symbolic names
+    {
         let symbolic = format!("{requested}-symbolic");
         if theme.has_icon(&symbolic) {
             return Some(symbolic);
@@ -116,9 +98,11 @@ fn infer_toggle_icon_kind(config: &ToggleWidgetConfig, requested: &str) -> Toggl
     // Sources include kind, label, and icon to support older custom configs
     let sources = [kind.as_str(), label.as_str(), requested.as_str()];
 
+    // Bluetooth is matched first to avoid wireless overlap ambiguity
     if matches_any(&sources, &["bluetooth", "bluez", "network-bluetooth"]) {
         return ToggleIconKind::Bluetooth;
     }
+    // Airplane includes multiple aliases for legacy and custom config names
     if matches_any(
         &sources,
         &[
@@ -131,12 +115,14 @@ fn infer_toggle_icon_kind(config: &ToggleWidgetConfig, requested: &str) -> Toggl
     ) {
         return ToggleIconKind::Airplane;
     }
+    // Night detection includes backend names used in toggle runtime defaults
     if matches_any(
         &sources,
         &["night", "sunset", "gamma", "wlsunset", "hyprsunset"],
     ) {
         return ToggleIconKind::Night;
     }
+    // Wifi falls back last because many icon names include generic network terms
     if matches_any(
         &sources,
         &["wifi", "wi-fi", "wireless", "wlan", "network-wireless"],
@@ -154,6 +140,29 @@ fn matches_any(sources: &[&str], needles: &[&str]) -> bool {
             .copied()
             .any(|needle| source.contains(needle))
     })
+}
+
+fn preferred_airplane_icon_name(requested: &str, theme: &gtk::IconTheme) -> Option<String> {
+    let requested = requested.to_ascii_lowercase();
+    if !requested.contains("airplane") {
+        // Limit this override to airplane-labeled requests only
+        return None;
+    }
+
+    for candidate in [
+        // Prefer symbolic flightmode aliases to avoid dark hardcoded airplane glyphs
+        "network-flightmode-on-symbolic",
+        "network-flightmode-off-symbolic",
+        // Keep non-symbolic fallbacks for themes without symbolic variants
+        "network-flightmode-on",
+        "flightmode-on",
+    ] {
+        if theme.has_icon(candidate) {
+            // First match keeps icon selection stable across refreshes
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 fn toggle_icon_fallbacks(kind: ToggleIconKind) -> &'static [&'static str] {
@@ -184,16 +193,25 @@ fn toggle_icon_fallbacks(kind: ToggleIconKind) -> &'static [&'static str] {
             "bluetooth",
         ],
         ToggleIconKind::Airplane => &[
-            // Prefer explicit airplane/flightmode names to avoid unrelated glyphs
+            // Prefer symbolic names first so tinting matches other toggle icons
             "airplane-mode-symbolic",
             "airplane-mode-disabled-symbolic",
+            "network-flightmode-on-symbolic",
+            "network-flightmode-off-symbolic",
+            "route-transit-airplane-symbolic",
+            "xsi-airplane-symbolic",
+            "network-wireless-offline-symbolic",
+            "xsi-network-wireless-offline-symbolic",
+            // Fallback to non-symbolic flightmode names used by Breeze-like themes
             "network-flightmode-on",
             "network-flightmode-off",
             "flightmode-on",
             "flightmode-off",
+            "transport-mode-flight",
             "airplane-mode",
             "airplane",
-            "network-wireless-offline-symbolic",
+            // Last semantic symbol before generic cross-kind fallback
+            "network-wireless-disabled-symbolic",
         ],
         ToggleIconKind::Night => &[
             // Keep night icon semantics close to moon/brightness symbols
@@ -206,6 +224,15 @@ fn toggle_icon_fallbacks(kind: ToggleIconKind) -> &'static [&'static str] {
         ],
         ToggleIconKind::Unknown => &[],
     }
+}
+
+fn common_icon_fallbacks() -> &'static [&'static str] {
+    &[
+        // Generic symbols prevent missing-icon placeholders when kind-specific names are absent
+        "applications-system-symbolic",
+        "preferences-system-symbolic",
+        "network-wireless-symbolic",
+    ]
 }
 
 #[cfg(test)]
@@ -265,9 +292,11 @@ mod tests {
     }
 
     #[test]
-    fn airplane_fallbacks_prefer_flightmode_family() {
+    fn airplane_fallbacks_prefer_symbolic_family() {
         let fallbacks = toggle_icon_fallbacks(ToggleIconKind::Airplane);
         assert_eq!(fallbacks.first().copied(), Some("airplane-mode-symbolic"));
+        assert!(fallbacks.contains(&"route-transit-airplane-symbolic"));
         assert!(fallbacks.contains(&"network-flightmode-on"));
+        assert!(fallbacks.contains(&"flightmode-on"));
     }
 }

@@ -52,6 +52,21 @@ impl ControlServer {
             .map_err(to_fdo_error)?;
         let bus_name = zbus::names::BusName::try_from(sender_name.as_str())
             .map_err(|_| zbus::fdo::Error::AccessDenied("invalid sender".to_string()))?;
+        let caller_uid = proxy.get_connection_unix_user(bus_name.clone()).await?;
+        let expected_uid = unsafe { libc::geteuid() };
+        // Control operations are local-user only; reject cross-UID callers defensively.
+        if caller_uid != expected_uid {
+            warn!(
+                method,
+                sender = %sender_name,
+                uid = caller_uid,
+                expected_uid,
+                "rejected control caller with mismatched uid"
+            );
+            return Err(zbus::fdo::Error::AccessDenied(
+                "caller uid is not authorized for control operation".to_string(),
+            ));
+        }
         let pid = proxy.get_connection_unix_process_id(bus_name).await?;
         let exe_path = read_process_executable_path(pid).await;
         if !exe_path

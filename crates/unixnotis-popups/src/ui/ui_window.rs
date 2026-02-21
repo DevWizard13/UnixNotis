@@ -47,6 +47,7 @@ pub(super) fn build_popup_window(
         let stack = stack.clone();
         let input_region = input_region.clone();
         move |window| {
+            // Realize can happen before first map, so initialize region immediately
             // Realize is the first safe point for surface input-region calls
             refresh_popup_input_region(
                 window,
@@ -61,6 +62,7 @@ pub(super) fn build_popup_window(
         let stack = stack.clone();
         let input_region = input_region.clone();
         move |window| {
+            // Map callbacks catch compositor-side geometry changes at show time
             // Mapping can change surface geometry after realize
             refresh_popup_input_region(
                 window,
@@ -75,6 +77,7 @@ pub(super) fn build_popup_window(
         let stack = stack.clone();
         let input_region = input_region.clone();
         move |window| {
+            // DPI/scale changes move logical bounds, so hit regions must be regenerated
             // Scale changes alter pixel bounds so hit regions must be rebuilt
             refresh_popup_input_region(
                 window,
@@ -114,8 +117,10 @@ pub(super) fn apply_popup_config(
     };
 
     if let Some(monitor) = monitor.as_ref() {
+        // Pin popup layer-surface to selected monitor
         window.set_monitor(Some(monitor));
     } else {
+        // Clear monitor pin when discovery fails so compositor default is used
         window.set_monitor(None);
     }
 

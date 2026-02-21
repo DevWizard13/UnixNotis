@@ -35,7 +35,17 @@ fn make_notification(summary: &str) -> Notification {
         image: NotificationImage::default(),
         expire_timeout: 0,
         received_at: Utc::now(),
+        sender_name: Some(":1.test".to_string()),
+        sender_pid: Some(1234),
+        sender_executable: Some("/usr/bin/test-app".to_string()),
     }
+}
+
+fn make_notification_with_sender(summary: &str, sender: &str, pid: u32) -> Notification {
+    let mut notification = make_notification(summary);
+    notification.sender_name = Some(sender.to_string());
+    notification.sender_pid = Some(pid);
+    notification
 }
 
 fn make_store_with_limits(max_active: usize, max_entries: usize) -> NotificationStore {
@@ -145,6 +155,27 @@ fn replace_id_in_history_reuses_id_and_clears_entry() {
 }
 
 #[test]
+fn replace_id_rejected_for_different_sender() {
+    let mut store = make_store_with_limits(2, 10);
+
+    let first = store.insert(
+        make_notification_with_sender("first", ":1.sender-a", 101),
+        0,
+    );
+    store.close(first.notification.id);
+    assert_eq!(store.history_len(), 1);
+
+    // Cross-sender replacement must allocate a fresh id and keep prior history intact.
+    let replaced = store.insert(
+        make_notification_with_sender("replacement", ":1.sender-b", 202),
+        first.notification.id,
+    );
+    assert!(!replaced.replaced);
+    assert_ne!(replaced.notification.id, first.notification.id);
+    assert_eq!(store.history_len(), 1);
+}
+
+#[test]
 fn history_eviction_keeps_most_recent_entries() {
     let mut store = make_store_with_limits(0, 2);
 
@@ -240,6 +271,25 @@ fn inhibit_owner_mismatch_is_rejected() {
         .remove_inhibitor(id, "owner-b")
         .expect_err("owner mismatch should error");
     assert!(err.message().contains("owner-a"));
+}
+
+#[test]
+fn is_notification_owned_by_matches_sender() {
+    let mut store = make_store_with_limits(10, 10);
+    let outcome = store.insert(make_notification_with_sender("owned", ":1.owner", 1234), 0);
+    assert!(store.is_notification_owned_by(outcome.notification.id, ":1.owner", Some(1234)));
+    assert!(!store.is_notification_owned_by(outcome.notification.id, ":1.other", Some(5678)));
+}
+
+#[test]
+fn is_notification_owned_by_accepts_same_pid_after_reconnect() {
+    let mut store = make_store_with_limits(10, 10);
+    let outcome = store.insert(
+        make_notification_with_sender("owned", ":1.owner-a", 1234),
+        0,
+    );
+    // A new bus name from the same process should still be treated as owner.
+    assert!(store.is_notification_owned_by(outcome.notification.id, ":1.owner-b", Some(1234)));
 }
 
 #[test]

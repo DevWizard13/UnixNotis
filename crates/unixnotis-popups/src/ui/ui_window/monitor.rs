@@ -18,6 +18,7 @@ pub(super) fn find_monitor(output: &str) -> Option<gtk::gdk::Monitor> {
             continue;
         };
         if monitor_matches_output(&monitor, output) {
+            // First match wins to keep output mapping deterministic
             return Some(monitor);
         }
     }
@@ -38,6 +39,7 @@ fn monitor_matches_output(monitor: &gtk::gdk::Monitor, output: &str) -> bool {
         .as_deref()
         .is_some_and(|connector| connector.eq_ignore_ascii_case(output))
     {
+        // Connector match is authoritative for compositor-facing output names
         return true;
     }
 
@@ -68,12 +70,14 @@ pub(super) fn default_monitor() -> Option<gtk::gdk::Monitor> {
         let geometry = monitor.geometry();
         let area = i64::from(geometry.width()) * i64::from(geometry.height());
         if area > best_area {
+            // Keep largest monitor as default target for popup readability
             best_area = area;
             best = Some(monitor);
         }
     }
 
     if best.is_some() {
+        // Largest-area monitor is used when multiple candidates exist
         return best;
     }
 

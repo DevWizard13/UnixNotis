@@ -236,9 +236,13 @@ impl NotificationStore {
         }
         // Preserve protocol semantics: replaces_id only applies when it matches an existing item.
         let has_replaces_id = replaces_id != 0;
-        // Replacement is only true when the referenced notification is present.
+        // Replacement is permitted only for notifications owned by the same D-Bus sender.
         let replaced = has_replaces_id
-            && (self.active.contains_key(&replaces_id) || self.history.contains(&replaces_id));
+            && self.can_replace_notification_for_sender(
+                replaces_id,
+                notification.sender_name.as_deref(),
+                notification.sender_pid,
+            );
         let assigned_id = if replaced {
             replaces_id
         } else {
@@ -273,6 +277,13 @@ impl NotificationStore {
             self.push_history(notification.clone());
         }
         removed
+    }
+
+    pub fn is_notification_owned_by(&self, id: u32, sender: &str, sender_pid: Option<u32>) -> bool {
+        let Some(notification) = self.active.get(&id) else {
+            return false;
+        };
+        notification_is_owned_by(notification, Some(sender), sender_pid)
     }
 
     pub fn clear_history(&mut self) {
@@ -431,6 +442,36 @@ impl NotificationStore {
             .inhibitors
             .values()
             .any(|inhibitor| inhibits_popups(inhibitor.scope));
+    }
+
+    fn can_replace_notification_for_sender(
+        &self,
+        id: u32,
+        sender: Option<&str>,
+        sender_pid: Option<u32>,
+    ) -> bool {
+        // Replacement is restricted to the original owner to prevent cross-app hijacking
+        let Some(existing) = self.active.get(&id).or_else(|| self.history.get(&id)) else {
+            return false;
+        };
+        notification_is_owned_by(existing, sender, sender_pid)
+    }
+}
+
+fn notification_is_owned_by(
+    notification: &Notification,
+    sender: Option<&str>,
+    sender_pid: Option<u32>,
+) -> bool {
+    // PID checks tolerate reconnecting clients while still blocking cross-process mutations.
+    if let (Some(caller_pid), Some(owner_pid)) = (sender_pid, notification.sender_pid) {
+        if caller_pid == owner_pid {
+            return true;
+        }
+    }
+    match (sender, notification.sender_name.as_deref()) {
+        (Some(caller), Some(owner)) => caller == owner,
+        _ => false,
     }
 }
 

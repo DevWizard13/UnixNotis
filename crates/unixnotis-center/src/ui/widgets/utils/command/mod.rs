@@ -30,8 +30,11 @@ const SLOW_JITTER_MS: u64 = 200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(in crate::ui::widgets) enum CommandKind {
+    // Fast probes such as state checks
     Fast,
+    // Potentially expensive reads that may involve D-Bus or shell pipelines
     Slow,
+    // User-triggered actions where responsiveness matters more than throughput
     Action,
 }
 
@@ -55,6 +58,7 @@ impl CommandPlan {
     }
 
     fn jitter(self) -> Duration {
+        // Jitter applies only to slow commands to desynchronize refresh bursts
         if self.kind != CommandKind::Slow || SLOW_JITTER_MS == 0 {
             return Duration::from_millis(0);
         }
@@ -88,6 +92,7 @@ pub(in crate::ui::widgets) fn resolve_command_plan(
     cmd: &str,
     default_kind: CommandKind,
 ) -> CommandPlan {
+    // Start with caller intent and upgrade only when heuristics require it
     let mut kind = default_kind;
     // Action commands remain action-class even if the heuristic marks them slow.
     if default_kind != CommandKind::Action && is_probably_slow(cmd) {
@@ -100,6 +105,7 @@ pub(in crate::ui::widgets) fn resolve_command_plan(
 }
 
 pub(in crate::ui::widgets) fn run_command(cmd: &str) {
+    // Whitespace-only command strings are rejected early to keep logs meaningful
     let cmd = cmd.trim();
     if cmd.is_empty() {
         warn!("command was empty");
@@ -120,6 +126,7 @@ pub(in crate::ui::widgets) fn run_command(cmd: &str) {
 pub(in crate::ui::widgets) fn run_command_capture_async(
     cmd: &str,
 ) -> async_channel::Receiver<Result<Output, io::Error>> {
+    // Single-result channel keeps queue semantics simple for UI callers
     let (tx, rx) = async_channel::bounded(1);
     let cmd = cmd.trim();
     if cmd.is_empty() {
@@ -143,6 +150,7 @@ pub(in crate::ui::widgets) fn run_command_capture_with_timeout_async(
     cmd: &str,
     timeout: Duration,
 ) -> async_channel::Receiver<Result<Output, io::Error>> {
+    // Timeout-aware variant is used primarily by plugin-backed widgets
     let (tx, rx) = async_channel::bounded(1);
     let cmd = cmd.trim();
     if cmd.is_empty() {
@@ -166,6 +174,7 @@ pub(in crate::ui::widgets) fn run_command_capture_with_timeout_async(
 pub(in crate::ui::widgets) fn run_command_capture_status_async(
     cmd: &str,
 ) -> async_channel::Receiver<Result<Output, io::Error>> {
+    // Status probe path uses a smaller default timeout budget
     let (tx, rx) = async_channel::bounded(1);
     let cmd = cmd.trim();
     if cmd.is_empty() {

@@ -17,34 +17,46 @@ use crossbeam_channel as channel;
 
 use self::stats_builtin::BuiltinStat;
 use super::plugin::{parse_stat_plugin_payload, PluginOutputLimits};
-use super::util::{
+use super::utils::{
     run_command_capture_async, run_command_capture_with_timeout_async, RefreshBackoff,
 };
 use crate::debug;
 
 pub struct StatGrid {
+    // FlowBox root is embedded by the panel widget tree
     root: gtk::FlowBox,
+    // Per-stat item state is retained for refresh scheduling
     items: Vec<StatItem>,
 }
 
 struct StatItem {
+    // Raw config is retained for command/plugin selection and labels
     config: StatWidgetConfig,
+    // Root card inserted into the grid
     root: gtk::Box,
+    // Render target for the latest stat value
     value_label: gtk::Label,
+    // Optional builtin reader reused across refresh calls
     builtin: Rc<RefCell<Option<BuiltinStat>>>,
+    // Guard prevents overlapping command or builtin reads
     inflight: Rc<Cell<bool>>,
+    // Cached value avoids unnecessary relayout for unchanged results
     last_value: Rc<RefCell<Option<String>>>,
     // Backoff reduces repeated reads when the value is stable.
     refresh_backoff: Rc<RefCell<RefreshBackoff>>,
 }
 
 struct BuiltinStatJob {
+    // Builtin reader variant to execute on the worker thread
     stat: BuiltinStat,
+    // One-shot response channel used to return the sampled value
     respond: async_channel::Sender<(BuiltinStat, String)>,
 }
 
 struct BuiltinStatWorker {
+    // Bounded queue feeding the dedicated builtin worker thread
     tx: channel::Sender<BuiltinStatJob>,
+    // True when worker startup failed and callers should read inline
     inline_fallback: bool,
     // Test-only receiver guard keeps the queue alive when no workers are spawned.
     #[cfg(test)]
@@ -125,9 +137,11 @@ impl StatGrid {
             if !config.enabled {
                 continue;
             }
+            // Preserve config order so layout remains predictable for users
             items.push(StatItem::new(config.clone()));
         }
         if items.is_empty() {
+            // Skip widget creation when all stat entries are disabled
             return None;
         }
 
@@ -142,6 +156,7 @@ impl StatGrid {
         root.set_hexpand(true);
 
         for item in &items {
+            // Insert in order so per-widget identity stays stable
             root.insert(&item.root, -1);
         }
 
@@ -247,6 +262,7 @@ impl StatItem {
             return;
         }
         if let Some(builtin) = self.builtin.borrow_mut().take() {
+            // Temporarily take builtin state to prevent overlapping reads
             self.inflight.set(true);
             let (tx, rx) = async_channel::bounded(1);
             let mut fallback = builtin.clone();
@@ -285,17 +301,20 @@ impl StatItem {
                 };
                 *builtin_cell.borrow_mut() = Some(builtin);
                 if value.is_empty() {
+                    // Empty command output keeps the previous stable value visible
                     apply_cached_value(&label, &last_value);
                     refresh_backoff
                         .borrow_mut()
                         .note_success(Instant::now(), base_interval, false);
                 } else if last_value.borrow().as_deref() != Some(&value) {
+                    // Label updates are applied only on actual value changes
                     label.set_text(&value);
                     *last_value.borrow_mut() = Some(value);
                     refresh_backoff
                         .borrow_mut()
                         .note_success(Instant::now(), base_interval, true);
                 } else {
+                    // Unchanged values only advance backoff cadence
                     refresh_backoff
                         .borrow_mut()
                         .note_success(Instant::now(), base_interval, false);

@@ -1,15 +1,10 @@
-//! Shared widget helpers and command plumbing.
-
-#[path = "command/command_utils.rs"]
-mod command_utils;
-#[path = "watch_utils.rs"]
-mod watch_utils;
+//! Command-backed slider widget and refresh wiring
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use glib::clone;
 use gtk::prelude::*;
@@ -17,95 +12,44 @@ use gtk::Align;
 use tracing::warn;
 use unixnotis_core::{util, NumericParseMode, PanelDebugLevel, SliderWidgetConfig};
 
+use super::slider_icons::resolve_slider_icon_name;
+use super::slider_parse::{format_value, parse_muted, parse_numeric};
+use super::{run_command, run_command_capture_status_async, start_command_watch, CommandWatch};
 use crate::debug;
-pub(super) use command_utils::{
-    run_command, run_command_capture_async, run_command_capture_status_async,
-    run_command_capture_with_timeout_async,
-};
-pub(super) use watch_utils::{start_command_watch, CommandWatch};
-
-// Backoff keeps stable widgets from re-running commands on every tick.
-const REFRESH_BACKOFF_MAX_MULT: u64 = 4;
-const REFRESH_BACKOFF_STABLE_AFTER: u8 = 2;
-const REFRESH_BACKOFF_ERROR_AFTER: u8 = 2;
-
-#[derive(Debug, Default)]
-pub(super) struct RefreshBackoff {
-    next_due: Option<Instant>,
-    stable_streak: u8,
-    error_streak: u8,
-    backoff_mult: u64,
-}
-
-impl RefreshBackoff {
-    pub(super) fn should_refresh(&self, now: Instant, force: bool) -> bool {
-        if force {
-            return true;
-        }
-        match self.next_due {
-            Some(due) => now >= due,
-            None => true,
-        }
-    }
-
-    pub(super) fn note_success(&mut self, now: Instant, base: Duration, changed: bool) {
-        self.error_streak = 0;
-        if changed {
-            // Reset the backoff when data changes to keep the UI responsive.
-            self.stable_streak = 0;
-            self.backoff_mult = 1;
-        } else {
-            self.stable_streak = self.stable_streak.saturating_add(1);
-            if self.stable_streak >= REFRESH_BACKOFF_STABLE_AFTER {
-                self.backoff_mult = (self.backoff_mult.max(1) * 2).min(REFRESH_BACKOFF_MAX_MULT);
-            }
-        }
-        self.next_due = Some(now + scale_duration(base, self.backoff_mult.max(1)));
-    }
-
-    pub(super) fn note_error(&mut self, now: Instant, base: Duration) {
-        // Keep retrying quickly at first, then back off to reduce churn on persistent failures.
-        self.error_streak = self.error_streak.saturating_add(1);
-        self.stable_streak = 0;
-        if self.error_streak >= REFRESH_BACKOFF_ERROR_AFTER {
-            self.backoff_mult = (self.backoff_mult.max(1) * 2).min(REFRESH_BACKOFF_MAX_MULT);
-        } else {
-            self.backoff_mult = 1;
-        }
-        self.next_due = Some(now + scale_duration(base, self.backoff_mult.max(1)));
-    }
-
-    pub(super) fn next_due_in(&self, now: Instant) -> Option<Duration> {
-        self.next_due.map(|due| due.saturating_duration_since(now))
-    }
-}
-
-fn scale_duration(base: Duration, mult: u64) -> Duration {
-    let base_ms = base.as_millis();
-    let scaled = base_ms.saturating_mul(mult as u128);
-    Duration::from_millis(scaled.min(u64::MAX as u128) as u64)
-}
 
 pub struct CommandSlider {
+    // Root widget embedded by higher-level widget wrappers
     pub root: gtk::Box,
+    // Interactive value control
     scale: gtk::Scale,
+    // Human-readable percentage label
     value_label: gtk::Label,
+    // Icon button used for mute/toggle actions when configured
     icon_button: gtk::Button,
+    // Default icon shown when slider is not muted
     icon_name: String,
+    // Optional icon variant for muted state
     icon_muted: Option<String>,
+    // Config is retained for refresh and watch lifecycle operations
     config: SliderWidgetConfig,
+    // Guard blocks recursive value-changed signals during internal updates
     updating: Rc<Cell<bool>>,
+    // Generation token avoids stale async refresh races
     refresh_gen: Arc<AtomicU64>,
+    // Optional watch command handle for event-driven refresh
     watch_handle: RefCell<Option<CommandWatch>>,
 }
 
 impl CommandSlider {
     pub fn new(config: SliderWidgetConfig, extra_class: &str) -> Self {
+        // Root combines base style with caller-provided variant class
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 10);
         root.add_css_class("unixnotis-quick-slider");
         root.add_css_class(extra_class);
 
-        let icon_button = gtk::Button::from_icon_name(&config.icon);
+        // Resolve icon upfront so themes without exact names still render valid glyphs
+        let icon_name = resolve_slider_icon_name(&config.label, &config.icon);
+        let icon_button = gtk::Button::from_icon_name(&icon_name);
         icon_button.add_css_class("unixnotis-quick-slider-icon");
         icon_button.set_valign(Align::Center);
         icon_button.set_halign(Align::Center);
@@ -120,7 +64,7 @@ impl CommandSlider {
         scale.set_hexpand(true);
         scale.set_vexpand(false);
         scale.set_valign(Align::Center);
-        // Ensure GTK gets a non-negative minimum size to avoid layout warnings.
+        // Ensure GTK gets a non-negative minimum size to avoid layout warnings
         scale.set_size_request(180, 24);
         scale.set_width_request(180);
         scale.set_height_request(24);
@@ -137,11 +81,14 @@ impl CommandSlider {
         root.append(&value_label);
 
         let updating = Rc::new(Cell::new(false));
+        // Debounce state coalesces slider drags into fewer set_cmd executions
         let pending = Rc::new(RefCell::new(None));
         let pending_value = Rc::new(Cell::new(None));
         let refresh_gen = Arc::new(AtomicU64::new(0));
-        let icon_name = config.icon.clone();
-        let icon_muted = config.icon_muted.clone();
+        let icon_muted = config
+            .icon_muted
+            .as_deref()
+            .map(|name| resolve_slider_icon_name(&config.label, name));
         let min = config.min;
         let max = config.max;
         let parse_mode = config.parse_mode;
@@ -173,7 +120,7 @@ impl CommandSlider {
                 #[strong]
                 refresh_icon_muted,
                 move |_| {
-                    // Weak widget captures avoid self-referential signal cycles.
+                    // Weak widget captures avoid self-referential signal cycles
                     run_command(&cmd);
                     glib::timeout_add_local(
                         Duration::from_millis(160),
@@ -226,6 +173,7 @@ impl CommandSlider {
         let pending_value_guard = pending_value.clone();
         let label_clone = value_label.clone();
         scale.connect_value_changed(move |scale| {
+            // Skip callback body when value is being updated programmatically
             if updating_guard.get() {
                 return;
             }
@@ -254,6 +202,7 @@ impl CommandSlider {
     }
 
     pub fn refresh(&self) {
+        // Public refresh path delegates to shared async fetch routine
         refresh_inner(
             self.config.get_cmd.clone(),
             self.config.min,
@@ -272,7 +221,7 @@ impl CommandSlider {
     pub fn needs_polling(&self) -> bool {
         let mut handle = self.watch_handle.borrow_mut();
         if let Some(watch) = handle.as_ref() {
-            // If the watch command exited, fall back to polling and allow a new watch later.
+            // If the watch command exited, fall back to polling and allow a new watch later
             if !watch.is_active() {
                 handle.take();
                 return true;
@@ -283,6 +232,7 @@ impl CommandSlider {
     }
 
     pub fn set_watch_active(&self, active: bool) {
+        // Widgets without a watch command rely on polling only
         if self.config.watch_cmd.is_none() {
             return;
         }
@@ -297,6 +247,7 @@ impl CommandSlider {
     }
 
     fn start_watch(&self) -> Option<CommandWatch> {
+        // Watch callbacks reuse polling refresh logic to keep semantics consistent
         let cmd = self.config.watch_cmd.as_ref()?;
         let refresh_cmd = self.config.get_cmd.clone();
         let refresh_scale = self.scale.clone();
@@ -341,6 +292,7 @@ fn refresh_inner(
     icon_muted: Option<String>,
     parse_mode: NumericParseMode,
 ) {
+    // Claim generation so older async command results cannot overwrite new state
     let gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
 
     let rx = run_command_capture_status_async(&cmd);
@@ -351,6 +303,7 @@ fn refresh_inner(
             Err(_) => return,
         };
         if refresh_gen.load(Ordering::Relaxed) != gen {
+            // A newer refresh has started while this command was running
             return;
         }
         let output = match output {
@@ -378,6 +331,7 @@ fn refresh_inner(
         let muted = parse_muted(&stdout);
 
         let formatted = format_value(value);
+        // Update only when values changed to reduce redraw and signal churn
         let value_changed = (scale.value() - value).abs() > f64::EPSILON;
         let label_changed = label.text().as_str() != formatted;
         if value_changed || label_changed {
@@ -397,6 +351,7 @@ fn refresh_inner(
             });
         }
         if let Some(icon_muted) = icon_muted.as_ref() {
+            // Muted icon mapping is optional because not all sliders support mute semantics
             let icon = if muted { icon_muted } else { &icon_name };
             icon_button.set_icon_name(icon);
         }
@@ -409,6 +364,7 @@ fn schedule_command(
     cmd_template: String,
     value: f64,
 ) {
+    // Latest value wins while debounce timer is active
     pending_value.set(Some(value));
     if pending.borrow().is_some() {
         return;
@@ -420,6 +376,7 @@ fn schedule_command(
     let pending_guard = pending.clone();
     let pending_value = pending_value.clone();
     let id = glib::timeout_add_local(Duration::from_millis(120), move || {
+        // Drain pending state and execute the most recent queued command
         let value = pending_value.replace(None);
         let _ = pending_guard.borrow_mut().take();
         if let Some(value) = value {
@@ -429,137 +386,4 @@ fn schedule_command(
         glib::ControlFlow::Break
     });
     *pending.borrow_mut() = Some(id);
-}
-
-fn parse_numeric(text: &str, min: f64, max: f64, mode: NumericParseMode) -> Option<f64> {
-    // Parse the last numeric token, preferring percent tokens, without allocating buffers.
-    let mut current_start = None;
-    let mut current_has_dot = false;
-    let mut last_any: Option<(f64, bool, bool)> = None;
-    let mut last_percent: Option<(f64, bool)> = None;
-
-    for (index, ch) in text.char_indices() {
-        if ch.is_ascii_digit() || ch == '.' {
-            if current_start.is_none() {
-                current_start = Some(index);
-            }
-            if ch == '.' {
-                current_has_dot = true;
-            }
-            continue;
-        }
-        if let Some(start) = current_start.take() {
-            if let Ok(value) = text[start..index].parse::<f64>() {
-                let percent = ch == '%';
-                last_any = Some((value, percent, current_has_dot));
-                if percent {
-                    last_percent = Some((value, current_has_dot));
-                }
-            }
-            current_has_dot = false;
-        }
-    }
-
-    if let Some(start) = current_start.take() {
-        if let Ok(value) = text[start..].parse::<f64>() {
-            last_any = Some((value, false, current_has_dot));
-        }
-    }
-
-    let (mut value, percent, has_dot) = if let Some((value, has_dot)) = last_percent {
-        (value, true, has_dot)
-    } else {
-        last_any?
-    };
-
-    match mode {
-        NumericParseMode::Auto => {
-            // Heuristic: If the token contains a decimal point, it's likely a normalized ratio
-            // from tools like wpctl. Scale to percentage.
-            if !percent && has_dot && value <= 5.0 {
-                value *= 100.0;
-            }
-        }
-        NumericParseMode::Percent => {}
-        NumericParseMode::Ratio => {
-            if !percent {
-                value *= 100.0;
-            }
-        }
-    }
-
-    Some(value.clamp(min, max))
-}
-
-fn parse_muted(text: &str) -> bool {
-    // Avoid per-refresh allocations by using ASCII-only case-insensitive checks.
-    contains_ascii_case_insensitive(text, "muted")
-        || contains_ascii_case_insensitive(text, "mute: yes")
-}
-
-fn format_value(value: f64) -> String {
-    format!("{value:.0}%")
-}
-
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    // ASCII-only command output is expected for widget status; keep the scan allocation-free.
-    let haystack = haystack.as_bytes();
-    let needle = needle.as_bytes();
-    if needle.is_empty() {
-        return true;
-    }
-    if haystack.len() < needle.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|window| {
-        window
-            .iter()
-            .zip(needle)
-            .all(|(lhs, rhs)| lhs.to_ascii_lowercase() == *rhs)
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RefreshBackoff;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn refresh_backoff_resets_on_change() {
-        let mut backoff = RefreshBackoff::default();
-        let base = Duration::from_millis(100);
-        let now = Instant::now();
-        backoff.note_success(now, base, false);
-        let next = now + base;
-        assert!(backoff.should_refresh(next, false));
-        backoff.note_success(next, base, true);
-        // After a change, backoff resets but still waits the base interval.
-        assert!(!backoff.should_refresh(next, false));
-        assert!(backoff.should_refresh(next + base, false));
-    }
-
-    #[test]
-    fn refresh_backoff_increases_on_stable() {
-        let mut backoff = RefreshBackoff::default();
-        let base = Duration::from_millis(100);
-        let mut now = Instant::now();
-        backoff.note_success(now, base, false);
-        now += base;
-        backoff.note_success(now, base, false);
-        // After two stable updates, backoff should extend the next due time.
-        assert!(!backoff.should_refresh(now + base, false));
-    }
-
-    #[test]
-    fn refresh_backoff_increases_on_errors() {
-        let mut backoff = RefreshBackoff::default();
-        let base = Duration::from_millis(100);
-        let now = Instant::now();
-        backoff.note_error(now, base);
-        // First error should still allow a quick retry.
-        assert!(backoff.should_refresh(now + base, false));
-        backoff.note_error(now + base, base);
-        // After repeated errors, backoff should delay retries.
-        assert!(!backoff.should_refresh(now + base, false));
-    }
 }

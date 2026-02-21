@@ -13,7 +13,7 @@ use gtk::Align;
 use tracing::warn;
 use unixnotis_core::{PanelDebugLevel, ToggleWidgetConfig};
 
-use super::util::{run_command, start_command_watch, CommandWatch};
+use super::utils::{run_command, start_command_watch, CommandWatch};
 use crate::debug;
 
 mod css;
@@ -61,6 +61,7 @@ impl ToggleGrid {
 
         // FlowBox keeps toggle cards in a stable responsive row layout
         let root = gtk::FlowBox::new();
+        // Class hook drives card sizing and spacing from theme css
         root.add_css_class("unixnotis-toggle-grid");
         root.set_selection_mode(gtk::SelectionMode::None);
         root.set_max_children_per_line(4);
@@ -79,6 +80,7 @@ impl ToggleGrid {
     }
 
     pub fn root(&self) -> &gtk::FlowBox {
+        // Root widget is embedded directly in the center layout
         &self.root
     }
 
@@ -112,18 +114,22 @@ impl ToggleItem {
 
         // Build base toggle card
         let button = gtk::ToggleButton::new();
+        // Base class applies shared visual treatment for all toggle cards
         button.add_css_class("unixnotis-toggle");
         button.set_focusable(true);
+        // Tooltip mirrors label so icon-only layouts still expose accessible text
         button.set_tooltip_text(Some(&config.label));
 
         // Stable per-kind CSS classes let themes target each toggle consistently
         if let Some(kind) = config.kind.as_deref() {
             if let Some(class) = toggle_kind_css_class(kind) {
+                // Kind class allows targeted color accents and hover behavior per toggle
                 button.add_css_class(&class);
             }
         }
 
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        // Centered content keeps icon and label aligned across theme variants
         content.set_halign(Align::Center);
         content.set_valign(Align::Center);
         content.add_css_class("unixnotis-toggle-content");
@@ -139,9 +145,11 @@ impl ToggleItem {
             );
         }
         let icon = gtk::Image::from_icon_name(&icon_name);
+        // Icon class controls size and tint in one place
         icon.add_css_class("unixnotis-toggle-icon");
 
         let label = gtk::Label::new(Some(&config.label));
+        // Label class controls typography and spacing with icon
         label.add_css_class("unixnotis-toggle-label");
         label.set_xalign(0.0);
         label.set_wrap(false);
@@ -180,6 +188,7 @@ impl ToggleItem {
 
             // Reconcile optimistic UI state with command result via short bounded retries
             if let Some(state_cmd) = state_cmd.clone() {
+                // Expected tracks the immediate UI state chosen by the user
                 let guard = guard_clone.clone();
                 let refresh_gen = refresh_gen_for_toggle.clone();
                 let button = button.clone();
@@ -221,6 +230,7 @@ impl ToggleItem {
     }
 
     fn set_watch_active(&self, active: bool) {
+        // Watch lifecycle is skipped when required commands are absent
         if self.config.watch_cmd.is_none() || self.config.state_cmd.is_none() {
             return;
         }

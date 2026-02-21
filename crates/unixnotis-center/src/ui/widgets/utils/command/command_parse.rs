@@ -14,6 +14,7 @@ pub(super) fn parse_simple_command(cmd: &str) -> Option<(String, Vec<String>)> {
         return None;
     }
     // Use GLib parsing to honor quoted arguments without invoking a shell.
+    // Parsing failures are treated as non-simple commands and routed through shell mode
     let mut parts = shell_parse_argv(cmd).ok()?.into_iter();
     let program = parts.next()?.into_string().ok()?;
     let args = parts
@@ -29,6 +30,7 @@ pub(super) fn is_probably_slow(cmd: &str) -> bool {
         return true;
     };
 
+    // Compare only executable basename so absolute paths and wrappers still match
     let program_name = program
         .rsplit('/')
         .next()

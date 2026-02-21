@@ -35,7 +35,9 @@ struct CommandJob {
 }
 
 struct CommandWorker {
+    // Primary queue feeding command workers
     tx: channel::Sender<CommandJob>,
+    // True when worker threads failed to spawn and inline fallback is active
     inline_fallback: bool,
 }
 
@@ -134,6 +136,7 @@ impl FallbackWorker {
     }
 
     fn new(capacity: usize) -> Self {
+        // Fallback worker isolates overflow handling from GTK main thread
         let (tx, rx) = channel::bounded(capacity);
         if std::thread::Builder::new()
             .name("unixnotis-command-fallback".to_string())
@@ -171,7 +174,9 @@ impl RefreshCommandKey {
 }
 
 struct CoalescedRefreshState {
+    // Latest job per refresh key
     pending: HashMap<RefreshCommandKey, CommandJob>,
+    // FIFO key order used by drain loop
     order: VecDeque<RefreshCommandKey>,
 }
 

@@ -115,7 +115,11 @@ impl SoundSettings {
 
 fn resolve_hint_sound(hints: &HashMap<String, OwnedValue>) -> Option<SoundSource> {
     if let Some(file) = hint_string(hints, "sound-file") {
-        return Some(SoundSource::File(resolve_sound_file(&file)));
+        let path = resolve_sound_file(&file);
+        if validate_sound_file_path(&path) {
+            return Some(SoundSource::File(path));
+        }
+        debug!(path = %path.display(), "ignoring invalid sound-file hint");
     }
     if let Some(name) = hint_string(hints, "sound-name") {
         return Some(SoundSource::Name(name));
@@ -180,7 +184,8 @@ fn percent_decode_path(value: &str) -> Option<String> {
 
 fn resolve_default_file(config: &Config) -> Option<PathBuf> {
     if let Some(path) = config.sound.default_file.as_ref() {
-        return resolve_config_path(path).or_else(|| Some(PathBuf::from(path)));
+        let resolved = resolve_config_path(path).or_else(|| Some(PathBuf::from(path)));
+        return resolved.filter(|path| validate_sound_file_path(path));
     }
     if let Some(dir) = config.sound.default_dir.as_ref() {
         if let Some(path) = resolve_config_path(dir).or_else(|| Some(PathBuf::from(dir))) {
@@ -232,6 +237,14 @@ fn has_audio_extension(path: &Path) -> bool {
     )
 }
 
+fn validate_sound_file_path(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    // Sound paths must resolve to bounded regular files to avoid device and FIFO abuse.
+    meta.is_file() && meta.len() <= MAX_SOUND_FILE_BYTES && has_audio_extension(path)
+}
+
 fn hint_string(hints: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
     hints
         .get(key)
@@ -258,6 +271,7 @@ fn detect_backend() -> SoundBackend {
 
 const SOUND_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const SOUND_MAX_CONCURRENT: usize = 2;
+const MAX_SOUND_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 fn sound_semaphore() -> &'static Arc<Semaphore> {
     static SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -451,5 +465,11 @@ mod tests {
     fn percent_decode_path_rejects_nul() {
         // NUL bytes should never appear in decoded filesystem paths.
         assert!(percent_decode_path("/%00.wav").is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_sound_file_path_rejects_device_nodes() {
+        assert!(!validate_sound_file_path(Path::new("/dev/zero")));
     }
 }

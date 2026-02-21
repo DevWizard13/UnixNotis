@@ -29,6 +29,10 @@ impl HistoryStore {
         self.entries.contains_key(id)
     }
 
+    pub(super) fn get(&self, id: &u32) -> Option<&Arc<Notification>> {
+        self.entries.get(id)
+    }
+
     pub(super) fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();

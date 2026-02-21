@@ -32,6 +32,7 @@ struct InputRegionSignature {
 
 impl PopupInputRegionState {
     pub(super) fn new(allow_click_through: bool) -> Self {
+        // New state starts dirty so first map applies a region immediately
         Self {
             allow_click_through: Rc::new(Cell::new(allow_click_through)),
             dirty: Rc::new(Cell::new(true)),
@@ -73,6 +74,7 @@ pub(in super::super) fn refresh_popup_input_region(
 
     // Keep ticking only during animations or when geometry is still settling
     if window.is_visible() && (keep_ticking || needs_retry) {
+        // Tick callback self-terminates once transitions and retries are complete
         ensure_popup_input_region_tick(window, stack, input_region);
     }
 }
@@ -109,6 +111,7 @@ fn ensure_popup_input_region_tick(
     let input_region = input_region.clone();
 
     window.add_tick_callback(move |window, _| {
+        // Animation-aware refresh keeps hitboxes aligned with revealer motion
         let active_transitions = popup_stack_has_active_transitions(&stack);
         if active_transitions {
             // Animated revealers shift geometry frame-by-frame
@@ -204,6 +207,7 @@ fn build_popup_input_region(
             // Only currently visible popup widgets should capture input
             union_widget_bounds(&region, &widget, window, &mut reactive_rects);
         }
+        // Capture next first to stay robust if current node gets detached
         child = next;
     }
 
@@ -294,6 +298,7 @@ fn clamp_floor_nonneg(value: f64) -> i32 {
         // Defensive clamp for NaN and infinities
         return 0;
     }
+    // Floor keeps origin inside widget bounds while clamping negative drift
     value.floor().clamp(0.0, f64::from(i32::MAX)) as i32
 }
 
@@ -302,5 +307,6 @@ fn clamp_ceil_nonneg(value: f64) -> i32 {
         // Defensive clamp for NaN and infinities
         return 0;
     }
+    // Ceil keeps width and height inclusive of fractional trailing edges
     value.ceil().clamp(0.0, f64::from(i32::MAX)) as i32
 }

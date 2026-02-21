@@ -37,6 +37,11 @@ pub struct Notification {
     pub image: NotificationImage,
     pub expire_timeout: i32,
     pub received_at: DateTime<Utc>,
+    // D-Bus unique sender name for ownership checks in daemon-side operations.
+    pub sender_name: Option<String>,
+    // Sender process metadata is retained for diagnostics and audit logging.
+    pub sender_pid: Option<u32>,
+    pub sender_executable: Option<String>,
 }
 
 impl Notification {
@@ -53,6 +58,7 @@ impl Notification {
             is_resident: self.is_resident,
             received_at_unix_ms: self.received_at.timestamp_millis(),
             image: self.image.clone(),
+            // Sender metadata is intentionally excluded from public views.
         }
     }
 
@@ -69,11 +75,16 @@ impl Notification {
             is_resident: self.is_resident,
             received_at_unix_ms: self.received_at.timestamp_millis(),
             image: self.image.for_listing(),
+            // Sender metadata is intentionally excluded from public views.
         }
     }
 
     /// Create a history entry with heavyweight hint data stripped out.
     pub fn to_history(&self) -> Notification {
+        // History entries should never retain raw image-data blobs.
+        let mut image = self.image.clone();
+        image.has_image_data = false;
+        image.image_data = Default::default();
         Notification {
             id: self.id,
             app_name: self.app_name.clone(),
@@ -89,9 +100,12 @@ impl Notification {
             is_resident: self.is_resident,
             suppress_popup: self.suppress_popup,
             suppress_sound: self.suppress_sound,
-            image: self.image.for_history(),
+            image,
             expire_timeout: self.expire_timeout,
             received_at: self.received_at,
+            sender_name: self.sender_name.clone(),
+            sender_pid: self.sender_pid,
+            sender_executable: self.sender_executable.clone(),
         }
     }
 }

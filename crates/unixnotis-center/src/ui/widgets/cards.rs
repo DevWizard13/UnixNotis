@@ -10,24 +10,34 @@ use tracing::warn;
 use unixnotis_core::{CardWidgetConfig, PanelDebugLevel, WidgetPluginConfig};
 
 use super::plugin::{parse_card_plugin_payload, PluginOutputLimits};
-use super::util::{
+use super::utils::{
     run_command_capture_async, run_command_capture_with_timeout_async, RefreshBackoff,
 };
 use crate::debug;
 
 pub struct CardGrid {
+    // FlowBox root is embedded directly by the panel widget layout
     root: gtk::FlowBox,
+    // Item list is retained for refresh cadence and due-time aggregation
     items: Vec<CardItem>,
 }
 
 struct CardItem {
+    // Raw config is retained for command/plugin refresh decisions
     config: CardWidgetConfig,
+    // Root card container inserted into the grid
     root: gtk::Box,
+    // Title line shown in the card header
     title_label: gtk::Label,
+    // Body label used by non-calendar cards
     body_label: gtk::Label,
+    // Optional calendar widget for calendar-type cards
     calendar: Option<gtk::Calendar>,
+    // Fast branch for calendar-specific refresh behavior
     is_calendar: bool,
+    // Guard blocks overlapping async refresh calls
     inflight: Rc<Cell<bool>>,
+    // Cached payload avoids visual churn when output is unchanged
     last_value: Rc<RefCell<Option<String>>>,
     // Backoff reduces repeated command executions when the value is stable.
     refresh_backoff: Rc<RefCell<RefreshBackoff>>,
@@ -44,9 +54,11 @@ impl CardGrid {
             if !config.enabled {
                 continue;
             }
+            // Preserve config ordering so cards stay in user-defined sequence
             items.push(CardItem::new(config.clone()));
         }
         if items.is_empty() {
+            // Skip allocation when all cards are disabled
             return None;
         }
 
@@ -61,6 +73,7 @@ impl CardGrid {
         root.set_hexpand(true);
 
         for item in &items {
+            // Insert in config order for deterministic rendering
             root.insert(&item.root, -1);
         }
 
@@ -94,6 +107,7 @@ impl CardGrid {
 
 impl CardItem {
     fn new(config: CardWidgetConfig) -> Self {
+        // Calendar cards are rendered differently and updated on day boundaries
         let is_calendar = matches!(config.kind.as_deref(), Some("calendar"));
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.add_css_class("unixnotis-info-card");
@@ -138,6 +152,7 @@ impl CardItem {
 
         root.append(&header);
         let calendar = if is_calendar {
+            // Calendar card embeds GTK calendar widget instead of freeform body text
             let calendar = gtk::Calendar::new();
             calendar.add_css_class("unixnotis-calendar");
             calendar.set_hexpand(true);
@@ -252,11 +267,13 @@ impl CardItem {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let value = stdout.trim();
             if value.is_empty() {
+                // Empty output keeps last stable text rather than flashing blanks
                 apply_cached_value(&label, &last_value);
                 refresh_backoff
                     .borrow_mut()
                     .note_success(Instant::now(), base_interval, false);
             } else {
+                // Avoid redundant label writes when value has not changed
                 let changed = last_value.borrow().as_deref() != Some(value);
                 if changed {
                     label.set_text(value);
@@ -358,6 +375,7 @@ impl CardItem {
                 }
             }
             let changed = if last_value.borrow().as_deref() != Some(parsed.text.as_str()) {
+                // Update body only when plugin output text changes
                 body_label.set_text(&parsed.text);
                 *last_value.borrow_mut() = Some(parsed.text);
                 true
@@ -403,6 +421,7 @@ fn apply_cached_value(label: &gtk::Label, cache: &Rc<RefCell<Option<String>>>) {
             label.set_text(value);
         }
     } else if label.text().as_str() != "n/a" {
+        // Default placeholder keeps card layout stable when no prior value exists
         label.set_text("n/a");
     }
 }

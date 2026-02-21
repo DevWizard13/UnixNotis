@@ -12,7 +12,7 @@ use gtk::glib;
 use gtk::prelude::*;
 use tracing::warn;
 
-use super::super::util::run_command_capture_status_async;
+use super::super::utils::run_command_capture_status_async;
 
 // Staggered retry delays keep UI responsive without long-lived polling loops
 const TOGGLE_REFRESH_DELAYS_MS: &[u64] = &[0, 50, 100, 200, 400, 800];
@@ -23,6 +23,7 @@ pub(super) fn refresh_toggle_state(
     guard: &Rc<Cell<bool>>,
     refresh_gen: &Arc<AtomicU64>,
 ) {
+    // Periodic refresh path keeps UI aligned with external command state
     // Own the command string so spawned tasks stay self-contained
     let cmd = cmd.to_string();
 
@@ -33,6 +34,7 @@ pub(super) fn refresh_toggle_state(
     let refresh_gen = Arc::clone(refresh_gen);
 
     glib::MainContext::default().spawn_local(async move {
+        // Single probe path is used for periodic refresh and watch-trigger refresh
         let Some(active) = fetch_toggle_state(&cmd, true).await else {
             return;
         };
@@ -58,6 +60,7 @@ pub(super) fn schedule_toggle_refresh_with_retry(
     guard: Rc<Cell<bool>>,
     refresh_gen: Arc<AtomicU64>,
 ) {
+    // Post-action retry path closes race windows where backend state lags UI input
     // Bounded retries reconcile optimistic UI state with eventually-consistent commands
     let gen = refresh_gen.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -67,6 +70,7 @@ pub(super) fn schedule_toggle_refresh_with_retry(
     let refresh_gen_weak = Arc::downgrade(&refresh_gen);
 
     glib::MainContext::default().spawn_local(async move {
+        // Retry cadence is short and bounded to avoid long-running background churn
         for (attempt, delay_ms) in TOGGLE_REFRESH_DELAYS_MS.iter().enumerate() {
             // Delay sequence smooths transient backend lag
             if *delay_ms > 0 {
@@ -74,6 +78,7 @@ pub(super) fn schedule_toggle_refresh_with_retry(
             }
 
             let Some(refresh_gen) = refresh_gen_weak.upgrade() else {
+                // Parent state dropped, stop work immediately
                 return;
             };
             if refresh_gen.load(Ordering::Relaxed) != gen {
@@ -83,6 +88,7 @@ pub(super) fn schedule_toggle_refresh_with_retry(
             // Keep warnings bounded to the first failed probe per action
             let log_failures = attempt == 0;
             let Some(active) = fetch_toggle_state(&state_cmd, log_failures).await else {
+                // Probe failed, continue to next retry window
                 continue;
             };
 
@@ -111,11 +117,13 @@ pub(super) fn schedule_toggle_refresh_with_retry(
 }
 
 async fn fetch_toggle_state(cmd: &str, log_failures: bool) -> Option<bool> {
+    // Shared fetch routine is used by both periodic refresh and retry path
     // Command helper returns receiver so execution stays off the GTK thread
     let rx = run_command_capture_status_async(cmd);
 
     let output = match rx.recv().await {
         Ok(output) => output,
+        // Channel close means command worker is unavailable
         Err(_) => return None,
     };
 
@@ -125,6 +133,7 @@ async fn fetch_toggle_state(cmd: &str, log_failures: bool) -> Option<bool> {
             if log_failures {
                 warn!(?cmd, ?err, "toggle state command failed");
             }
+            // Parse path is skipped when command invocation itself fails
             return None;
         }
     };
@@ -186,5 +195,6 @@ fn parse_toggle_state(output: &str) -> bool {
     value
         // Non-alphanumeric separators cover outputs like "state: on"
         .split(|ch: char| !ch.is_ascii_alphanumeric())
+        // Any affirmative token is treated as enabled to handle mixed output formats
         .any(|token| matches!(token, "on" | "yes" | "true" | "enabled" | "up" | "active"))
 }

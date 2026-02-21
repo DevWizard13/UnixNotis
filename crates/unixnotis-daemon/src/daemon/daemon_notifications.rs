@@ -3,6 +3,7 @@
 //! Keeps notification delivery logic separate from the control-plane interface.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,8 +11,10 @@ use tracing::debug;
 use unixnotis_core::{
     Action, CloseReason, Config, Notification, NotificationImage, Urgency, CONTROL_OBJECT_PATH,
 };
+use zbus::fdo::DBusProxy;
+use zbus::message::Header;
 use zbus::zvariant::{OwnedValue, Value};
-use zbus::{interface, SignalContext};
+use zbus::{interface, Connection, SignalContext};
 
 use crate::expire::ExpirationScheduler;
 
@@ -67,6 +70,7 @@ impl NotificationServer {
         body: String,
         actions: Vec<String>,
         hints: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: Header<'_>,
         expire_timeout: i32,
     ) -> zbus::fdo::Result<u32> {
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -85,6 +89,19 @@ impl NotificationServer {
                 debug!(body = %body_snip, "notification body snippet");
             }
         }
+        let sender = resolve_sender_metadata(self.state.connection(), &header).await;
+        if sender
+            .sender_executable
+            .as_deref()
+            .is_some_and(|exe| !app_name_matches_sender(&app_name, exe))
+        {
+            debug!(
+                app_name = %app_name,
+                sender = sender.sender_name.as_deref().unwrap_or("unknown"),
+                sender_executable = sender.sender_executable.as_deref().unwrap_or("unknown"),
+                "notification app_name does not match sender executable"
+            );
+        }
         let notification = build_notification(
             app_name,
             app_icon,
@@ -92,6 +109,7 @@ impl NotificationServer {
             body,
             actions,
             hints,
+            sender,
             expire_timeout,
         );
 
@@ -173,8 +191,31 @@ impl NotificationServer {
         Ok(())
     }
 
-    async fn close_notification(&self, id: u32) -> zbus::fdo::Result<()> {
+    async fn close_notification(
+        &self,
+        id: u32,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
         debug!(id, "close notification requested");
+        // Freedesktop close requests can only target notifications owned by the same sender.
+        // Unauthorized closes are treated as a no-op for compatibility.
+        let sender = resolve_sender_metadata(self.state.connection(), &header).await;
+        let Some(sender_name) = sender.sender_name.as_deref() else {
+            return Ok(());
+        };
+        let owned = {
+            let store = self.state.store.lock().await;
+            store.is_notification_owned_by(id, sender_name, sender.sender_pid)
+        };
+        if !owned {
+            debug!(
+                id,
+                sender = sender_name,
+                sender_pid = sender.sender_pid,
+                "ignoring close for unowned notification"
+            );
+            return Ok(());
+        }
         self.state
             .close_notification(id, CloseReason::ClosedByCall)
             .await
@@ -212,6 +253,7 @@ fn build_notification(
     body: String,
     actions: Vec<String>,
     hints: HashMap<String, OwnedValue>,
+    sender: SenderMetadata,
     expire_timeout: i32,
 ) -> Notification {
     // Derive common hints first so the UI and rule engine can make decisions.
@@ -251,7 +293,85 @@ fn build_notification(
         image,
         expire_timeout,
         received_at: chrono::Utc::now(),
+        sender_name: sender.sender_name,
+        sender_pid: sender.sender_pid,
+        sender_executable: sender.sender_executable,
     }
+}
+
+struct SenderMetadata {
+    // Unique bus sender name (:1.x) used for compatibility checks
+    sender_name: Option<String>,
+    // Process id used for reconnect-safe ownership checks
+    sender_pid: Option<u32>,
+    // Executable path used for diagnostics and spoofing analysis
+    sender_executable: Option<String>,
+}
+
+async fn resolve_sender_metadata(connection: &Connection, header: &Header<'_>) -> SenderMetadata {
+    // Sender details are best-effort; failures must not break notification delivery
+    let sender_name = header.sender().map(|sender| sender.as_str().to_string());
+    let Some(sender_name_str) = sender_name.as_deref() else {
+        return SenderMetadata {
+            sender_name,
+            sender_pid: None,
+            sender_executable: None,
+        };
+    };
+    let Ok(bus_name) = zbus::names::BusName::try_from(sender_name_str) else {
+        return SenderMetadata {
+            sender_name,
+            sender_pid: None,
+            sender_executable: None,
+        };
+    };
+    let Ok(proxy) = DBusProxy::new(connection).await else {
+        return SenderMetadata {
+            sender_name,
+            sender_pid: None,
+            sender_executable: None,
+        };
+    };
+    // Process metadata comes from the bus owner and cannot be forged by payload fields
+    let sender_pid = proxy.get_connection_unix_process_id(bus_name).await.ok();
+    let sender_executable = match sender_pid {
+        Some(pid) => read_process_executable_path(pid)
+            .await
+            .map(|path| path.display().to_string()),
+        None => None,
+    };
+    SenderMetadata {
+        sender_name,
+        sender_pid,
+        sender_executable,
+    }
+}
+
+fn app_name_matches_sender(app_name: &str, sender_executable: &str) -> bool {
+    // Match is advisory-only to keep protocol compatibility for apps with custom labels
+    let app = app_name.trim().to_ascii_lowercase();
+    if app.is_empty() {
+        return true;
+    }
+    let Some(exe_name) = Path::new(sender_executable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+    else {
+        return true;
+    };
+    app == exe_name || app.replace(' ', "-") == exe_name || exe_name.contains(&app)
+}
+
+#[cfg(target_os = "linux")]
+async fn read_process_executable_path(pid: u32) -> Option<std::path::PathBuf> {
+    let path = format!("/proc/{pid}/exe");
+    tokio::fs::read_link(path).await.ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn read_process_executable_path(_pid: u32) -> Option<std::path::PathBuf> {
+    None
 }
 
 fn parse_actions(raw: Vec<String>) -> Vec<Action> {
@@ -368,7 +488,8 @@ mod tests {
 
     use super::{
         build_notification, owned_to_string, parse_actions, sanitize_hints_for_storage,
-        string_to_owned_value, truncate_utf8_bytes, MAX_ACTIONS, MAX_BODY_BYTES, MAX_SUMMARY_BYTES,
+        string_to_owned_value, truncate_utf8_bytes, SenderMetadata, MAX_ACTIONS, MAX_BODY_BYTES,
+        MAX_SUMMARY_BYTES,
     };
 
     #[test]
@@ -389,6 +510,11 @@ mod tests {
             body,
             Vec::new(),
             HashMap::<String, OwnedValue>::new(),
+            SenderMetadata {
+                sender_name: Some(":1.test".to_string()),
+                sender_pid: Some(42),
+                sender_executable: Some("/usr/bin/test-app".to_string()),
+            },
             0,
         );
         assert!(notification.summary.len() <= MAX_SUMMARY_BYTES);

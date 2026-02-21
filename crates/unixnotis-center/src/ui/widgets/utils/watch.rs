@@ -15,12 +15,16 @@ use unixnotis_core::PanelDebugLevel;
 
 use crate::debug;
 
-use super::command_utils::{kill_process_group, resolve_command_plan, CommandKind};
+use super::command::{kill_process_group, resolve_command_plan, CommandKind};
 
 pub(in crate::ui::widgets) struct CommandWatch {
+    // Command string retained for diagnostics during shutdown
     cmd: String,
+    // Child process handle for lifecycle control
     child: Option<Child>,
+    // Reader thread that consumes watch stdout
     thread: Option<std::thread::JoinHandle<()>>,
+    // GTK-side debounce task for event coalescing
     task: Option<glib::JoinHandle<()>>,
     // Tracks whether the watch process is still emitting events.
     active: Arc<AtomicBool>,
@@ -76,6 +80,7 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
     let plan = resolve_command_plan(cmd, CommandKind::Slow);
     let cmd_string = cmd.to_string();
     let cmd_for_thread = cmd_string.clone();
+    // Spawn watch command with stdout piped so events can be consumed
     let mut child = match plan.spawn_watch_command(cmd) {
         Ok(child) => child,
         Err(err) => {
@@ -105,6 +110,7 @@ pub(in crate::ui::widgets) fn start_command_watch<F: Fn() + 'static>(
         let on_event = on_event.clone();
         let cmd = cmd_string.clone();
         async move {
+            // Debounce loop coalesces bursts into fewer refresh callbacks
             while rx.recv().await.is_ok() {
                 loop {
                     glib::timeout_future(debounce).await;
