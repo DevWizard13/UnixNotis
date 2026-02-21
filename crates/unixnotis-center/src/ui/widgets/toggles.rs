@@ -109,7 +109,17 @@ impl ToggleItem {
         content.set_valign(Align::Center);
         content.add_css_class("unixnotis-toggle-content");
 
-        let icon = gtk::Image::from_icon_name(&config.icon);
+        // Resolve missing symbolic names to theme-supported fallbacks
+        let icon_name = resolve_toggle_icon_name(&config);
+        if icon_name != config.icon {
+            warn!(
+                requested = %config.icon,
+                resolved = %icon_name,
+                label = %config.label,
+                "toggle icon missing in theme; using fallback"
+            );
+        }
+        let icon = gtk::Image::from_icon_name(&icon_name);
         icon.add_css_class("unixnotis-toggle-icon");
         let label = gtk::Label::new(Some(&config.label));
         label.add_css_class("unixnotis-toggle-label");
@@ -212,6 +222,71 @@ impl ToggleItem {
         start_command_watch(watch_cmd, move || {
             refresh_toggle_state(&state_cmd, &button, &guard, &refresh_gen);
         })
+    }
+}
+
+fn resolve_toggle_icon_name(config: &ToggleWidgetConfig) -> String {
+    let requested = config.icon.trim();
+    // Empty configured icon should still produce a stable themed glyph
+    if requested.is_empty() {
+        return "applications-system-symbolic".to_string();
+    }
+    // Display can be unavailable during early startup paths
+    let Some(display) = gtk::gdk::Display::default() else {
+        return requested.to_string();
+    };
+    let theme = gtk::IconTheme::for_display(&display);
+    // Keep configured icon when the active theme provides it
+    if theme.has_icon(requested) {
+        return requested.to_string();
+    }
+
+    // Prefer kind-specific fallbacks so semantics stay recognizable
+    for fallback in toggle_icon_fallbacks(config) {
+        if theme.has_icon(fallback) {
+            return fallback.to_string();
+        }
+    }
+
+    // Last-resort generic system glyphs avoid red missing-icon placeholders
+    for fallback in [
+        "applications-system-symbolic",
+        "preferences-system-symbolic",
+    ] {
+        if theme.has_icon(fallback) {
+            return fallback.to_string();
+        }
+    }
+
+    requested.to_string()
+}
+
+fn toggle_icon_fallbacks(config: &ToggleWidgetConfig) -> &'static [&'static str] {
+    let kind = config.kind.as_deref().unwrap_or_default();
+    let kind = kind.trim().to_ascii_lowercase();
+    // Order matters here because the first present icon is selected
+    match kind.as_str() {
+        "wifi" => &[
+            "network-wireless-signal-excellent-symbolic",
+            "network-wireless-symbolic",
+            "network-workgroup-symbolic",
+        ],
+        "bluetooth" => &[
+            "bluetooth-active-symbolic",
+            "bluetooth-symbolic",
+            "network-wireless-symbolic",
+        ],
+        "airplane" => &[
+            "airplane-mode-symbolic",
+            "airplane-mode-disabled-symbolic",
+            "network-wireless-offline-symbolic",
+        ],
+        "night" => &[
+            "weather-clear-night-symbolic",
+            "display-brightness-symbolic",
+            "preferences-system-symbolic",
+        ],
+        _ => &[],
     }
 }
 

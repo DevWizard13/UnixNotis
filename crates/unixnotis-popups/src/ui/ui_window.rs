@@ -169,9 +169,9 @@ pub(super) fn refresh_popup_input_region(
 ) {
     // Any caller here has observed a state or layout change
     input_region.mark_dirty();
-    apply_popup_input_region_if_dirty(window, stack, input_region);
+    let needs_retry = apply_popup_input_region_if_dirty(window, stack, input_region);
     // Tick only while transitions are active to avoid steady frame work
-    if keep_ticking && window.is_visible() {
+    if window.is_visible() && (keep_ticking || needs_retry) {
         ensure_popup_input_region_tick(window, stack, input_region);
     }
 }
@@ -207,10 +207,12 @@ fn ensure_popup_input_region_tick(
         // Region may drift each frame while revealers animate
         let active_transitions = popup_stack_has_active_transitions(&stack);
         if active_transitions {
+            // Animation frames can move hit areas between ticks
             input_region.mark_dirty();
         }
-        apply_popup_input_region_if_dirty(window, &stack, &input_region);
-        if active_transitions {
+        // Retry path keeps controls interactive when geometry is late
+        let needs_retry = apply_popup_input_region_if_dirty(window, &stack, &input_region);
+        if active_transitions || needs_retry {
             ControlFlow::Continue
         } else {
             // Clear guard so future animations can start ticking again
@@ -224,22 +226,23 @@ fn apply_popup_input_region_if_dirty(
     window: &gtk::ApplicationWindow,
     stack: &gtk::Box,
     input_region: &PopupInputRegionState,
-) {
+) -> bool {
     // Fast exit when no invalidation was requested
     if !input_region.take_dirty() {
-        return;
+        return false;
     }
 
     let Some(surface) = window.surface() else {
         // Surface might not exist yet during early startup
         // Keep dirty set so next map/realize pass retries
         input_region.mark_dirty();
-        return;
+        return true;
     };
 
     let surface_width = surface.width().max(0);
     let surface_height = surface.height().max(0);
-    let (region, signature) = if input_region.allow_click_through() {
+    // Signature includes surface size so monitor/scale changes invalidate correctly
+    let (region, signature, visible_widgets) = if input_region.allow_click_through() {
         (
             cairo::Region::create(),
             InputRegionSignature {
@@ -247,10 +250,19 @@ fn apply_popup_input_region_if_dirty(
                 surface_height,
                 reactive_rects: Vec::new(),
             },
+            0,
         )
     } else {
         build_popup_input_region(window, stack, surface_width, surface_height)
     };
+    // Visible widgets with zero rects usually means allocation has not landed yet
+    let needs_layout_retry = !input_region.allow_click_through()
+        && visible_widgets > 0
+        && signature.reactive_rects.is_empty();
+    if needs_layout_retry {
+        // Bounds can be unavailable for a frame before final allocation lands
+        input_region.mark_dirty();
+    }
 
     let unchanged = input_region
         .last_signature
@@ -259,11 +271,12 @@ fn apply_popup_input_region_if_dirty(
         .is_some_and(|prev| *prev == signature);
     if unchanged {
         // Skip compositor call when region shape is identical
-        return;
+        return needs_layout_retry;
     }
 
     surface.set_input_region(&region);
     *input_region.last_signature.borrow_mut() = Some(signature);
+    needs_layout_retry
 }
 
 fn build_popup_input_region(
@@ -271,25 +284,30 @@ fn build_popup_input_region(
     stack: &gtk::Box,
     surface_width: i32,
     surface_height: i32,
-) -> (cairo::Region, InputRegionSignature) {
+) -> (cairo::Region, InputRegionSignature, usize) {
     let region = cairo::Region::create();
     // Store source rects so signature can detect no-op rebuilds
     let mut reactive_rects = Vec::new();
+    let mut visible_widgets = 0usize;
     let mut child = stack.first_child();
     while let Some(widget) = child {
         let next = widget.next_sibling();
         if widget.is_visible() {
+            visible_widgets += 1;
             // Only visible popup widgets should capture pointer input
-            union_widget_bounds(
-                &region,
-                &widget,
-                window,
-                surface_width,
-                surface_height,
-                &mut reactive_rects,
-            );
+            union_widget_bounds(&region, &widget, window, &mut reactive_rects);
         }
         child = next;
+    }
+
+    // When visible widgets exist but child bounds are not ready yet,
+    // fall back to the stack allocation so popup controls stay interactive
+    if visible_widgets > 0 && reactive_rects.is_empty() {
+        // This keeps button hit areas alive during first-frame layout
+        if let Some(rect) = widget_rect_in_window(stack.upcast_ref(), window) {
+            let _ = region.union_rectangle(&rect);
+            reactive_rects.push(rect);
+        }
     }
 
     (
@@ -299,6 +317,7 @@ fn build_popup_input_region(
             surface_height,
             reactive_rects,
         },
+        visible_widgets,
     )
 }
 
@@ -306,50 +325,75 @@ fn union_widget_bounds(
     region: &cairo::Region,
     widget: &gtk::Widget,
     window: &gtk::ApplicationWindow,
-    surface_width: i32,
-    surface_height: i32,
     reactive_rects: &mut Vec<cairo::RectangleInt>,
 ) {
-    let Some(bounds) = widget.compute_bounds(window) else {
+    let Some(rect) = widget_rect_in_window(widget, window) else {
         // Bounds can be unavailable briefly during widget lifecycle changes
         return;
     };
 
-    let x0 = clamp_floor(bounds.x(), 0, surface_width);
-    let y0 = clamp_floor(bounds.y(), 0, surface_height);
-    let x1 = clamp_ceil(bounds.x() + bounds.width(), 0, surface_width);
-    let y1 = clamp_ceil(bounds.y() + bounds.height(), 0, surface_height);
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-
-    let rect = cairo::RectangleInt::new(x0, y0, x1 - x0, y1 - y0);
     // Union keeps a single region for all interactive popup areas
     let _ = region.union_rectangle(&rect);
     // Cache raw rectangles for cheap signature comparison
     reactive_rects.push(rect);
 }
 
-fn clamp_floor(value: f32, min: i32, max: i32) -> i32 {
-    if !value.is_finite() {
-        // Defensive clamp for invalid geometry input
-        return min;
+fn widget_rect_in_window(
+    widget: &gtk::Widget,
+    window: &gtk::ApplicationWindow,
+) -> Option<cairo::RectangleInt> {
+    // Allocation gives stable local size once the widget is measured
+    let alloc = widget.allocation();
+    let width = alloc.width();
+    let height = alloc.height();
+    if width <= 0 || height <= 0 {
+        return None;
     }
-    let clamped = f64::from(value)
-        .floor()
-        .clamp(f64::from(min), f64::from(max));
-    clamped as i32
+
+    // Translate local origin into window coordinates for input-region rectangles
+    let translated = widget
+        .translate_coordinates(window, 0.0, 0.0)
+        .map(|(x, y)| {
+            (
+                clamp_floor_nonneg(x),
+                clamp_floor_nonneg(y),
+                clamp_ceil_nonneg(x + f64::from(width)),
+                clamp_ceil_nonneg(y + f64::from(height)),
+            )
+        });
+    let (x0, y0, x1, y1) = if let Some(values) = translated {
+        values
+    } else {
+        // Fallback for transient coordinate mapping failures
+        let bounds = widget.compute_bounds(window)?;
+        (
+            clamp_floor_nonneg(f64::from(bounds.x())),
+            clamp_floor_nonneg(f64::from(bounds.y())),
+            clamp_ceil_nonneg(f64::from(bounds.x() + bounds.width())),
+            clamp_ceil_nonneg(f64::from(bounds.y() + bounds.height())),
+        )
+    };
+    if x1 <= x0 || y1 <= y0 {
+        // Degenerate rectangles are ignored to avoid invalid regions
+        return None;
+    }
+    Some(cairo::RectangleInt::new(x0, y0, x1 - x0, y1 - y0))
 }
 
-fn clamp_ceil(value: f32, min: i32, max: i32) -> i32 {
+fn clamp_floor_nonneg(value: f64) -> i32 {
     if !value.is_finite() {
-        // Defensive clamp for invalid geometry input
-        return min;
+        // NaN and infinities should never leak into region math
+        return 0;
     }
-    let clamped = f64::from(value)
-        .ceil()
-        .clamp(f64::from(min), f64::from(max));
-    clamped as i32
+    value.floor().clamp(0.0, f64::from(i32::MAX)) as i32
+}
+
+fn clamp_ceil_nonneg(value: f64) -> i32 {
+    if !value.is_finite() {
+        // NaN and infinities should never leak into region math
+        return 0;
+    }
+    value.ceil().clamp(0.0, f64::from(i32::MAX)) as i32
 }
 
 fn apply_anchor(window: &impl IsA<gtk::Window>, anchor: Anchor, margin: Margins) {
