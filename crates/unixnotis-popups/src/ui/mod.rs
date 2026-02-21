@@ -24,7 +24,7 @@ use unixnotis_ui::css::{self, CssManager};
 use icons::DesktopIconIndex;
 use ui_entry::PopupEntry;
 use ui_icons::TextureCache;
-use ui_window::{apply_popup_config, build_popup_window};
+use ui_window::{apply_popup_config, build_popup_window, PopupInputRegionState};
 
 /// Popup-only GTK state for notification toasts.
 pub struct UiState {
@@ -34,6 +34,8 @@ pub struct UiState {
     command_tx: Sender<UiCommand>,
     popup_window: gtk::ApplicationWindow,
     popup_stack: gtk::Box,
+    // Shared popup input shaping state for config + runtime updates
+    popup_input_region: PopupInputRegionState,
     popups: HashMap<u32, PopupEntry>,
     popup_order: VecDeque<u32>,
     // Desktop icon index caches resolved icon themes for known applications.
@@ -54,7 +56,8 @@ impl UiState {
         command_tx: Sender<UiCommand>,
         css: CssManager,
     ) -> Self {
-        let (popup_window, popup_stack) = build_popup_window(app, &config);
+        // Build window and region state together so callbacks share one source
+        let (popup_window, popup_stack, popup_input_region) = build_popup_window(app, &config);
 
         Self {
             config,
@@ -63,6 +66,7 @@ impl UiState {
             command_tx,
             popup_window,
             popup_stack,
+            popup_input_region,
             popups: HashMap::new(),
             popup_order: VecDeque::new(),
             desktop_icons: DesktopIconIndex::new(),
@@ -157,9 +161,17 @@ impl UiState {
         };
 
         self.config = config.clone();
+        // Keep click mode in sync before applying layout updates
+        self.popup_input_region
+            .set_allow_click_through(config.popups.allow_click_through);
         debug!("popup config reloaded");
         self.css.update_theme(theme_paths, config.theme.clone());
         self.css.reload(css::DEFAULT_CSS);
-        apply_popup_config(&self.popup_window, &self.popup_stack, &config);
+        apply_popup_config(
+            &self.popup_window,
+            &self.popup_stack,
+            &config,
+            &self.popup_input_region,
+        );
     }
 }

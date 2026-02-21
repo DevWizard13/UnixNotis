@@ -6,11 +6,13 @@ use gtk::prelude::*;
 use tracing::debug;
 use unixnotis_core::NotificationView;
 
+use super::ui_window::{popup_stack_has_active_transitions, refresh_popup_input_region};
 use super::UiState;
 
 impl UiState {
     pub(super) fn add_popup(&mut self, notification: NotificationView) {
         let id = notification.id;
+        // Ignore duplicates so ordering and animations stay deterministic
         if self.popups.contains_key(&id) {
             return;
         }
@@ -26,6 +28,7 @@ impl UiState {
 
     pub(super) fn replace_popup(&mut self, notification: NotificationView, show_popup: bool) {
         let id = notification.id;
+        // Replace path keeps one source of truth for update semantics
         self.remove_popup(id);
         if show_popup {
             self.add_popup(notification);
@@ -37,12 +40,23 @@ impl UiState {
             // Revealers animate out before removing from the stack.
             entry.revealer.set_reveal_child(false);
             let stack = self.popup_stack.clone();
+            let popup_window = self.popup_window.clone();
+            let popup_input_region = self.popup_input_region.clone();
             entry
                 .revealer
                 .connect_notify_local(Some("child-revealed"), move |revealer, _| {
+                    // Remove only after transition completes to avoid visual pop
                     if !revealer.is_child_revealed() && revealer.parent().is_some() {
                         stack.remove(revealer);
                     }
+                    // Re-sync clickable shape after each reveal step
+                    let has_active_transitions = popup_stack_has_active_transitions(&stack);
+                    refresh_popup_input_region(
+                        &popup_window,
+                        &stack,
+                        &popup_input_region,
+                        has_active_transitions,
+                    );
                 });
         }
         self.popup_order.retain(|item| *item != id);
@@ -69,6 +83,13 @@ impl UiState {
                 entry.revealer.set_reveal_child(false);
             }
             self.popup_window.set_visible(false);
+            // Keep input region empty when popups are disabled
+            refresh_popup_input_region(
+                &self.popup_window,
+                &self.popup_stack,
+                &self.popup_input_region,
+                false,
+            );
             debug!("popups disabled by max_visible = 0");
             return;
         }
@@ -112,6 +133,14 @@ impl UiState {
                 }
             }
         }
+        // Tick while transitions run so interactive area tracks animation frames
+        let has_active_transitions = popup_stack_has_active_transitions(&self.popup_stack);
+        refresh_popup_input_region(
+            &self.popup_window,
+            &self.popup_stack,
+            &self.popup_input_region,
+            has_active_transitions,
+        );
         debug!(
             visible = self.popup_order.len().min(max_visible + stack_depth),
             total = self.popup_order.len(),
