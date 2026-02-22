@@ -11,8 +11,9 @@ pub(super) const MAX_SUMMARY_BYTES: usize = 1024;
 pub(super) const MAX_BODY_BYTES: usize = 16 * 1024;
 // Category is used for grouping and rules, so keep values compact
 pub(super) const MAX_CATEGORY_BYTES: usize = 256;
-// Limit actions so one notification cannot create excessive UI controls
-pub(super) const MAX_ACTIONS: usize = 32;
+// Keep action rows compact so one notification cannot stretch list layout
+// This limit is shared by popup and center action rendering expectations
+pub(super) const MAX_ACTIONS: usize = 8;
 // Action keys are internal identifiers
 pub(super) const MAX_ACTION_KEY_BYTES: usize = 128;
 // Action labels are user-facing button text

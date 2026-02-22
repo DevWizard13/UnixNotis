@@ -15,6 +15,9 @@ use super::limits::{
 };
 use super::sender::SenderMetadata;
 
+// Unbroken tokens longer than this are folded with an ellipsis to avoid UI overflow spikes.
+const MAX_CONTIGUOUS_TOKEN_CHARS: usize = 96;
+
 pub(super) struct NotificationInput {
     pub(super) app_name: String,
     pub(super) app_icon: String,
@@ -63,8 +66,18 @@ pub(super) fn build_notification(input: NotificationInput) -> Notification {
             truncate_utf8_bytes(&app_name, MAX_APP_NAME_BYTES)
         },
         app_icon: truncate_utf8_bytes(&app_icon, MAX_APP_ICON_BYTES),
-        summary: truncate_utf8_bytes(&summary, MAX_SUMMARY_BYTES),
-        body: truncate_utf8_bytes(&body, MAX_BODY_BYTES),
+        // Truncate bytes first, then fold long contiguous runs to keep UTF-8 boundaries valid
+        // Fold very long unbroken runs so renderer width remains bounded.
+        summary: normalize_text_for_layout(
+            &truncate_utf8_bytes(&summary, MAX_SUMMARY_BYTES),
+            MAX_CONTIGUOUS_TOKEN_CHARS,
+        ),
+        // Apply the same order for body so renderer sees consistent text constraints
+        // Body can be much larger, so apply the same run-folding protection here.
+        body: normalize_text_for_layout(
+            &truncate_utf8_bytes(&body, MAX_BODY_BYTES),
+            MAX_CONTIGUOUS_TOKEN_CHARS,
+        ),
         actions: parse_actions(actions),
         hints: sanitize_hints_for_storage(hints),
         urgency,
@@ -114,6 +127,7 @@ fn parse_actions(raw: Vec<String>) -> Vec<Action> {
     while let Some(key) = iter.next() {
         if let Some(label) = iter.next() {
             if actions.len() >= MAX_ACTIONS {
+                // Hard stop keeps button rows bounded even when sender floods action pairs
                 break;
             }
             actions.push(Action {
@@ -126,6 +140,7 @@ fn parse_actions(raw: Vec<String>) -> Vec<Action> {
 }
 
 fn sanitize_hints_for_storage(hints: HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
+    // Pre-sizing avoids rehash churn on adversarial hint fanout
     let mut sanitized = HashMap::with_capacity(hints.len().min(MAX_HINT_ENTRIES));
 
     for (key, value) in hints {
@@ -186,6 +201,7 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
         return String::new();
     }
     if value.len() <= max_bytes {
+        // Fast path for common short payloads
         return value.to_string();
     }
 
@@ -197,6 +213,43 @@ fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
     value[..end].to_string()
 }
 
+fn normalize_text_for_layout(value: &str, max_contiguous: usize) -> String {
+    if value.is_empty() || max_contiguous == 0 {
+        return value.to_string();
+    }
+
+    // Reserve original length to keep this pass allocation-stable on long input
+    let mut out = String::with_capacity(value.len());
+    let mut run_len = 0usize;
+    let mut folded_run = false;
+
+    // Walk characters so non-ASCII content remains valid after normalization.
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            // Whitespace resets contiguous-run accounting
+            run_len = 0;
+            folded_run = false;
+            out.push(ch);
+            continue;
+        }
+
+        if run_len < max_contiguous {
+            out.push(ch);
+            run_len += 1;
+            continue;
+        }
+
+        // Add one ellipsis when a contiguous token crosses the safety threshold.
+        if !folded_run {
+            out.push('…');
+            folded_run = true;
+        }
+        // Remaining chars in this run are dropped until whitespace appears again
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -204,9 +257,9 @@ mod tests {
     use zbus::zvariant::OwnedValue;
 
     use super::{
-        build_notification, owned_to_string, parse_actions, sanitize_hints_for_storage,
-        string_to_owned_value, truncate_utf8_bytes, NotificationInput, SenderMetadata, MAX_ACTIONS,
-        MAX_BODY_BYTES, MAX_SUMMARY_BYTES,
+        build_notification, normalize_text_for_layout, owned_to_string, parse_actions,
+        sanitize_hints_for_storage, string_to_owned_value, truncate_utf8_bytes, NotificationInput,
+        SenderMetadata, MAX_ACTIONS, MAX_BODY_BYTES, MAX_SUMMARY_BYTES,
     };
 
     #[test]
@@ -278,5 +331,18 @@ mod tests {
         )
         .expect("sound-name should be string");
         assert!(sound_name.len() <= 2048);
+    }
+
+    #[test]
+    fn normalize_text_for_layout_folds_long_unbroken_tokens() {
+        let input = "x".repeat(200);
+        let normalized = normalize_text_for_layout(&input, 96);
+        assert!(normalized.contains('…'));
+        let longest = normalized
+            .split_whitespace()
+            .map(|part| part.chars().filter(|ch| ch.is_ascii_alphanumeric()).count())
+            .max()
+            .unwrap_or(0);
+        assert!(longest <= 96);
     }
 }

@@ -100,6 +100,10 @@ pub(super) fn apply_popup_config(
     // Width is fixed by config while height remains content-driven
     window.set_default_size(config.popups.width, 1);
     window.set_size_request(config.popups.width, -1);
+    // Stack width follows popup width exactly so children cannot request wider geometry.
+    // This keeps popup geometry pinned to config even with hostile payload text
+    stack.set_size_request(config.popups.width, -1);
+    stack.set_hexpand(false);
     stack.set_spacing(config.popups.spacing);
 
     apply_anchor(window, config.popups.anchor, config.popups.margin);

@@ -73,8 +73,8 @@ impl UiState {
     }
 
     pub(super) fn update_popup_visibility(&self) {
+        // Visibility contract is driven strictly by configured max_visible count
         let max_visible = self.config.popups.max_visible;
-        let stack_depth = 3; // Increased depth for better visual pile
 
         // Max-visible of zero disables popups entirely.
         if max_visible == 0 {
@@ -105,29 +105,15 @@ impl UiState {
             if let Some(entry) = self.popups.get(id) {
                 // Clean up previous state classes.
                 entry.root.remove_css_class("unixnotis-popup-visible");
-                entry.root.remove_css_class("unixnotis-popup-stacked");
-                for i in 0..stack_depth {
-                    entry
-                        .root
-                        .remove_css_class(&format!("unixnotis-popup-stacked-{}", i));
-                }
 
                 if index < max_visible {
                     // Fully visible notification.
                     entry.root.set_visible(true);
                     entry.revealer.set_reveal_child(true);
                     entry.root.add_css_class("unixnotis-popup-visible");
-                } else if index < max_visible + stack_depth {
-                    // Stacked (pile) notification.
-                    let stack_idx = index - max_visible;
-                    entry.root.set_visible(true);
-                    entry.revealer.set_reveal_child(true);
-                    entry.root.add_css_class("unixnotis-popup-stacked");
-                    entry
-                        .root
-                        .add_css_class(&format!("unixnotis-popup-stacked-{}", stack_idx));
                 } else {
-                    // Hidden.
+                    // Keep overflow notifications hidden to avoid visual layering artifacts.
+                    // Hidden entries still stay in memory so close/update events stay coherent
                     entry.root.set_visible(false);
                     entry.revealer.set_reveal_child(false);
                 }
@@ -142,7 +128,7 @@ impl UiState {
             has_active_transitions,
         );
         debug!(
-            visible = self.popup_order.len().min(max_visible + stack_depth),
+            visible = self.popup_order.len().min(max_visible),
             total = self.popup_order.len(),
             "popup visibility updated"
         );

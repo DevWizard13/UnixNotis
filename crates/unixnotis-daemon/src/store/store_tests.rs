@@ -50,6 +50,7 @@ fn make_notification_with_sender(summary: &str, sender: &str, pid: u32) -> Notif
 
 fn make_store_with_limits(max_active: usize, max_entries: usize) -> NotificationStore {
     let mut config = Config::default();
+    // Test helper uses explicit limits so each case isolates one policy branch
     config.history.max_active = max_active;
     config.history.max_entries = max_entries;
     NotificationStore::new(config)
@@ -117,6 +118,27 @@ fn max_active_evicts_oldest_to_history() {
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].summary, "second");
     assert_eq!(store.history_len(), 1);
+}
+
+#[test]
+fn max_active_hard_cap_limits_even_when_config_is_higher() {
+    // Config may request a larger active window, but runtime hard-cap protects UI stability.
+    let mut store = make_store_with_limits(32, 64);
+
+    for idx in 0..18 {
+        // Insert in-order so expected active/history boundaries are easy to assert
+        store.insert(make_notification(&format!("entry-{idx}")), 0);
+    }
+
+    let active = store.list_active();
+    let history = store.list_history();
+
+    assert_eq!(active.len(), 12);
+    assert_eq!(history.len(), 6);
+    // Newest remains at front after cap-based eviction
+    assert_eq!(active[0].summary, "entry-17");
+    // Oldest retained active entry starts where cap boundary begins
+    assert_eq!(active[11].summary, "entry-6");
 }
 
 #[test]

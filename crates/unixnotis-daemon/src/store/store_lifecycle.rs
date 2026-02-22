@@ -5,6 +5,9 @@ use unixnotis_core::{Notification, Urgency};
 
 use super::{DismissOutcome, InsertOutcome, NotificationStore};
 
+// Hard ceiling for concurrently active notifications to protect panel/popups stability.
+const ACTIVE_HARD_CAP: usize = 12;
+
 impl NotificationStore {
     pub fn insert(&mut self, mut notification: Notification, replaces_id: u32) -> InsertOutcome {
         // Rule transforms happen before any storage decision
@@ -32,6 +35,7 @@ impl NotificationStore {
                 notification.sender_name.as_deref(),
                 notification.sender_pid,
             );
+        // Replacement preserves ID only when sender ownership is confirmed
         let assigned_id = if replaced {
             replaces_id
         } else {
@@ -47,6 +51,7 @@ impl NotificationStore {
         let notification = Arc::new(notification);
         // Active map keeps insertion order so oldest eviction is deterministic
         self.active.insert(assigned_id, notification.clone());
+        // Enforce active cap immediately so UI never sees oversized active sets
         let evicted = self.enforce_active_limit();
 
         InsertOutcome {
@@ -110,7 +115,8 @@ impl NotificationStore {
     }
 
     fn enforce_active_limit(&mut self) -> Vec<u32> {
-        let max_active = self.config.history.max_active;
+        // Config limit still applies, but active list never exceeds the global safety cap.
+        let max_active = self.config.history.max_active.min(ACTIVE_HARD_CAP);
         if max_active == 0 {
             // max_active=0 means archive everything immediately
             let mut evicted = Vec::new();
@@ -132,6 +138,7 @@ impl NotificationStore {
                 self.push_history(notification);
                 evicted.push(id);
             } else {
+                // Defensive break for impossible map/index mismatch cases
                 break;
             }
         }

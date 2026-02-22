@@ -434,17 +434,22 @@ mod tests {
             "unixnotis-popups",
             "unixnotis-daemon",
         ];
+        // At least one trusted binary should be present on a normal dev or install layout
         let mut found_any = false;
         for directory in directories {
             for executable in trusted_names {
                 let candidate = directory.join(executable);
                 if candidate.exists() {
                     found_any = true;
+                    // Every discovered trusted-name binary path should pass path validation
                     assert!(is_trusted_control_executable_path(&candidate));
                 }
             }
         }
-        assert!(found_any, "expected at least one trusted control binary to exist");
+        assert!(
+            found_any,
+            "expected at least one trusted control binary to exist"
+        );
     }
 
     #[test]

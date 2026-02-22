@@ -15,12 +15,15 @@ pub(crate) fn print_notifications(label: &str, notifications: &[NotificationView
     for notification in notifications {
         // Log output is sanitized to avoid terminal control characters and long blobs.
         let summary = util::sanitize_log_value(&notification.summary, limit);
+        // Action count is included so probes can spot large action payloads from CLI output
+        let action_count = notification.actions.len();
         // Each line is stable and script-friendly for downstream tooling.
         println!(
-            "- #{id} [{app}] {summary}",
+            "- #{id} [{app}] {summary} (actions={actions})",
             id = notification.id,
             app = notification.app_name,
-            summary = summary
+            summary = summary,
+            actions = action_count
         );
     }
 }

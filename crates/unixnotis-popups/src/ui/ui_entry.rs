@@ -2,16 +2,15 @@
 //!
 //! Keeps widget assembly separate from popup list bookkeeping.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::borrow::Cow;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use gtk::pango;
+use gtk::pango::{EllipsizeMode, WrapMode};
 use gtk::prelude::*;
 use gtk::Align;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, warn};
+use tracing::debug;
 use unixnotis_core::{NotificationView, Urgency};
 
 use crate::dbus::UiCommand;
@@ -23,6 +22,16 @@ pub(super) struct PopupEntry {
     pub(super) root: gtk::Box,
 }
 
+const MAX_POPUP_ACTIONS: usize = 3;
+// Header/app title stays single-line and clipped at this length
+const POPUP_APP_MAX_CHARS: usize = 40;
+// Summary is visually dominant but still bounded to avoid tall cards
+const POPUP_SUMMARY_MAX_CHARS: usize = 120;
+// Body keeps enough context while preventing oversized popup growth
+const POPUP_BODY_MAX_CHARS: usize = 320;
+// Action labels stay short so button row width remains predictable
+const POPUP_ACTION_LABEL_MAX_CHARS: usize = 14;
+
 impl UiState {
     pub(super) fn build_popup_entry(&mut self, notification: &NotificationView) -> PopupEntry {
         let revealer = gtk::Revealer::new();
@@ -32,6 +41,10 @@ impl UiState {
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.add_css_class("unixnotis-popup-card");
+        // Popup width is strict from config; content should adapt, not grow surface geometry.
+        root.set_size_request(self.config.popups.width, -1);
+        root.set_halign(Align::Fill);
+        root.set_hexpand(false);
         if notification.urgency == Urgency::Critical as u8 {
             root.add_css_class("critical");
         }
@@ -47,6 +60,11 @@ impl UiState {
         }
         let app = gtk::Label::new(Some(&notification.app_name));
         app.set_xalign(0.0);
+        // Header label never wraps into multi-line title blocks
+        app.set_single_line_mode(true);
+        app.set_ellipsize(EllipsizeMode::End);
+        app.set_max_width_chars(POPUP_APP_MAX_CHARS as i32);
+        app.set_text(clamp_label_text(&notification.app_name, POPUP_APP_MAX_CHARS).as_ref());
         app.add_css_class("unixnotis-popup-header");
 
         let close = gtk::Button::from_icon_name("window-close-symbolic");
@@ -60,15 +78,26 @@ impl UiState {
         // Summary line mirrors the notification title for quick scanning.
         let summary = gtk::Label::new(Some(&notification.summary));
         summary.set_xalign(0.0);
+        // WordChar breaks long tokens instead of letting one token push width
         summary.set_wrap(true);
+        summary.set_wrap_mode(WrapMode::WordChar);
+        summary.set_ellipsize(EllipsizeMode::End);
+        summary.set_lines(3);
+        summary.set_max_width_chars(POPUP_SUMMARY_MAX_CHARS as i32);
+        summary.set_text(clamp_label_text(&notification.summary, POPUP_SUMMARY_MAX_CHARS).as_ref());
         summary.add_css_class("unixnotis-popup-summary");
 
-        // Body uses markup to preserve formatting supplied by the notification.
+        // Body is rendered as bounded plain text so payload markup cannot affect layout.
         let body = gtk::Label::new(None);
         body.set_xalign(0.0);
+        // Body follows the same wrapping rules for consistent layout behavior
         body.set_wrap(true);
+        body.set_wrap_mode(WrapMode::WordChar);
+        body.set_ellipsize(EllipsizeMode::End);
+        body.set_lines(6);
+        body.set_max_width_chars(POPUP_BODY_MAX_CHARS as i32);
         body.add_css_class("unixnotis-popup-body");
-        set_label_markup(&body, &notification.body);
+        body.set_text(clamp_label_text(&notification.body, POPUP_BODY_MAX_CHARS).as_ref());
 
         root.append(&header);
         root.append(&summary);
@@ -78,8 +107,11 @@ impl UiState {
         if !notification.actions.is_empty() {
             let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             actions.add_css_class("unixnotis-popup-actions");
-            for action in &notification.actions {
-                let button = gtk::Button::with_label(&action.label);
+            // Only keep the first few actions to avoid action-row overdraw and width spikes
+            for action in notification.actions.iter().take(MAX_POPUP_ACTIONS) {
+                let button = gtk::Button::with_label(
+                    clamp_label_text(&action.label, POPUP_ACTION_LABEL_MAX_CHARS).as_ref(),
+                );
                 button.add_css_class("unixnotis-popup-action");
                 let action_key = action.key.clone();
                 let tx = self.command_tx.clone();
@@ -133,41 +165,20 @@ impl UiState {
     }
 }
 
-fn set_label_markup(label: &gtk::Label, body: &str) {
-    if body.is_empty() {
-        label.set_text("");
-        return;
+fn clamp_label_text(text: &str, max_chars: usize) -> Cow<'_, str> {
+    if max_chars == 0 {
+        return Cow::Borrowed("");
     }
-    // Validate markup before applying it to avoid panics and malformed render state.
-    // Use '\0' to disable accelerator parsing and keep validation strict.
-    // Fallback to plain text so notifications remain readable.
-    if let Err(err) = pango::parse_markup(body, '\0') {
-        if should_warn_invalid_markup() {
-            warn!(
-                ?err,
-                "invalid notification markup; falling back to plain text"
-            );
+    // char_indices preserves UTF-8 boundaries during truncation
+    for (chars, (idx, _)) in text.char_indices().enumerate() {
+        if chars == max_chars {
+            let mut clamped = String::with_capacity(idx + 3);
+            clamped.push_str(&text[..idx]);
+            clamped.push('…');
+            return Cow::Owned(clamped);
         }
-        label.set_text(body);
-        return;
     }
-    label.set_markup(body);
-}
-
-fn should_warn_invalid_markup() -> bool {
-    // Rate-limit malformed markup warnings to avoid log spam from noisy apps.
-    const WARN_INTERVAL_SECS: u64 = 30;
-    static LAST_WARN: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let last = LAST_WARN.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= WARN_INTERVAL_SECS {
-        LAST_WARN.store(now, Ordering::Relaxed);
-        return true;
-    }
-    false
+    Cow::Borrowed(text)
 }
 
 fn try_send_command(tx: &Sender<UiCommand>, command: UiCommand) {
