@@ -20,3 +20,4 @@ toml.workspace = true
 unixnotis-core = { path = "../unixnotis-core" }
 indexmap.workspace = true
 libc.workspace = true
+unicode-width.workspace = true

@@ -204,7 +204,16 @@ pub fn sanitize_log_value(value: &str, max_len: usize) -> String {
     let mut count = 0usize;
     let mut truncated = false;
     for ch in value.chars() {
-        let ch = if ch == '\n' || ch == '\r' { ' ' } else { ch };
+        // Directionality controls can visually reorder terminal output, so drop them.
+        if is_bidi_control(ch) {
+            continue;
+        }
+        // Replace control/newline bytes with spaces to keep logs single-line and safe.
+        let ch = if ch == '\n' || ch == '\r' || ch.is_control() {
+            ' '
+        } else {
+            ch
+        };
         cleaned.push(ch);
         count += 1;
         if count >= max_len {
@@ -225,6 +234,25 @@ pub fn log_snippet(value: &str) -> String {
     sanitize_log_value(value, log_limit())
 }
 
+fn is_bidi_control(ch: char) -> bool {
+    // Covers directional embeddings/overrides/isolates and directional marks.
+    matches!(
+        ch,
+        '\u{061C}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'
+            | '\u{202B}'
+            | '\u{202C}'
+            | '\u{202D}'
+            | '\u{202E}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +265,13 @@ mod tests {
 
         let no_truncate = sanitize_log_value("ok", 5);
         assert_eq!(no_truncate, "ok");
+    }
+
+    #[test]
+    fn sanitize_log_value_strips_bidi_controls() {
+        let value = "safe\u{202E}spoof\u{2066}text\u{2069}";
+        let sanitized = sanitize_log_value(value, 80);
+        assert_eq!(sanitized, "safespooftext");
     }
 
     #[test]
