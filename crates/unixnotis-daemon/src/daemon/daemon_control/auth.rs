@@ -93,14 +93,24 @@ async fn read_process_executable_path(_pid: u32) -> Option<PathBuf> {
 }
 
 pub(super) fn is_trusted_control_executable_path(path: &Path) -> bool {
-    // Canonicalize both sides so symlinks do not bypass the allowlist
+    // Canonicalize observed path first so comparisons use a stable filesystem identity
     let observed = canonicalize_best_effort(path);
-    trusted_control_executable_paths()
-        .into_iter()
-        .any(|candidate| canonicalize_best_effort(&candidate) == observed)
+    // Require an exact trusted binary name, not a suffix-alike alias
+    let Some(observed_name) = observed.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if !TRUSTED_CONTROL_EXECUTABLES.contains(&observed_name) {
+        return false;
+    }
+    // Candidate set includes only discovered binaries with exact trusted names
+    trusted_control_executable_paths().contains(&observed)
 }
 
-fn trusted_control_executable_paths() -> Vec<PathBuf> {
+fn trusted_control_executable_paths() -> std::collections::HashSet<PathBuf> {
+    use std::collections::HashSet;
+
+    // Build a deduplicated set so lookups stay O(1)
+    let mut candidates = HashSet::new();
     let mut directories = Vec::new();
 
     // Include the current binary directory for local builds and dev runs
@@ -113,13 +123,19 @@ fn trusted_control_executable_paths() -> Vec<PathBuf> {
     directories.push(PathBuf::from("/usr/local/bin"));
     directories.push(PathBuf::from("/usr/bin"));
     directories.push(PathBuf::from("/bin"));
+    // Include common per-user install location used by UnixNotis installer
+    if let Some(home) = std::env::var_os("HOME") {
+        directories.push(PathBuf::from(home).join(".local/bin"));
+    }
 
-    let mut candidates = Vec::new();
     for directory in directories {
         for executable in TRUSTED_CONTROL_EXECUTABLES {
-            candidates.push(directory.join(executable));
-            // Keep Windows-style suffix support for portability and tests
-            candidates.push(directory.join(format!("{executable}.exe")));
+            // Exact name match only; suffix aliases like *.exe are not accepted on Linux
+            let candidate = directory.join(executable);
+            // Keep only files that exist at discovery time
+            if candidate.exists() {
+                candidates.insert(canonicalize_best_effort(&candidate));
+            }
         }
     }
     candidates

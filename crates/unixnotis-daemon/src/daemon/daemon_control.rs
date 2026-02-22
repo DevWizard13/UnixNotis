@@ -54,16 +54,21 @@ impl ControlServer {
 
 #[interface(name = "com.unixnotis.Control")]
 impl ControlServer {
-    async fn get_state(&self) -> ControlState {
+    async fn get_state(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<ControlState> {
+        // State metadata is now treated as privileged control telemetry
+        self.authorize_control_call(&header, "GetState").await?;
         // Single lock read keeps state snapshot internally consistent
         let store = self.state.store.lock().await;
         // Read cached inhibitor values to keep state queries constant-time.
-        ControlState {
+        Ok(ControlState {
             dnd_enabled: store.dnd_enabled(),
             history_count: store.history_len() as u32,
             inhibited: store.inhibited(),
             inhibitor_count: store.inhibitor_count(),
-        }
+        })
     }
 
     async fn list_active(
@@ -409,19 +414,37 @@ mod tests {
 
     #[test]
     fn trusted_control_executable_paths_in_known_dirs() {
-        let current_dir = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-            .expect("current exe parent");
-        assert!(is_trusted_control_executable_path(
-            &current_dir.join("noticenterctl")
-        ));
-        assert!(is_trusted_control_executable_path(
-            &current_dir.join("unixnotis-center")
-        ));
-        assert!(is_trusted_control_executable_path(
-            &current_dir.join("unixnotis-popups")
-        ));
+        // Use real binaries discovered on this machine instead of assuming test-binary layout
+        let mut directories = Vec::new();
+        if let Ok(current_exe) = std::env::current_exe() {
+            if let Some(parent) = current_exe.parent() {
+                directories.push(parent.to_path_buf());
+            }
+        }
+        directories.push(std::path::PathBuf::from("/usr/local/bin"));
+        directories.push(std::path::PathBuf::from("/usr/bin"));
+        directories.push(std::path::PathBuf::from("/bin"));
+        if let Some(home) = std::env::var_os("HOME") {
+            directories.push(std::path::PathBuf::from(home).join(".local/bin"));
+        }
+
+        let trusted_names = [
+            "noticenterctl",
+            "unixnotis-center",
+            "unixnotis-popups",
+            "unixnotis-daemon",
+        ];
+        let mut found_any = false;
+        for directory in directories {
+            for executable in trusted_names {
+                let candidate = directory.join(executable);
+                if candidate.exists() {
+                    found_any = true;
+                    assert!(is_trusted_control_executable_path(&candidate));
+                }
+            }
+        }
+        assert!(found_any, "expected at least one trusted control binary to exist");
     }
 
     #[test]
@@ -432,6 +455,17 @@ mod tests {
         assert!(!is_trusted_control_executable_path(Path::new(
             "/usr/bin/python3"
         )));
+    }
+
+    #[test]
+    fn rejects_trusted_name_alias_suffixes() {
+        let current_dir = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+            .expect("current exe parent");
+        assert!(!is_trusted_control_executable_path(
+            &current_dir.join("noticenterctl.exe")
+        ));
     }
 
     #[test]
