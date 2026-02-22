@@ -1,12 +1,20 @@
-//! Notification store with ordering, history, and suppression policies.
+//! Notification store with ordering, history, and suppression policies
 //!
-//! Split into focused modules so persistence and inhibitor tracking stay isolated
-//! from the core notification lifecycle logic.
+//! store.rs stays as the main entry point and wires focused modules under store/
 
+// Focused modules keep policy and lifecycle logic isolated and easier to test
 #[path = "store/store_history.rs"]
 mod store_history;
+#[path = "store/store_identity.rs"]
+mod store_identity;
 #[path = "store/store_inhibit.rs"]
 mod store_inhibit;
+#[path = "store/store_inhibitor_api.rs"]
+mod store_inhibitor_api;
+#[path = "store/store_lifecycle.rs"]
+mod store_lifecycle;
+#[path = "store/store_rules.rs"]
+mod store_rules;
 #[path = "store/store_state.rs"]
 mod store_state;
 
@@ -16,77 +24,99 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 use tracing::{debug, warn};
-use unixnotis_core::{Config, InhibitMode, Notification, NotificationView, RuleConfig, Urgency};
+use unixnotis_core::{Config, Notification, NotificationView};
 
+// Internal store primitives used by the main NotificationStore type
 use store_history::HistoryStore;
-use store_inhibit::{inhibits_popups, Inhibitor, InhibitorOwnerMismatch};
+use store_inhibit::Inhibitor;
 use store_state::{DndStateStore, DND_STATE_VERSION};
 
 #[cfg(test)]
 use std::path::PathBuf;
 
-/// Mutable notification state owned by the daemon.
+#[cfg(test)]
+use store_rules::contains_ci;
+
+/// Mutable notification state owned by the daemon
 pub struct NotificationStore {
+    // Immutable runtime config snapshot
     config: Config,
+    // Next candidate id for allocation
     next_id: u32,
+    // Active notifications in insertion order
     active: IndexMap<u32, Arc<Notification>>,
+    // Archived notifications with bounded retention
     history: HistoryStore,
+    // Optional expiration deadline per active id
     expirations: HashMap<u32, Instant>,
+    // Effective DND switch after loading persisted state
     dnd_enabled: bool,
-    // Optional persistence layer for the DND toggle; absence keeps behavior in-memory only.
+    // Optional persistence layer for DND; absent store keeps behavior in-memory
     dnd_state_store: Option<DndStateStore>,
-    // Monotonic token for inhibitor registration; tokens are never reused in a process.
+    // Token counter for inhibitors; never reused in a process
     next_inhibitor_id: u64,
-    // Active inhibitors keyed by token for O(1) lookup and removal.
+    // Active inhibitors keyed by token for quick lookup/removal
     inhibitors: HashMap<u64, Inhibitor>,
-    // Cached boolean so popup decisions stay O(1) during notify bursts.
+    // Cached flags avoid rescanning inhibitors on every notification
     inhibited: bool,
-    // Cached total so D-Bus state can be emitted without recomputation.
     inhibitor_count: u32,
 }
 
 pub struct InsertOutcome {
+    // Stored notification instance returned to callers
     pub notification: Arc<Notification>,
+    // True when insertion replaced an existing id
     pub replaced: bool,
+    // Whether popup rendering is allowed for this payload
     pub show_popup: bool,
+    // Whether sound playback is allowed for this payload
     pub allow_sound: bool,
+    // Active ids evicted because max_active was exceeded
     pub evicted: Vec<u32>,
+    // True when payload was intentionally dropped by inhibit mode
     pub dropped: bool,
 }
 
 pub struct DismissOutcome {
+    // True when an active entry was removed
     pub removed_active: bool,
+    // True when a history entry was removed
     pub removed_history: bool,
 }
 
 impl DismissOutcome {
     pub fn removed_any(&self) -> bool {
+        // Convenience helper for callers that only need yes/no
         self.removed_active || self.removed_history
     }
 }
 
 impl NotificationStore {
     pub fn new(config: Config) -> Self {
+        // Default constructor attempts to bind persistence to XDG state dir
         let dnd_state_store = DndStateStore::new();
         Self::new_with_state_store(config, dnd_state_store)
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_state_dir(config: Config, state_dir: PathBuf) -> Self {
-        // Test helper: allow a custom state directory without mutating process env.
+        // Test helper with explicit state path and no env mutations
         let dnd_state_store = Some(DndStateStore::from_state_dir(state_dir));
         Self::new_with_state_store(config, dnd_state_store)
     }
 
     fn new_with_state_store(config: Config, dnd_state_store: Option<DndStateStore>) -> Self {
+        // Config default is used unless a valid persisted value overrides it
         let mut dnd_enabled = config.general.dnd_default;
         if let Some(store) = dnd_state_store.as_ref() {
             match store.load() {
                 Ok(Some(state)) if state.version == DND_STATE_VERSION => {
+                    // Versioned state prevents accidental decode of incompatible formats
                     dnd_enabled = state.dnd_enabled;
                     debug!(dnd_enabled, "loaded persisted do-not-disturb state");
                 }
                 Ok(Some(state)) => {
+                    // Unknown version is ignored but logged for troubleshooting
                     warn!(
                         version = state.version,
                         "unsupported dnd state version; ignoring persisted value"
@@ -94,12 +124,14 @@ impl NotificationStore {
                 }
                 Ok(None) => {}
                 Err(err) => {
+                    // Persistence failures must never block daemon startup
                     warn!(?err, "failed to read persisted do-not-disturb state");
                 }
             }
         }
 
         Self {
+            // IDs start at 1 to preserve protocol expectations
             next_id: 1,
             dnd_enabled,
             config,
@@ -124,10 +156,11 @@ impl NotificationStore {
 
     pub fn set_dnd(&mut self, enabled: bool) -> (bool, Option<DndStateStore>) {
         if self.dnd_enabled == enabled {
+            // Returning false lets callers skip unnecessary state writes
             return (false, None);
         }
         self.dnd_enabled = enabled;
-        // Persist outside the store lock to avoid blocking notification processing on I/O.
+        // Persist outside the store lock so notification flow stays responsive
         (true, self.dnd_state_store.clone())
     }
 
@@ -139,71 +172,8 @@ impl NotificationStore {
         self.inhibitor_count
     }
 
-    pub fn add_inhibitor(&mut self, owner: String, reason: String, scope: u32) -> u64 {
-        let id = self.next_inhibitor_id.max(1);
-        self.next_inhibitor_id = id.saturating_add(1);
-        // Keep the owner name so disconnect cleanup can evict all related inhibitors.
-        self.inhibitors.insert(
-            id,
-            Inhibitor {
-                id,
-                owner,
-                reason,
-                scope,
-            },
-        );
-        self.refresh_inhibit_state();
-        id
-    }
-
-    pub fn remove_inhibitor(
-        &mut self,
-        id: u64,
-        owner: &str,
-    ) -> Result<bool, InhibitorOwnerMismatch> {
-        let Some(existing) = self.inhibitors.get(&id) else {
-            return Ok(false);
-        };
-        if existing.owner != owner {
-            // Owner checks prevent one client from removing another client's inhibitor.
-            return Err(InhibitorOwnerMismatch::new(
-                existing.owner.clone(),
-                owner.to_string(),
-            ));
-        }
-        self.inhibitors.remove(&id);
-        self.refresh_inhibit_state();
-        Ok(true)
-    }
-
-    pub fn remove_inhibitors_by_owner(&mut self, owner: &str) -> bool {
-        let before = self.inhibitors.len();
-        self.inhibitors
-            .retain(|_, inhibitor| inhibitor.owner != owner);
-        if self.inhibitors.len() == before {
-            return false;
-        }
-        // Refresh cached counters only when the set actually changes.
-        self.refresh_inhibit_state();
-        true
-    }
-
-    pub fn list_inhibitors(&self) -> Vec<(u64, String, u32, String)> {
-        let mut inhibitors = Vec::with_capacity(self.inhibitors.len());
-        for inhibitor in self.inhibitors.values() {
-            inhibitors.push((
-                inhibitor.id,
-                inhibitor.reason.clone(),
-                inhibitor.scope,
-                inhibitor.owner.clone(),
-            ));
-        }
-        // Sort by token for deterministic CLI output and test expectations.
-        inhibitors.sort_by_key(|(id, _, _, _)| *id);
-        inhibitors
-    }
-
     pub fn list_active(&self) -> Vec<NotificationView> {
+        // Reverse iteration returns newest entries first for panel rendering
         self.active
             .values()
             .rev()
@@ -212,334 +182,19 @@ impl NotificationStore {
     }
 
     pub fn list_history(&self) -> Vec<NotificationView> {
+        // HistoryStore already returns newest first
         self.history.list_views()
     }
 
     pub fn history_len(&self) -> usize {
+        // Exposed for diagnostics and test assertions
         self.history.len()
     }
 
-    pub fn insert(&mut self, mut notification: Notification, replaces_id: u32) -> InsertOutcome {
-        self.apply_rules(&mut notification);
-        if self.should_drop_inhibited() {
-            let assigned_id = self.next_id();
-            notification.id = assigned_id;
-            let notification = Arc::new(notification);
-            return InsertOutcome {
-                show_popup: false,
-                allow_sound: false,
-                notification,
-                replaced: false,
-                evicted: Vec::new(),
-                dropped: true,
-            };
-        }
-        // Preserve protocol semantics: replaces_id only applies when it matches an existing item.
-        let has_replaces_id = replaces_id != 0;
-        // Replacement is permitted only for notifications owned by the same D-Bus sender.
-        let replaced = has_replaces_id
-            && self.can_replace_notification_for_sender(
-                replaces_id,
-                notification.sender_name.as_deref(),
-                notification.sender_pid,
-            );
-        let assigned_id = if replaced {
-            replaces_id
-        } else {
-            self.next_id()
-        };
-        notification.id = assigned_id;
-
-        // Remove any stale entries for this ID before inserting the replacement.
-        self.active.shift_remove(&assigned_id);
-        self.history.remove(&assigned_id);
-        self.expirations.remove(&assigned_id);
-
-        let notification = Arc::new(notification);
-        self.active.insert(assigned_id, notification.clone());
-        let evicted = self.enforce_active_limit();
-
-        InsertOutcome {
-            show_popup: self.should_show_popup(&notification),
-            allow_sound: self.should_play_sound(&notification),
-            notification,
-            replaced,
-            evicted,
-            dropped: false,
-        }
-    }
-
-    pub fn close(&mut self, id: u32) -> Option<Arc<Notification>> {
-        let removed = self.active.shift_remove(&id);
-        self.expirations.remove(&id);
-        if let Some(notification) = removed.clone() {
-            // History entries are appended only when the notification is explicitly closed.
-            self.push_history(notification.clone());
-        }
-        removed
-    }
-
-    pub fn is_notification_owned_by(&self, id: u32, sender: &str, sender_pid: Option<u32>) -> bool {
-        let Some(notification) = self.active.get(&id) else {
-            return false;
-        };
-        notification_is_owned_by(notification, Some(sender), sender_pid)
-    }
-
     pub fn clear_history(&mut self) {
+        // Explicit history wipe used by CLI and control commands
         self.history.clear();
     }
-
-    pub fn dismiss_from_panel(&mut self, id: u32) -> DismissOutcome {
-        let removed_active = self.active.shift_remove(&id).is_some();
-        if removed_active {
-            self.expirations.remove(&id);
-        }
-
-        let removed_history = self.history.remove(&id).is_some();
-
-        DismissOutcome {
-            removed_active,
-            removed_history,
-        }
-    }
-
-    pub fn drain_active_ids(&mut self) -> Vec<u32> {
-        // Drain active notifications in one pass to avoid repeated scans.
-        let ids = self.active.keys().rev().copied().collect();
-        self.active.clear();
-        self.expirations.clear();
-        ids
-    }
-
-    pub fn set_expiration(&mut self, id: u32, deadline: Option<Instant>) {
-        match deadline {
-            Some(deadline) => {
-                self.expirations.insert(id, deadline);
-            }
-            None => {
-                self.expirations.remove(&id);
-            }
-        }
-    }
-
-    pub fn expiration_for(&self, id: u32) -> Option<Instant> {
-        self.expirations.get(&id).copied()
-    }
-
-    fn next_id(&mut self) -> u32 {
-        // Walk at most (active + history + 1) IDs to find a free slot.
-        // Any window of N+1 IDs must contain a free value when only N are in use.
-        let start = self.next_id.max(1);
-        let mut candidate = start;
-        let used = self.active.len().saturating_add(self.history.len());
-        let max_attempts = used.saturating_add(1).max(1);
-        for _ in 0..max_attempts {
-            if !self.active.contains_key(&candidate) && !self.history.contains(&candidate) {
-                self.next_id = candidate.wrapping_add(1);
-                if self.next_id == 0 {
-                    self.next_id = 1;
-                }
-                return candidate;
-            }
-            candidate = candidate.wrapping_add(1);
-            if candidate == 0 {
-                candidate = 1;
-            }
-        }
-        warn!(
-            used,
-            "notification id space exhausted; reusing id to avoid deadlock"
-        );
-        self.next_id = start.wrapping_add(1);
-        if self.next_id == 0 {
-            self.next_id = 1;
-        }
-        start
-    }
-
-    fn enforce_active_limit(&mut self) -> Vec<u32> {
-        let max_active = self.config.history.max_active;
-        if max_active == 0 {
-            // max_active == 0 means "no active list"; archive everything immediately.
-            let mut evicted = Vec::new();
-            // shift_remove_index(0) evicts the oldest entry while preserving insertion order.
-            while let Some((id, notification)) = self.active.shift_remove_index(0) {
-                self.expirations.remove(&id);
-                self.push_history(notification);
-                evicted.push(id);
-            }
-            return evicted;
-        }
-        let mut evicted = Vec::new();
-        while self.active.len() > max_active {
-            // shift_remove_index(0) evicts the oldest entry while preserving insertion order.
-            if let Some((id, notification)) = self.active.shift_remove_index(0) {
-                self.expirations.remove(&id);
-                self.push_history(notification);
-                evicted.push(id);
-            } else {
-                break;
-            }
-        }
-        evicted
-    }
-
-    fn push_history(&mut self, notification: Arc<Notification>) {
-        if self.config.history.max_entries == 0 {
-            // Honor zero-history limit without allocating a history copy.
-            self.history.clear();
-            return;
-        }
-        if notification.is_transient && !self.config.history.transient_to_history {
-            return;
-        }
-        let stored = Arc::new(notification.to_history());
-        self.history.insert(stored);
-        self.history.evict_to_limit(self.config.history.max_entries);
-    }
-
-    fn should_show_popup(&self, notification: &Notification) -> bool {
-        if notification.suppress_popup {
-            return false;
-        }
-        if self.inhibited {
-            return false;
-        }
-        if self.dnd_enabled {
-            return notification.urgency == Urgency::Critical;
-        }
-        true
-    }
-
-    fn should_play_sound(&self, notification: &Notification) -> bool {
-        if notification.suppress_sound {
-            return false;
-        }
-        // Inhibitors only gate popup rendering; sound follows DND and rule overrides.
-        if self.dnd_enabled {
-            return notification.urgency == Urgency::Critical;
-        }
-        true
-    }
-
-    fn apply_rules(&self, notification: &mut Notification) {
-        for rule in &self.config.rules {
-            if !rule_matches(rule, notification) {
-                continue;
-            }
-            apply_rule(rule, notification);
-        }
-    }
-
-    fn should_drop_inhibited(&self) -> bool {
-        self.inhibited && matches!(self.config.inhibit.mode, InhibitMode::DropAll)
-    }
-
-    fn refresh_inhibit_state(&mut self) {
-        self.inhibitor_count = self.inhibitors.len() as u32;
-        self.inhibited = self
-            .inhibitors
-            .values()
-            .any(|inhibitor| inhibits_popups(inhibitor.scope));
-    }
-
-    fn can_replace_notification_for_sender(
-        &self,
-        id: u32,
-        sender: Option<&str>,
-        sender_pid: Option<u32>,
-    ) -> bool {
-        // Replacement is restricted to the original owner to prevent cross-app hijacking
-        let Some(existing) = self.active.get(&id).or_else(|| self.history.get(&id)) else {
-            return false;
-        };
-        notification_is_owned_by(existing, sender, sender_pid)
-    }
-}
-
-fn notification_is_owned_by(
-    notification: &Notification,
-    sender: Option<&str>,
-    sender_pid: Option<u32>,
-) -> bool {
-    // PID checks tolerate reconnecting clients while still blocking cross-process mutations.
-    if let (Some(caller_pid), Some(owner_pid)) = (sender_pid, notification.sender_pid) {
-        if caller_pid == owner_pid {
-            return true;
-        }
-    }
-    match (sender, notification.sender_name.as_deref()) {
-        (Some(caller), Some(owner)) => caller == owner,
-        _ => false,
-    }
-}
-
-fn rule_matches(rule: &RuleConfig, notification: &Notification) -> bool {
-    if let Some(app) = rule.app.as_ref() {
-        if !contains_ci(&notification.app_name, app) {
-            return false;
-        }
-    }
-    if let Some(summary) = rule.summary.as_ref() {
-        if !contains_ci(&notification.summary, summary) {
-            return false;
-        }
-    }
-    if let Some(body) = rule.body.as_ref() {
-        if !contains_ci(&notification.body, body) {
-            return false;
-        }
-    }
-    if let Some(category) = rule.category.as_ref() {
-        match notification.category.as_ref() {
-            Some(value) if contains_ci(value, category) => {}
-            _ => return false,
-        }
-    }
-    if let Some(urgency) = rule.urgency {
-        if notification.urgency != Urgency::from(urgency) {
-            return false;
-        }
-    }
-    true
-}
-
-fn apply_rule(rule: &RuleConfig, notification: &mut Notification) {
-    if let Some(no_popup) = rule.no_popup {
-        notification.suppress_popup = no_popup;
-    }
-    if let Some(silent) = rule.silent {
-        notification.suppress_sound = silent;
-    }
-    if let Some(force_urgency) = rule.force_urgency {
-        notification.urgency = Urgency::from(force_urgency);
-    }
-    if let Some(expire_timeout_ms) = rule.expire_timeout_ms {
-        let clamped = expire_timeout_ms.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-        notification.expire_timeout = clamped;
-    }
-    if let Some(resident) = rule.resident {
-        notification.is_resident = resident;
-    }
-    if let Some(transient) = rule.transient {
-        notification.is_transient = transient;
-    }
-}
-
-fn contains_ci(haystack: &str, needle: &str) -> bool {
-    // ASCII-only case-insensitive substring match without per-call allocations.
-    if needle.is_empty() {
-        return true;
-    }
-    let haystack_bytes = haystack.as_bytes();
-    let needle_bytes = needle.as_bytes();
-    if needle_bytes.len() > haystack_bytes.len() {
-        return false;
-    }
-    haystack_bytes
-        .windows(needle_bytes.len())
-        .any(|window| window.eq_ignore_ascii_case(needle_bytes))
 }
 
 #[cfg(test)]

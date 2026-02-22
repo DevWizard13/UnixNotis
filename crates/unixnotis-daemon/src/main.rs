@@ -21,7 +21,6 @@ mod runtime_config;
 mod shutdown_signal;
 mod sound;
 mod store;
-#[path = "trial_mode.rs"]
 mod trial_mode;
 
 use crate::child_process::{

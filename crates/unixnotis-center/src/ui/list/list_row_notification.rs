@@ -17,16 +17,25 @@ use super::super::try_send_command;
 use super::list_item::RowData;
 
 pub(super) struct NotificationRowWidgets {
+    // Main icon shown at the top-left of the row
     pub(super) icon: gtk::Image,
+    // App name text shown beside the icon
     pub(super) app_label: gtk::Label,
+    // Summary line with stronger visual weight
     pub(super) summary_label: gtk::Label,
+    // Body text section that can span multiple lines
     pub(super) body_label: gtk::Label,
+    // Container for optional action buttons
     pub(super) actions_box: gtk::Box,
+    // Current notification id bound to this reused row widget
     pub(super) notify_id: Rc<Cell<u32>>,
+    // Last rendered action signature for cheap no-op detection
     pub(super) action_cache: RefCell<Vec<(String, String)>>,
+    // Last rendered icon signature so decoding only runs when needed
     pub(super) icon_sig: RefCell<Option<IconSignature>>,
 }
 
+// Hard caps keep very large payloads from blowing up row height
 const MAX_SUMMARY_LABEL_CHARS: usize = 160;
 const MAX_BODY_LABEL_CHARS: usize = 512;
 
@@ -43,6 +52,7 @@ pub(super) struct IconSignature {
 
 impl IconSignature {
     fn from(notification: &NotificationView) -> Self {
+        // Signature includes all fields that can change icon resolution output
         Self {
             image_path: notification.image.image_path.clone(),
             icon_name: notification.image.icon_name.clone(),
@@ -58,9 +68,11 @@ impl IconSignature {
 pub(super) fn build_notification_row(
     command_tx: mpsc::Sender<UiCommand>,
 ) -> (gtk::Box, NotificationRowWidgets) {
+    // Root card uses vertical layout: header, summary, body, then actions
     let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
     root.add_css_class("unixnotis-panel-card");
 
+    // Header packs icon + app label + close button
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let icon = gtk::Image::new();
     icon.set_pixel_size(22);
@@ -68,12 +80,14 @@ pub(super) fn build_notification_row(
 
     let app_label = gtk::Label::new(None);
     app_label.set_xalign(0.0);
+    // Ellipsis avoids row width spikes from long app names
     app_label.set_ellipsize(EllipsizeMode::End);
     app_label.set_single_line_mode(true);
     app_label.set_max_width_chars(40);
     app_label.add_css_class("unixnotis-panel-app");
 
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+    // Spacer pushes close button to the far edge
     spacer.set_hexpand(true);
 
     let close_button = gtk::Button::from_icon_name("window-close-symbolic");
@@ -87,6 +101,7 @@ pub(super) fn build_notification_row(
 
     let summary_label = gtk::Label::new(None);
     summary_label.set_xalign(0.0);
+    // Summary can wrap but stays bounded to three lines
     summary_label.set_wrap(true);
     summary_label.set_wrap_mode(WrapMode::WordChar);
     summary_label.set_ellipsize(EllipsizeMode::End);
@@ -96,6 +111,7 @@ pub(super) fn build_notification_row(
 
     let body_label = gtk::Label::new(None);
     body_label.set_xalign(0.0);
+    // Body gets more lines than summary but still has upper bounds
     body_label.set_wrap(true);
     body_label.set_wrap_mode(WrapMode::WordChar);
     body_label.set_ellipsize(EllipsizeMode::End);
@@ -104,6 +120,7 @@ pub(super) fn build_notification_row(
     body_label.add_css_class("unixnotis-panel-body");
 
     let actions_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // Action buttons are added on demand during row updates
     actions_box.add_css_class("unixnotis-notification-actions");
 
     root.append(&header);
@@ -112,11 +129,13 @@ pub(super) fn build_notification_row(
     root.append(&actions_box);
 
     let notify_id = Rc::new(Cell::new(0));
+    // Close click always targets the latest id assigned to this row
     let close_tx = command_tx.clone();
     let notify_id_clone = notify_id.clone();
     close_button.connect_clicked(move |_| {
         let id = notify_id_clone.get();
         if id == 0 {
+            // Ignore clicks before first binding
             return;
         }
         debug!(id, "dismiss clicked");
@@ -146,28 +165,33 @@ pub(super) fn update_notification_row(
     icon_resolver: &IconResolver,
     command_tx: &mpsc::Sender<UiCommand>,
 ) {
+    // Recycled rows can be updated with None while model changes
     let Some(notification) = data.notification.as_ref() else {
         return;
     };
     let notification = notification.as_ref();
 
     if notification.urgency == Urgency::Critical as u8 {
+        // CSS class toggles are explicit to avoid stale visual state
         root.add_css_class("critical");
     } else {
         root.remove_css_class("critical");
     }
     if data.is_active {
+        // Active rows can be styled differently from history rows
         root.add_css_class("active");
     } else {
         root.remove_css_class("active");
     }
     if data.stacked {
+        // Stacked class indicates collapsed entries in grouped mode
         root.add_css_class("stacked");
     } else {
         root.remove_css_class("stacked");
     }
 
     row.app_label.set_text(&notification.app_name);
+    // Clamp before GTK rendering to avoid giant layout passes
     let summary = clamp_label_text(&notification.summary, MAX_SUMMARY_LABEL_CHARS);
     row.summary_label.set_text(summary.as_ref());
     update_body_label(&row.body_label, &notification.body);
@@ -180,6 +204,7 @@ pub(super) fn update_notification_row(
         notification,
     );
 
+    // Icon decode/apply is skipped when signature is unchanged
     let next_sig = IconSignature::from(notification);
     let mut sig_guard = row.icon_sig.borrow_mut();
     if sig_guard.as_ref() != Some(&next_sig) {
@@ -191,6 +216,7 @@ pub(super) fn update_notification_row(
 
 fn update_body_label(label: &gtk::Label, body: &str) {
     if body.is_empty() {
+        // Hide empty body to reduce visual noise
         label.set_text("");
         label.set_visible(false);
         return;
@@ -205,15 +231,15 @@ fn clamp_label_text(text: &str, max_chars: usize) -> Cow<'_, str> {
     if max_chars == 0 {
         return Cow::Borrowed("");
     }
-    let mut chars = 0usize;
-    for (idx, _) in text.char_indices() {
+    // Iterate by character boundaries so UTF-8 stays valid after truncation
+    for (chars, (idx, _)) in text.char_indices().enumerate() {
         if chars == max_chars {
+            // Allocate only when truncation actually happens
             let mut clamped = String::with_capacity(idx + 3);
             clamped.push_str(&text[..idx]);
             clamped.push('…');
             return Cow::Owned(clamped);
         }
-        chars += 1;
     }
     Cow::Borrowed(text)
 }
@@ -224,6 +250,7 @@ fn update_actions(
     command_tx: &mpsc::Sender<UiCommand>,
     notification: &NotificationView,
 ) {
+    // Fast path: skip button rebuild when action set is unchanged
     {
         let cached = cache.borrow();
         if cached.len() == notification.actions.len()
@@ -237,6 +264,7 @@ fn update_actions(
     }
 
     {
+        // Cache current action signature for next update cycle
         let mut cached = cache.borrow_mut();
         cached.clear();
         cached.reserve(notification.actions.len());
@@ -247,6 +275,7 @@ fn update_actions(
 
     // Refresh action buttons only when the action list changes.
     while let Some(child) = actions_box.first_child() {
+        // Remove old buttons before rebuilding the new set
         actions_box.remove(&child);
     }
     if notification.actions.is_empty() {
@@ -262,6 +291,7 @@ fn update_actions(
         let id = notification.id;
         button.connect_clicked(move |_| {
             debug!(id, action = %action_key, "action invoked");
+            // Action execution is best-effort and non-blocking
             // Best-effort enqueue keeps action handling responsive.
             try_send_command(
                 &tx,
