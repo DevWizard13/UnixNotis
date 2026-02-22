@@ -2,39 +2,43 @@
 //!
 //! Provides panel control, state queries, and inhibitor management.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::stream::{self, StreamExt};
 use tracing::warn;
 use unixnotis_core::{
     CloseReason, ControlState, InhibitorInfo, NotificationView, PanelDebugLevel, PanelRequest,
-    CONTROL_OBJECT_PATH, INHIBIT_SCOPE_ALL, INHIBIT_SCOPE_POPUPS,
+    CONTROL_OBJECT_PATH,
 };
-use zbus::fdo::DBusProxy;
 use zbus::message::Header;
 use zbus::{interface, SignalContext};
 
 use super::{to_fdo_error, DaemonState, NotificationServer, NOTIFICATIONS_OBJECT_PATH};
 
+// Split auth logic out so this file stays focused on control interface behavior
+#[path = "daemon_control/auth.rs"]
+mod auth;
+// Split input normalization out so validation is shared and easy to test
+#[path = "daemon_control/sanitize.rs"]
+mod sanitize;
+// Split owner-watch logic out so background cleanup code is isolated
+#[path = "daemon_control/watch.rs"]
+mod watch;
+
 /// D-Bus server for com.unixnotis.Control.
 pub struct ControlServer {
+    // Shared daemon state used by all control methods
     state: Arc<DaemonState>,
 }
 
+// Keep clear-all signal fanout bounded to avoid a burst of tiny tasks
 const CLEAR_ALL_CONCURRENCY: usize = 64;
-// Restrict privileged control calls to known UnixNotis frontends.
-const TRUSTED_CONTROL_EXECUTABLES: [&str; 4] = [
-    "noticenterctl",
-    "unixnotis-center",
-    "unixnotis-popups",
-    "unixnotis-daemon",
-];
-const MAX_INHIBITOR_REASON_BYTES: usize = 256;
+// Cap inhibitor count so memory use stays bounded even under abusive clients
 const MAX_ACTIVE_INHIBITORS: u32 = 128;
 
 impl ControlServer {
     pub fn new(state: Arc<DaemonState>) -> Self {
+        // Lightweight wrapper around the shared daemon state
         Self { state }
     }
 
@@ -43,57 +47,15 @@ impl ControlServer {
         header: &Header<'_>,
         method: &'static str,
     ) -> zbus::fdo::Result<()> {
-        let sender = header
-            .sender()
-            .ok_or_else(|| zbus::fdo::Error::AccessDenied("missing sender".to_string()))?;
-        let sender_name = sender.as_str().to_string();
-        let proxy = DBusProxy::new(self.state.connection())
-            .await
-            .map_err(to_fdo_error)?;
-        let bus_name = zbus::names::BusName::try_from(sender_name.as_str())
-            .map_err(|_| zbus::fdo::Error::AccessDenied("invalid sender".to_string()))?;
-        let caller_uid = proxy.get_connection_unix_user(bus_name.clone()).await?;
-        let expected_uid = unsafe { libc::geteuid() };
-        // Control operations are local-user only; reject cross-UID callers defensively.
-        if caller_uid != expected_uid {
-            warn!(
-                method,
-                sender = %sender_name,
-                uid = caller_uid,
-                expected_uid,
-                "rejected control caller with mismatched uid"
-            );
-            return Err(zbus::fdo::Error::AccessDenied(
-                "caller uid is not authorized for control operation".to_string(),
-            ));
-        }
-        let pid = proxy.get_connection_unix_process_id(bus_name).await?;
-        let exe_path = read_process_executable_path(pid).await;
-        if !exe_path
-            .as_deref()
-            .is_some_and(is_trusted_control_executable_path)
-        {
-            warn!(
-                method,
-                sender = %sender_name,
-                pid,
-                executable = exe_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                "rejected untrusted control caller"
-            );
-            return Err(zbus::fdo::Error::AccessDenied(
-                "caller is not authorized for control operation".to_string(),
-            ));
-        }
-        Ok(())
+        // Keep access control centralized so every privileged method uses the same rules.
+        auth::authorize_control_call(&self.state, header, method).await
     }
 }
 
 #[interface(name = "com.unixnotis.Control")]
 impl ControlServer {
     async fn get_state(&self) -> ControlState {
+        // Single lock read keeps state snapshot internally consistent
         let store = self.state.store.lock().await;
         // Read cached inhibitor values to keep state queries constant-time.
         ControlState {
@@ -108,6 +70,7 @@ impl ControlServer {
         &self,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<Vec<NotificationView>> {
+        // Guard against untrusted callers before reading any notification content
         self.authorize_control_call(&header, "ListActive").await?;
         let store = self.state.store.lock().await;
         // Active list is used for popup seeding and panel hydration.
@@ -118,6 +81,7 @@ impl ControlServer {
         &self,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<Vec<NotificationView>> {
+        // History can contain sensitive content, so it uses the same auth gate
         self.authorize_control_call(&header, "ListHistory").await?;
         let store = self.state.store.lock().await;
         // History list is used for panel hydration and pagination.
@@ -175,13 +139,23 @@ impl ControlServer {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "SetDnd").await?;
-        let (changed, persist) = {
+        // Capture the previous state so persistence failures can roll back cleanly
+        let (changed, persist, previous) = {
             let mut store = self.state.store.lock().await;
-            store.set_dnd(enabled)
+            let previous = store.dnd_enabled();
+            let (changed, persist) = store.set_dnd(enabled);
+            (changed, persist, previous)
         };
         if let Some(store) = persist {
+            // Persist outside the main store lock to avoid blocking notify paths on I/O
             if let Err(err) = store.persist(enabled) {
                 warn!(?err, "failed to persist do-not-disturb state");
+                // Revert in-memory state so success always implies durable state.
+                let mut state = self.state.store.lock().await;
+                let _ = state.set_dnd(previous);
+                return Err(zbus::fdo::Error::Failed(
+                    "failed to persist do-not-disturb state".to_string(),
+                ));
             }
         }
         if changed {
@@ -204,12 +178,14 @@ impl ControlServer {
         let sender = header
             .sender()
             .ok_or_else(|| zbus::fdo::Error::Failed("missing sender".to_string()))?;
-        let normalized_scope = normalize_inhibit_scope(scope)?;
-        let sanitized_reason = sanitize_inhibit_reason(reason);
+        // Convert incoming values into safe canonical values before storing.
+        let normalized_scope = sanitize::normalize_inhibit_scope(scope)?;
+        let sanitized_reason = sanitize::sanitize_inhibit_reason(reason);
         // Track inhibitors by unique bus name so cleanup on disconnect is reliable.
         let (id, active, count) = {
             let mut store = self.state.store.lock().await;
             if store.inhibitor_count() >= MAX_ACTIVE_INHIBITORS {
+                // Hard cap blocks unbounded growth from accidental loops or hostile callers
                 return Err(zbus::fdo::Error::Failed(format!(
                     "inhibitor limit reached ({MAX_ACTIVE_INHIBITORS})"
                 )));
@@ -237,6 +213,7 @@ impl ControlServer {
         id: u64,
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
+        // Uninhibit trusts ownership on the bus sender, not executable allowlists
         let sender = header
             .sender()
             .ok_or_else(|| zbus::fdo::Error::Failed("missing sender".to_string()))?;
@@ -285,6 +262,7 @@ impl ControlServer {
 
     async fn dismiss(&self, id: u32, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "Dismiss").await?;
+        // Delegate to shared state helper so all close signals stay consistent
         self.state
             .dismiss_from_panel(id)
             .await
@@ -298,6 +276,7 @@ impl ControlServer {
         #[zbus(header)] header: Header<'_>,
     ) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "InvokeAction").await?;
+        // Reuse the freedesktop action signal path for compatibility with listeners
         let ctx = SignalContext::new(self.state.connection(), NOTIFICATIONS_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Action signals re-use the freedesktop notification interface path.
@@ -312,42 +291,64 @@ impl ControlServer {
         let ids = {
             let mut store = self.state.store.lock().await;
             let ids = store.drain_active_ids();
+            // Keep clear-all semantics simple: active + history are both reset
             store.clear_history();
             ids
         };
         if ids.is_empty() {
-            return self.state.emit_state_changed().await.map_err(to_fdo_error);
+            if let Err(err) = self.state.emit_state_changed().await {
+                warn!(?err, "failed to emit state_changed after clear_all");
+            }
+            return Ok(());
         }
-        let notif_ctx = SignalContext::new(self.state.connection(), NOTIFICATIONS_OBJECT_PATH)
-            .map_err(to_fdo_error)?;
-        let control_ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
-            .map_err(to_fdo_error)?;
+        let notif_ctx = SignalContext::new(self.state.connection(), NOTIFICATIONS_OBJECT_PATH).ok();
+        let control_ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH).ok();
+        if notif_ctx.is_none() || control_ctx.is_none() {
+            // Local store mutation already happened, so signal errors are logged but non-fatal
+            warn!("failed to build signal context for clear_all; continuing with local state");
+        }
         // Emit close signals with a bounded concurrency limit to avoid task spikes.
         stream::iter(ids)
-            .map(|id| {
+            .for_each_concurrent(CLEAR_ALL_CONCURRENCY, move |id| {
                 let notif_ctx = notif_ctx.clone();
                 let control_ctx = control_ctx.clone();
                 async move {
-                    NotificationServer::notification_closed(
-                        &notif_ctx,
-                        id,
-                        CloseReason::DismissedByUser as u32,
-                    )
-                    .await?;
-                    ControlServer::notification_closed(
-                        &control_ctx,
-                        id,
-                        CloseReason::DismissedByUser,
-                    )
-                    .await?;
-                    Ok::<(), zbus::Error>(())
+                    if let Some(notif_ctx) = notif_ctx.as_ref() {
+                        if let Err(err) = NotificationServer::notification_closed(
+                            notif_ctx,
+                            id,
+                            CloseReason::DismissedByUser as u32,
+                        )
+                        .await
+                        {
+                            warn!(
+                                ?err,
+                                id, "failed to emit notification_closed during clear_all"
+                            );
+                        }
+                    }
+                    if let Some(control_ctx) = control_ctx.as_ref() {
+                        if let Err(err) = ControlServer::notification_closed(
+                            control_ctx,
+                            id,
+                            CloseReason::DismissedByUser,
+                        )
+                        .await
+                        {
+                            warn!(
+                                ?err,
+                                id, "failed to emit control notification_closed during clear_all"
+                            );
+                        }
+                    }
                 }
             })
-            .buffer_unordered(CLEAR_ALL_CONCURRENCY)
-            .try_for_each(|_| async { Ok(()) })
-            .await
-            .map_err(to_fdo_error)?;
-        self.state.emit_state_changed().await.map_err(to_fdo_error)
+            .await;
+        if let Err(err) = self.state.emit_state_changed().await {
+            // State was updated locally even if listeners missed this broadcast
+            warn!(?err, "failed to emit state_changed after clear_all");
+        }
+        Ok(())
     }
 
     #[zbus(signal)]
@@ -393,135 +394,8 @@ impl ControlServer {
 }
 
 pub async fn spawn_inhibitor_owner_watch(state: Arc<DaemonState>) -> zbus::Result<()> {
-    let proxy = DBusProxy::new(state.connection()).await?;
-    let mut stream = proxy.receive_name_owner_changed().await?;
-    tokio::spawn(async move {
-        while let Some(signal) = stream.next().await {
-            let args = match signal.args() {
-                Ok(args) => args,
-                Err(err) => {
-                    warn!(?err, "failed to decode NameOwnerChanged args");
-                    continue;
-                }
-            };
-            if args.new_owner().is_some() {
-                continue;
-            }
-            let owner = args.name().to_string();
-            // Drop inhibitors for disconnected clients to avoid stale suppression.
-            let (changed, active, count) = {
-                let mut store = state.store.lock().await;
-                let changed = store.remove_inhibitors_by_owner(&owner);
-                let active = store.inhibited();
-                let count = store.inhibitor_count();
-                (changed, active, count)
-            };
-            if !changed {
-                continue;
-            }
-            let ctx = match SignalContext::new(state.connection(), CONTROL_OBJECT_PATH) {
-                Ok(ctx) => ctx,
-                Err(err) => {
-                    warn!(?err, "failed to build signal context for inhibitor cleanup");
-                    continue;
-                }
-            };
-            if let Err(err) = ControlServer::inhibitors_changed(&ctx, active, count).await {
-                warn!(
-                    ?err,
-                    "failed to emit inhibitors_changed after owner disconnect"
-                );
-            }
-            if let Err(err) = state.emit_state_changed().await {
-                warn!(?err, "failed to emit state_changed after owner disconnect");
-            }
-        }
-    });
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-async fn read_process_executable_path(pid: u32) -> Option<PathBuf> {
-    // Resolve /proc/<pid>/exe so authorization is based on the real executable name.
-    let path = format!("/proc/{pid}/exe");
-    tokio::fs::read_link(path).await.ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn read_process_executable_path(_pid: u32) -> Option<PathBuf> {
-    None
-}
-
-fn is_trusted_control_executable_path(path: &Path) -> bool {
-    let observed = canonicalize_best_effort(path);
-    trusted_control_executable_paths()
-        .into_iter()
-        .any(|candidate| canonicalize_best_effort(&candidate) == observed)
-}
-
-fn trusted_control_executable_paths() -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            directories.push(parent.to_path_buf());
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            directories.push(PathBuf::from(home).join(".local").join("bin"));
-        }
-    }
-    directories.push(PathBuf::from("/usr/local/bin"));
-    directories.push(PathBuf::from("/usr/bin"));
-    directories.push(PathBuf::from("/bin"));
-
-    let mut candidates = Vec::new();
-    for directory in directories {
-        for executable in TRUSTED_CONTROL_EXECUTABLES {
-            candidates.push(directory.join(executable));
-            candidates.push(directory.join(format!("{executable}.exe")));
-        }
-    }
-    candidates
-}
-
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn sanitize_inhibit_reason(reason: &str) -> String {
-    let trimmed = reason.trim();
-    if trimmed.is_empty() {
-        return "manual".to_string();
-    }
-    truncate_utf8_bytes(trimmed, MAX_INHIBITOR_REASON_BYTES)
-}
-
-fn normalize_inhibit_scope(scope: u32) -> zbus::fdo::Result<u32> {
-    if scope == INHIBIT_SCOPE_ALL {
-        return Ok(INHIBIT_SCOPE_ALL);
-    }
-    let normalized = scope & INHIBIT_SCOPE_POPUPS;
-    if normalized == 0 {
-        return Err(zbus::fdo::Error::Failed(
-            "unsupported inhibit scope".to_string(),
-        ));
-    }
-    Ok(normalized)
-}
-
-fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
-    if max_bytes == 0 {
-        return String::new();
-    }
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_string()
+    // Delegate to a focused module so the interface file stays small and readable.
+    watch::spawn_inhibitor_owner_watch(state).await
 }
 
 #[cfg(test)]
@@ -530,9 +404,8 @@ mod tests {
 
     use unixnotis_core::{INHIBIT_SCOPE_ALL, INHIBIT_SCOPE_POPUPS};
 
-    use super::{
-        is_trusted_control_executable_path, normalize_inhibit_scope, sanitize_inhibit_reason,
-    };
+    use super::auth::is_trusted_control_executable_path;
+    use super::sanitize::{normalize_inhibit_scope, sanitize_inhibit_reason};
 
     #[test]
     fn trusted_control_executable_paths_in_known_dirs() {

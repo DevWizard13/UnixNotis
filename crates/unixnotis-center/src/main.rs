@@ -4,7 +4,8 @@ use std::cell::RefCell;
 use std::env;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -23,6 +24,113 @@ mod media;
 mod ui;
 
 const UI_EVENT_QUEUE_CAPACITY: usize = 512;
+const RELOAD_FLUSH_INTERVAL_MS: u64 = 200;
+
+// Coalesces reload requests so CSS/config edits are retried when the UI queue is full
+struct ReloadGate {
+    css_pending: AtomicBool,
+    config_pending: AtomicBool,
+}
+
+impl ReloadGate {
+    fn new() -> Self {
+        Self {
+            css_pending: AtomicBool::new(false),
+            config_pending: AtomicBool::new(false),
+        }
+    }
+
+    fn request_css(&self, sender: &async_channel::Sender<dbus::UiEvent>) -> bool {
+        self.request(sender, dbus::UiEvent::CssReload, &self.css_pending)
+    }
+
+    fn request_config(&self, sender: &async_channel::Sender<dbus::UiEvent>) -> bool {
+        self.request(sender, dbus::UiEvent::ConfigReload, &self.config_pending)
+    }
+
+    fn flush(&self, sender: &async_channel::Sender<dbus::UiEvent>) {
+        self.flush_one(sender, dbus::UiEvent::CssReload, &self.css_pending);
+        self.flush_one(sender, dbus::UiEvent::ConfigReload, &self.config_pending);
+    }
+
+    fn has_pending(&self) -> bool {
+        self.css_pending.load(Ordering::Acquire) || self.config_pending.load(Ordering::Acquire)
+    }
+
+    fn request(
+        &self,
+        sender: &async_channel::Sender<dbus::UiEvent>,
+        event: dbus::UiEvent,
+        pending: &AtomicBool,
+    ) -> bool {
+        if pending.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        match sender.try_send(event) {
+            Ok(()) => {
+                pending.store(false, Ordering::Release);
+                false
+            }
+            Err(async_channel::TrySendError::Full(_)) => true,
+            Err(async_channel::TrySendError::Closed(_)) => {
+                pending.store(false, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    fn flush_one(
+        &self,
+        sender: &async_channel::Sender<dbus::UiEvent>,
+        event: dbus::UiEvent,
+        pending: &AtomicBool,
+    ) {
+        if !pending.load(Ordering::Acquire) {
+            return;
+        }
+        match sender.try_send(event) {
+            Ok(()) => {
+                pending.store(false, Ordering::Release);
+            }
+            Err(async_channel::TrySendError::Full(_)) => {}
+            Err(async_channel::TrySendError::Closed(_)) => {
+                pending.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn start_reload_timer(
+    reload_gate: &Arc<ReloadGate>,
+    sender: &async_channel::Sender<dbus::UiEvent>,
+    timer_state: &Arc<Mutex<Option<glib::SourceId>>>,
+) {
+    let mut timer_guard = match timer_state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if timer_guard.is_some() {
+        return;
+    }
+    let reload_gate = Arc::clone(reload_gate);
+    let sender = sender.clone();
+    let timer_state = Arc::clone(timer_state);
+    let source_id =
+        glib::timeout_add_local(Duration::from_millis(RELOAD_FLUSH_INTERVAL_MS), move || {
+            reload_gate.flush(&sender);
+            if reload_gate.has_pending() {
+                glib::ControlFlow::Continue
+            } else {
+                let mut timer_guard = match timer_state.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *timer_guard = None;
+                glib::ControlFlow::Break
+            }
+        });
+    *timer_guard = Some(source_id);
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -73,6 +181,8 @@ fn main() -> Result<()> {
     app.connect_activate(move |app| {
         // Bound the UI event queue to avoid unbounded memory growth under stalls.
         let (event_tx, event_rx) = async_channel::bounded(UI_EVENT_QUEUE_CAPACITY);
+        let reload_gate = Arc::new(ReloadGate::new());
+        let reload_timer = Arc::new(Mutex::new(None::<glib::SourceId>));
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             // Limit worker threads to reduce idle CPU and memory overhead.
             // The center workload is I/O bound, so a small pool remains responsive.
@@ -118,6 +228,8 @@ fn main() -> Result<()> {
         })));
 
         let ui_clone = ui.clone();
+        let reload_gate_loop = Arc::clone(&reload_gate);
+        let event_tx_loop = event_tx.clone();
         let rebuild_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
         MainContext::default().spawn_local(async move {
             while let Ok(event) = event_rx.recv().await {
@@ -126,6 +238,7 @@ fn main() -> Result<()> {
                 while let Ok(next_event) = event_rx.try_recv() {
                     ui.handle_event(next_event);
                 }
+                reload_gate_loop.flush(&event_tx_loop);
                 // Coalesce rebuilds to once per frame to avoid bursty list churn.
                 // Defer rebuilds while hidden; they'll be flushed on the next open.
                 // This keeps the GTK list idle when the panel is closed.
@@ -153,12 +266,33 @@ fn main() -> Result<()> {
 
         css::start_css_watcher(&theme_paths, CssKind::Panel, {
             let event_tx = event_tx.clone();
+            let reload_gate = Arc::clone(&reload_gate);
+            let reload_timer = Arc::clone(&reload_timer);
             move || {
-                let _ = event_tx.try_send(dbus::UiEvent::CssReload);
+                if reload_gate.request_css(&event_tx) {
+                    let reload_gate = Arc::clone(&reload_gate);
+                    let event_tx = event_tx.clone();
+                    let reload_timer = Arc::clone(&reload_timer);
+                    MainContext::default().invoke(move || {
+                        start_reload_timer(&reload_gate, &event_tx, &reload_timer);
+                    });
+                }
             }
         });
-        css::start_config_watcher(config_path.clone(), move || {
-            let _ = event_tx.try_send(dbus::UiEvent::ConfigReload);
+        css::start_config_watcher(config_path.clone(), {
+            let event_tx = event_tx.clone();
+            let reload_gate = Arc::clone(&reload_gate);
+            let reload_timer = Arc::clone(&reload_timer);
+            move || {
+                if reload_gate.request_config(&event_tx) {
+                    let reload_gate = Arc::clone(&reload_gate);
+                    let event_tx = event_tx.clone();
+                    let reload_timer = Arc::clone(&reload_timer);
+                    MainContext::default().invoke(move || {
+                        start_reload_timer(&reload_gate, &event_tx, &reload_timer);
+                    });
+                }
+            }
         });
         info!("unixnotis-center running");
     });

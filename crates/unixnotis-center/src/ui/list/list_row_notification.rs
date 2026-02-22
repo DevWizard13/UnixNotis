@@ -1,8 +1,10 @@
 //! Notification row widget construction and updates.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use gtk::pango::{EllipsizeMode, WrapMode};
 use gtk::prelude::*;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -24,6 +26,9 @@ pub(super) struct NotificationRowWidgets {
     pub(super) action_cache: RefCell<Vec<(String, String)>>,
     pub(super) icon_sig: RefCell<Option<IconSignature>>,
 }
+
+const MAX_SUMMARY_LABEL_CHARS: usize = 160;
+const MAX_BODY_LABEL_CHARS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct IconSignature {
@@ -63,6 +68,9 @@ pub(super) fn build_notification_row(
 
     let app_label = gtk::Label::new(None);
     app_label.set_xalign(0.0);
+    app_label.set_ellipsize(EllipsizeMode::End);
+    app_label.set_single_line_mode(true);
+    app_label.set_max_width_chars(40);
     app_label.add_css_class("unixnotis-panel-app");
 
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 1);
@@ -80,11 +88,19 @@ pub(super) fn build_notification_row(
     let summary_label = gtk::Label::new(None);
     summary_label.set_xalign(0.0);
     summary_label.set_wrap(true);
+    summary_label.set_wrap_mode(WrapMode::WordChar);
+    summary_label.set_ellipsize(EllipsizeMode::End);
+    summary_label.set_lines(3);
+    summary_label.set_max_width_chars(88);
     summary_label.add_css_class("unixnotis-panel-summary");
 
     let body_label = gtk::Label::new(None);
     body_label.set_xalign(0.0);
     body_label.set_wrap(true);
+    body_label.set_wrap_mode(WrapMode::WordChar);
+    body_label.set_ellipsize(EllipsizeMode::End);
+    body_label.set_lines(8);
+    body_label.set_max_width_chars(112);
     body_label.add_css_class("unixnotis-panel-body");
 
     let actions_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -152,7 +168,8 @@ pub(super) fn update_notification_row(
     }
 
     row.app_label.set_text(&notification.app_name);
-    row.summary_label.set_text(&notification.summary);
+    let summary = clamp_label_text(&notification.summary, MAX_SUMMARY_LABEL_CHARS);
+    row.summary_label.set_text(summary.as_ref());
     update_body_label(&row.body_label, &notification.body);
     row.notify_id.set(notification.id);
 
@@ -180,7 +197,25 @@ fn update_body_label(label: &gtk::Label, body: &str) {
     }
     label.set_visible(true);
     // Notification bodies are treated as plain text to avoid markup rendering surprises.
-    label.set_text(body);
+    let body = clamp_label_text(body, MAX_BODY_LABEL_CHARS);
+    label.set_text(body.as_ref());
+}
+
+fn clamp_label_text(text: &str, max_chars: usize) -> Cow<'_, str> {
+    if max_chars == 0 {
+        return Cow::Borrowed("");
+    }
+    let mut chars = 0usize;
+    for (idx, _) in text.char_indices() {
+        if chars == max_chars {
+            let mut clamped = String::with_capacity(idx + 3);
+            clamped.push_str(&text[..idx]);
+            clamped.push('…');
+            return Cow::Owned(clamped);
+        }
+        chars += 1;
+    }
+    Cow::Borrowed(text)
 }
 
 fn update_actions(

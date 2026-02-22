@@ -145,7 +145,15 @@ pub(super) fn restore_previous(action: RestoreAction) -> Result<()> {
             if !args.is_empty() {
                 command.args(args);
             }
-            let _ = command.spawn()?;
+            let child = command.spawn()?;
+            std::thread::Builder::new()
+                .name("unixnotis-trial-restore-reaper".to_string())
+                .spawn(move || {
+                    if let Err(err) = child.wait_with_output() {
+                        warn!(?err, "failed to reap restore process");
+                    }
+                })
+                .map_err(|err| anyhow!("failed to spawn restore reaper thread: {err}"))?;
             Ok(())
         }
     }
