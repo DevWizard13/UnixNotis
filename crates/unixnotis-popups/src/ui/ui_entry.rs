@@ -41,8 +41,10 @@ impl UiState {
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 6);
         root.add_css_class("unixnotis-popup-card");
-        // Popup width is strict from config; content should adapt, not grow surface geometry.
-        root.set_size_request(self.config.popups.width, -1);
+        // Use the live stack width so entries match monitor-aware popup sizing.
+        let popup_width = self.popup_stack.width_request().max(1);
+        // Popup width is strict from runtime geometry; content should adapt.
+        root.set_size_request(popup_width, -1);
         root.set_halign(Align::Fill);
         root.set_hexpand(false);
         if notification.urgency == Urgency::Critical as u8 {

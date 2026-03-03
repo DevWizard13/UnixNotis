@@ -17,6 +17,11 @@ pub(super) use self::input_region::{
 };
 use self::monitor::{default_monitor, find_monitor};
 
+// Keep popup width proportional on compact displays to avoid oversized cards.
+const POPUP_WIDTH_MONITOR_RATIO_CAP: f32 = 0.28;
+// Width floor keeps popup text readable on very small displays.
+const POPUP_WIDTH_MIN: i32 = 260;
+
 pub(super) fn build_popup_window(
     app: &gtk::Application,
     config: &Config,
@@ -97,12 +102,28 @@ pub(super) fn apply_popup_config(
     config: &Config,
     input_region: &PopupInputRegionState,
 ) {
+    let monitor = if let Some(output) = config.popups.output.as_ref() {
+        // Explicit output is attempted first
+        find_monitor(output).or_else(default_monitor)
+    } else {
+        // Fallback monitor selection keeps behavior stable without explicit output
+        default_monitor()
+    };
+    if let Some(monitor) = monitor.as_ref() {
+        // Pin popup layer-surface to selected monitor
+        window.set_monitor(Some(monitor));
+    } else {
+        // Clear monitor pin when discovery fails so compositor default is used
+        window.set_monitor(None);
+    }
+    // Width follows config but is capped by monitor geometry on smaller displays.
+    let popup_width = resolve_popup_width(config, monitor.as_ref());
     // Width is fixed by config while height remains content-driven
-    window.set_default_size(config.popups.width, 1);
-    window.set_size_request(config.popups.width, -1);
+    window.set_default_size(popup_width, 1);
+    window.set_size_request(popup_width, -1);
     // Stack width follows popup width exactly so children cannot request wider geometry.
     // This keeps popup geometry pinned to config even with hostile payload text
-    stack.set_size_request(config.popups.width, -1);
+    stack.set_size_request(popup_width, -1);
     stack.set_hexpand(false);
     stack.set_spacing(config.popups.spacing);
 
@@ -112,22 +133,6 @@ pub(super) fn apply_popup_config(
     // Keyboard focus stays with the underlying active window
     window.set_keyboard_mode(KeyboardMode::None);
 
-    let monitor = if let Some(output) = config.popups.output.as_ref() {
-        // Explicit output is attempted first
-        find_monitor(output).or_else(default_monitor)
-    } else {
-        // Fallback monitor selection keeps behavior stable without explicit output
-        default_monitor()
-    };
-
-    if let Some(monitor) = monitor.as_ref() {
-        // Pin popup layer-surface to selected monitor
-        window.set_monitor(Some(monitor));
-    } else {
-        // Clear monitor pin when discovery fails so compositor default is used
-        window.set_monitor(None);
-    }
-
     // Apply passthrough mode changes immediately on config reload
     input_region.set_allow_click_through(config.popups.allow_click_through);
     refresh_popup_input_region(
@@ -136,4 +141,22 @@ pub(super) fn apply_popup_config(
         input_region,
         popup_stack_has_active_transitions(stack),
     );
+}
+
+fn resolve_popup_width(config: &Config, monitor: Option<&gtk::gdk::Monitor>) -> i32 {
+    let requested = config.popups.width.max(1);
+    let Some(monitor) = monitor else {
+        return requested;
+    };
+    let geometry = monitor.geometry();
+    let available = geometry.width() - (config.popups.margin.left + config.popups.margin.right);
+    if available <= 0 {
+        return requested;
+    }
+    // Ratio cap keeps popup cards from occupying too much horizontal space.
+    let ratio_cap = ((available as f32) * POPUP_WIDTH_MONITOR_RATIO_CAP).round() as i32;
+    let max_width = available.max(1);
+    let min_width = POPUP_WIDTH_MIN.min(max_width);
+    let bounded_cap = ratio_cap.clamp(min_width, max_width);
+    requested.min(bounded_cap).max(1)
 }

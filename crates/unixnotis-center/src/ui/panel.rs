@@ -7,6 +7,11 @@ use gtk::Align;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use unixnotis_core::{Anchor, Config, Margins, PanelKeyboardInteractivity};
 
+// Keep panel width reasonable on narrow displays to avoid dominating screen real estate.
+const PANEL_WIDTH_MONITOR_RATIO_CAP: f32 = 0.32;
+// Width floor keeps controls readable when monitor geometry is very small.
+const PANEL_WIDTH_MIN: i32 = 260;
+
 /// GTK widgets backing the notification center panel window.
 pub struct PanelWidgets {
     pub window: gtk::ApplicationWindow,
@@ -272,7 +277,8 @@ fn resolve_panel_size(
     monitor: Option<&gdk::Monitor>,
     reserved: Option<Margins>,
 ) -> (i32, i32) {
-    let width = config.panel.width.max(1);
+    // Width is constrained by monitor geometry so defaults stay usable on laptops.
+    let width = resolve_panel_width(config, monitor);
     if config.panel.height > 0 {
         return (width, config.panel.height);
     }
@@ -283,6 +289,24 @@ fn resolve_panel_size(
     }
     // Natural height keeps top or bottom anchored panels compact when no explicit size is set.
     (width, -1)
+}
+
+fn resolve_panel_width(config: &Config, monitor: Option<&gdk::Monitor>) -> i32 {
+    let requested = config.panel.width.max(1);
+    let Some(monitor) = monitor else {
+        return requested;
+    };
+    let geometry = monitor.geometry();
+    let available = geometry.width() - (config.panel.margin.left + config.panel.margin.right);
+    if available <= 0 {
+        return requested;
+    }
+    // Ratio cap prevents oversized side panels on compact displays.
+    let ratio_cap = ((available as f32) * PANEL_WIDTH_MONITOR_RATIO_CAP).round() as i32;
+    let max_width = available.max(1);
+    let min_width = PANEL_WIDTH_MIN.min(max_width);
+    let bounded_cap = ratio_cap.clamp(min_width, max_width);
+    requested.min(bounded_cap).max(1)
 }
 
 fn compute_side_panel_height(
@@ -314,10 +338,10 @@ fn compute_side_panel_height(
 }
 
 fn dynamic_bottom_pad(work_area: i32) -> i32 {
-    // Scale the bottom gap with display height to avoid oversized panels on small screens.
-    let scaled = ((work_area as f32) * 0.1).round() as i32;
+    // Reserve a larger proportional gap so side panels do not feel full-height on laptops.
+    let scaled = ((work_area as f32) * 0.16).round() as i32;
     // Clamp provides guard rails so extreme screen sizes still keep a reasonable gap.
-    scaled.clamp(24, 160)
+    scaled.clamp(48, 220)
 }
 
 fn default_monitor() -> Option<gdk::Monitor> {

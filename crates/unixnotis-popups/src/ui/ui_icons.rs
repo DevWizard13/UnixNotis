@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use gtk::glib::object::Cast;
+use gtk::prelude::*;
 use gtk::{gdk, glib};
 use tracing::{debug, warn};
 use unixnotis_core::NotificationView;
@@ -26,6 +27,8 @@ const ICON_TEXTURE_CACHE_MAX_BYTES: usize = 1024 * 1024;
 const ICON_DECODE_WORKERS: usize = 2;
 // Limit queued decode jobs to keep bursts from accumulating unbounded memory.
 const ICON_DECODE_QUEUE_CAPACITY: usize = 64;
+// Popup icon size is fixed so rows stay visually consistent across icon sources.
+const POPUP_ICON_SIZE: i32 = 20;
 
 enum IconDecodeDropPolicy {
     DropNewest,
@@ -36,6 +39,7 @@ const ICON_DECODE_DROP_POLICY: IconDecodeDropPolicy = IconDecodeDropPolicy::Drop
 
 struct IconDecodeJob {
     path: PathBuf,
+    target_size: i32,
 }
 
 // Arc shares decoded bytes across waiters without cloning large buffers.
@@ -91,7 +95,7 @@ impl IconDecodePool {
         }
     }
 
-    fn submit(&self, path: PathBuf, reply: IconReply) {
+    fn submit(&self, path: PathBuf, target_size: i32, reply: IconReply) {
         // Deduplicate in-flight requests so repeated icon paths share a single decode.
         {
             let mut in_flight = match self.in_flight.lock() {
@@ -106,7 +110,10 @@ impl IconDecodePool {
         }
 
         // Avoid blocking the GTK thread; drop on overflow and signal failure to the caller.
-        match self.tx.try_send(IconDecodeJob { path: path.clone() }) {
+        match self.tx.try_send(IconDecodeJob {
+            path: path.clone(),
+            target_size,
+        }) {
             Ok(()) => {}
             Err(async_channel::TrySendError::Full(job)) => {
                 let reason = match ICON_DECODE_DROP_POLICY {
@@ -223,7 +230,7 @@ impl TextureCache {
 fn worker_loop(rx: async_channel::Receiver<IconDecodeJob>, in_flight: IconWaiters) {
     while let Ok(job) = rx.recv_blocking() {
         // Decode file-backed icons off the GTK thread to keep animations smooth.
-        let result = decode_icon_file(&job.path).map(Arc::new);
+        let result = decode_icon_file(&job.path, job.target_size).map(Arc::new);
         let waiters = {
             let mut in_flight = match in_flight.lock() {
                 Ok(guard) => guard,
@@ -248,20 +255,20 @@ impl UiState {
         let image = &notification.image;
         if let Some(texture) = image_data_texture(image) {
             let widget = gtk::Image::from_paintable(Some(&texture));
-            widget.set_pixel_size(20);
+            set_popup_icon_size(&widget, POPUP_ICON_SIZE);
             return Some(widget);
         }
 
         if !image.image_path.is_empty() {
             let path = image.image_path.as_str();
-            return self.resolve_icon_widget(path, 20);
+            return self.resolve_icon_widget(path, POPUP_ICON_SIZE);
         }
 
         let cache_key = format!("{}|{}", notification.app_name, notification.image.icon_name);
         if let Some(cached) = self.icon_cache.get(&cache_key) {
             return cached
                 .as_ref()
-                .and_then(|icon_name| self.resolve_icon_widget(icon_name, 20));
+                .and_then(|icon_name| self.resolve_icon_widget(icon_name, POPUP_ICON_SIZE));
         }
 
         let candidates = collect_icon_candidates(notification);
@@ -271,7 +278,9 @@ impl UiState {
         for candidate in &candidates {
             if let Some(icon_names) = self.desktop_icons.icons_for(candidate) {
                 for icon_name in icon_names {
-                    if let Some(widget) = self.resolve_icon_widget(icon_name.as_str(), 20) {
+                    if let Some(widget) =
+                        self.resolve_icon_widget(icon_name.as_str(), POPUP_ICON_SIZE)
+                    {
                         resolved = Some((icon_name.clone(), widget));
                         break;
                     }
@@ -284,7 +293,7 @@ impl UiState {
 
         if resolved.is_none() {
             for candidate in &candidates {
-                if let Some(widget) = self.resolve_icon_widget(candidate, 20) {
+                if let Some(widget) = self.resolve_icon_widget(candidate, POPUP_ICON_SIZE) {
                     resolved = Some((candidate.clone(), widget));
                     break;
                 }
@@ -331,20 +340,25 @@ impl UiState {
                 if let Some(texture) = self.icon_texture_cache.borrow_mut().get(&file_path) {
                     let widget = gtk::Image::new();
                     widget.set_paintable(Some(&texture));
+                    set_popup_icon_size(&widget, size);
                     return Some(widget);
                 }
-                return Some(self.spawn_file_icon(file_path));
+                return Some(self.spawn_file_icon(file_path, size));
             }
         }
-        resolve_icon_image(name, size)
+        let widget = resolve_icon_image(name, size)?;
+        set_popup_icon_size(&widget, size);
+        Some(widget)
     }
 
-    fn spawn_file_icon(&self, path: PathBuf) -> gtk::Image {
+    fn spawn_file_icon(&self, path: PathBuf, size: i32) -> gtk::Image {
         let widget = gtk::Image::new();
+        set_popup_icon_size(&widget, size);
         let (tx, rx) = async_channel::bounded::<IconDecodeResult>(1);
         let widget_clone = widget.clone();
         let cache = self.icon_texture_cache.clone();
         let path_clone = path.clone();
+        let target_size = size.max(1);
         // Apply the texture on the main loop to avoid GTK thread violations.
         glib::MainContext::default().spawn_local(async move {
             if let Ok(result) = rx.recv().await {
@@ -366,6 +380,7 @@ impl UiState {
                                 .insert(path_clone.clone(), texture.clone());
                         }
                         widget_clone.set_paintable(Some(&texture));
+                        set_popup_icon_size(&widget_clone, target_size);
                     }
                     Err(err) => {
                         debug!(?err, "popup icon decode failed");
@@ -375,10 +390,17 @@ impl UiState {
         });
 
         // Decode on a background worker pool to avoid spawning unbounded threads.
-        IconDecodePool::global().submit(path, tx);
+        IconDecodePool::global().submit(path, target_size, tx);
 
         widget
     }
+}
+
+fn set_popup_icon_size(widget: &gtk::Image, size: i32) {
+    let size = size.max(1);
+    // Enforce a fixed icon footprint so file-backed and themed icons align.
+    widget.set_pixel_size(size);
+    widget.set_size_request(size, size);
 }
 
 #[cfg(test)]
@@ -392,8 +414,8 @@ mod tests {
         let (tx_a, _rx_a) = async_channel::bounded(1);
         let (tx_b, _rx_b) = async_channel::bounded(1);
 
-        pool.submit(path.clone(), tx_a);
-        pool.submit(path.clone(), tx_b);
+        pool.submit(path.clone(), POPUP_ICON_SIZE, tx_a);
+        pool.submit(path.clone(), POPUP_ICON_SIZE, tx_b);
 
         assert_eq!(pool.queue_len(), 1);
         assert_eq!(pool.waiter_count(&path), 2);
@@ -407,8 +429,8 @@ mod tests {
         let (tx_a, _rx_a) = async_channel::bounded(1);
         let (tx_b, rx_b) = async_channel::bounded(1);
 
-        pool.submit(path_a, tx_a);
-        pool.submit(path_b.clone(), tx_b);
+        pool.submit(path_a, POPUP_ICON_SIZE, tx_a);
+        pool.submit(path_b.clone(), POPUP_ICON_SIZE, tx_b);
 
         let result = rx_b.recv_blocking().expect("reply expected");
         assert!(result.is_err());

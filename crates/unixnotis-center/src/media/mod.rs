@@ -8,7 +8,6 @@ mod media_metadata;
 mod media_schedule;
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -25,7 +24,8 @@ use media_bus::{
 };
 use media_cache::{refresh_cache, refresh_player_cache, send_snapshot};
 use media_schedule::{
-    schedule_delayed_refresh, schedule_metadata_fallback, schedule_metadata_fallbacks,
+    cancel_delayed_refresh, prune_delayed_refreshes, schedule_command_refresh,
+    schedule_metadata_fallback, schedule_metadata_fallbacks, DelayedRefreshTasks,
 };
 
 // MPRIS base identifiers used to discover players on the session bus.
@@ -158,6 +158,8 @@ pub fn start_media_task(
         let (signal_tx, mut signal_rx) = mpsc::channel::<MediaSignal>(MEDIA_SIGNAL_CAPACITY);
         let mut players: HashMap<String, PlayerState> = HashMap::new();
         let mut cache: HashMap<String, MediaInfo> = HashMap::new();
+        // Track delayed refresh work per player so retries remain bounded.
+        let mut delayed_refreshes: DelayedRefreshTasks = HashMap::new();
         // Clone tokens once to avoid repeated allocations in refresh paths.
         let browser_tokens = config.browser_tokens.clone();
         let mut refresh = true;
@@ -170,9 +172,11 @@ pub fn start_media_task(
                 {
                     warn!(?err, "failed to refresh media players");
                 }
+                // Remove stale delayed refresh work for players that no longer exist.
+                prune_player_refreshes(&mut delayed_refreshes, &players);
                 refresh_cache(&players, &browser_tokens, &mut cache).await;
                 send_snapshot(&sender, &cache).await;
-                schedule_metadata_fallbacks(&cache, signal_tx.clone());
+                schedule_metadata_fallbacks(&mut delayed_refreshes, &cache, signal_tx.clone());
                 refresh = false;
             }
 
@@ -191,14 +195,12 @@ pub fn start_media_task(
                                 refresh_player_cache(&players, &browser_tokens, &mut cache, &name)
                                     .await;
                                 send_snapshot(&sender, &cache).await;
-                                schedule_metadata_fallback(&cache, signal_tx.clone(), &name);
-                                for delay_ms in [150_u64, 650_u64] {
-                                    schedule_delayed_refresh(
-                                        signal_tx.clone(),
-                                        name.clone(),
-                                        Duration::from_millis(delay_ms),
-                                    );
-                                }
+                                schedule_command_refresh(
+                                    &mut delayed_refreshes,
+                                    &cache,
+                                    signal_tx.clone(),
+                                    &name,
+                                );
                             }
                         }
                     }
@@ -211,7 +213,12 @@ pub fn start_media_task(
                     // Property changes are per-player; refresh only the updated entry.
                     refresh_player_cache(&players, &browser_tokens, &mut cache, &name).await;
                     send_snapshot(&sender, &cache).await;
-                    schedule_metadata_fallback(&cache, signal_tx.clone(), &name);
+                    schedule_metadata_fallback(
+                        &mut delayed_refreshes,
+                        &cache,
+                        signal_tx.clone(),
+                        &name,
+                    );
                 }
                 signal = owner_stream.next() => {
                     let Some(signal) = signal else {
@@ -231,6 +238,7 @@ pub fn start_media_task(
                             &signal_tx,
                             &mut players,
                             &mut cache,
+                            &mut delayed_refreshes,
                             &sender,
                         )
                         .await
@@ -258,6 +266,7 @@ async fn apply_owner_change(
     signal_tx: &mpsc::Sender<MediaSignal>,
     players: &mut HashMap<String, PlayerState>,
     cache: &mut HashMap<String, MediaInfo>,
+    delayed_refreshes: &mut DelayedRefreshTasks,
     sender: &async_channel::Sender<UiEvent>,
 ) -> zbus::Result<()> {
     if !name.starts_with(MPRIS_PREFIX) {
@@ -268,6 +277,8 @@ async fn apply_owner_change(
         if let Some(state) = players.remove(name) {
             // Stop the background properties listener when removing the player.
             let _ = state.listener_cancel.send(true);
+            // Remove delayed retries tied to this player now that it is no longer tracked.
+            cancel_delayed_refresh(delayed_refreshes, name);
             cache.remove(name);
             send_snapshot(sender, cache).await;
         }
@@ -279,6 +290,8 @@ async fn apply_owner_change(
         if let Some(state) = players.remove(name) {
             // Stop the background properties listener when the player exits.
             let _ = state.listener_cancel.send(true);
+            // Remove delayed retries tied to this player now that it has exited.
+            cancel_delayed_refresh(delayed_refreshes, name);
             cache.remove(name);
             send_snapshot(sender, cache).await;
         }
@@ -300,8 +313,24 @@ async fn apply_owner_change(
         // Use the same browser token set for late-joining players.
         refresh_player_cache(players, &config.browser_tokens, cache, name).await;
         send_snapshot(sender, cache).await;
-        schedule_metadata_fallback(cache, signal_tx.clone(), name);
+        schedule_metadata_fallback(delayed_refreshes, cache, signal_tx.clone(), name);
     }
 
     Ok(())
+}
+
+fn prune_player_refreshes(
+    delayed_refreshes: &mut DelayedRefreshTasks,
+    players: &HashMap<String, PlayerState>,
+) {
+    // First trim finished tasks so lookups stay cheap over long sessions.
+    prune_delayed_refreshes(delayed_refreshes);
+    // Abort retries for players that disappeared from the active player table.
+    delayed_refreshes.retain(|name, task| {
+        if players.contains_key(name) {
+            return true;
+        }
+        task.abort();
+        false
+    });
 }

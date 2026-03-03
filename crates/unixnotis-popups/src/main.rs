@@ -1,6 +1,6 @@
 //! Popup application entrypoint and GTK initialization.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::env;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -178,8 +178,16 @@ fn main() -> Result<()> {
         .context("ensure theme files")?;
 
     let app = gtk::Application::new(Some("com.unixnotis.Popups"), Default::default());
+    // Activation can be emitted more than once, so startup wiring must be one-time.
+    // This guard avoids duplicate runtimes, watchers, and signal loops in one process.
+    let activation_started = Rc::new(Cell::new(false));
 
     app.connect_activate(move |app| {
+        // Ignore repeated activations after successful startup wiring.
+        if activation_started.replace(true) {
+            info!("popup activation ignored because runtime is already initialized");
+            return;
+        }
         // Bound the UI event queue to avoid unbounded memory growth under stalls.
         let (event_tx, event_rx) = async_channel::bounded(UI_EVENT_QUEUE_CAPACITY);
         let command_tx = dbus::start_dbus_runtime(event_tx.clone());

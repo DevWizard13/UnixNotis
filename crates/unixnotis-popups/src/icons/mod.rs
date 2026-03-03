@@ -349,7 +349,7 @@ const MAX_ICON_BYTES: u64 = 16 * 1024 * 1024;
 // Cap decoded dimensions to bound memory use (512px RGBA = ~1MB per icon).
 const MAX_ICON_DIMENSION: u32 = 512;
 
-pub(super) fn decode_icon_file(path: &Path) -> Result<RasterIcon, String> {
+pub(super) fn decode_icon_file(path: &Path, target_size: i32) -> Result<RasterIcon, String> {
     // Decode on a worker thread; keep I/O and CPU-bound work off the GTK main loop.
     let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
     if !metadata.is_file() {
@@ -369,6 +369,9 @@ pub(super) fn decode_icon_file(path: &Path) -> Result<RasterIcon, String> {
             FilterType::CatmullRom,
         );
     }
+    let target = target_size.max(1) as u32;
+    // Normalize to the popup icon target so file-backed icons match themed icon sizing.
+    image = image.resize(target, target, FilterType::Lanczos3);
 
     let rgba = image.to_rgba8();
     let width = rgba.width();

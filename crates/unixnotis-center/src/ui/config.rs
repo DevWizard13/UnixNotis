@@ -88,18 +88,20 @@ impl UiState {
         }
 
         self.panel.media_container.set_visible(true);
+        // Use the live panel width so media layout stays aligned after adaptive sizing.
+        let panel_width = self.panel.root.width_request().max(1);
         match (self.media.as_mut(), self.media_handle.as_ref()) {
             (Some(media), _) => {
                 // Reuse existing widget to avoid extra allocations during reloads.
                 debug!("media layout updated");
-                media.apply_layout(config.panel.width, config.media.title_char_limit);
+                media.apply_layout(panel_width, config.media.title_char_limit);
             }
             (None, Some(handle)) => {
                 debug!("media widget created");
                 let media = media_widget::MediaWidget::new(
                     &self.panel.media_container,
                     handle.clone(),
-                    config.panel.width,
+                    panel_width,
                     config.media.title_char_limit,
                 );
                 self.media = Some(media);

@@ -81,8 +81,17 @@ impl ExpirationScheduler {
                                 if scheduled.get(&item.id) == Some(&item.deadline) {
                                     scheduled.remove(&item.id);
                                 }
-                                let _ =
-                                    state.close_notification(item.id, CloseReason::Expired).await;
+                                // Expiration closes must be observable so signal/state failures
+                                // are visible in logs instead of being silently ignored.
+                                if let Err(err) =
+                                    state.close_notification(item.id, CloseReason::Expired).await
+                                {
+                                    warn!(
+                                        ?err,
+                                        id = item.id,
+                                        "failed to close expired notification"
+                                    );
+                                }
                             } else if scheduled.get(&item.id) == Some(&item.deadline) {
                                 // The store no longer expects this deadline (dismissed or updated),
                                 // so drop the stale schedule to avoid repeated checks.
