@@ -52,3 +52,7 @@ cargo run --release -p unixnotis-installer
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
+
+## License
+
+MIT. See `LICENSE`.
