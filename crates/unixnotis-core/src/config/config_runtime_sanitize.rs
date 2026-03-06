@@ -305,5 +305,5 @@ fn command_requires_shell(cmd: &str) -> bool {
 }
 
 #[cfg(test)]
-#[path = "config_runtime_sanitize/tests.rs"]
+#[path = "config_runtime_sanitize_tests.rs"]
 mod tests;

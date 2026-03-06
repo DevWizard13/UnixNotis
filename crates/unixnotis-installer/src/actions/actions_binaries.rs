@@ -43,8 +43,10 @@ pub(super) fn resolve_install_binaries(paths: &InstallPaths) -> Result<Vec<Strin
         }
     }
 
-    // Last-resort fallback retains legacy behavior when discovery yields nothing.
-    Ok(legacy_binaries())
+    // Install should stop here instead of guessing a binary list
+    Err(anyhow!(
+        "no installable binaries discovered from installer metadata or cargo metadata"
+    ))
 }
 
 pub(super) fn resolve_target_directory(paths: &InstallPaths) -> Result<PathBuf> {
@@ -243,6 +245,16 @@ members = ["crates/unixnotis-daemon"]
 "#;
         let binaries = parse_install_binaries_metadata(input).expect("valid metadata");
         assert!(binaries.is_empty());
+    }
+
+    #[test]
+    fn parse_install_binaries_metadata_handles_empty_entries() {
+        let input = r#"
+[workspace.metadata.unixnotis.installer]
+binaries = ["unixnotis-daemon", "  ", ""]
+"#;
+        let binaries = parse_install_binaries_metadata(input).expect("valid metadata");
+        assert_eq!(binaries, vec!["unixnotis-daemon".to_string()]);
     }
 
     #[test]

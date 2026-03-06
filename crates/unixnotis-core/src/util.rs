@@ -290,5 +290,5 @@ fn is_bidi_control(ch: char) -> bool {
 }
 
 #[cfg(test)]
-#[path = "util/tests.rs"]
+#[path = "util_tests.rs"]
 mod tests;

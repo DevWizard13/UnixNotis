@@ -297,5 +297,5 @@ fn display_width(ch: char) -> usize {
 }
 
 #[cfg(test)]
-#[path = "payload/tests.rs"]
+#[path = "payload_tests.rs"]
 mod tests;

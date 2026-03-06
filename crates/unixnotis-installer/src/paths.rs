@@ -108,5 +108,5 @@ fn is_unixnotis_repo(cargo_toml: &Path) -> bool {
 }
 
 #[cfg(test)]
-#[path = "paths/tests.rs"]
+#[path = "paths_tests.rs"]
 mod tests;

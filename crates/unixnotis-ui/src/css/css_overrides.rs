@@ -65,5 +65,5 @@ pub(crate) fn build_popup_overrides(theme: &ThemeConfig) -> String {
 }
 
 #[cfg(test)]
-#[path = "css_overrides/tests.rs"]
+#[path = "css_overrides_tests.rs"]
 mod tests;

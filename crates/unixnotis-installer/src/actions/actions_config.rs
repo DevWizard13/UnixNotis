@@ -251,5 +251,5 @@ fn format_with_state_env(path: &Path) -> String {
 }
 
 #[cfg(test)]
-#[path = "actions_config/tests.rs"]
+#[path = "actions_config_tests.rs"]
 mod tests;

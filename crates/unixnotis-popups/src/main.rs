@@ -166,10 +166,7 @@ fn main() -> Result<()> {
         return Err(anyhow!("Wayland session not detected; UI requires Wayland"));
     }
 
-    let theme_base = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Config::default_config_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let theme_base = Config::config_dir_for_path(&config_path).context("resolve config dir")?;
     let theme_paths = config
         .resolve_theme_paths_from(&theme_base)
         .context("resolve theme paths")?;

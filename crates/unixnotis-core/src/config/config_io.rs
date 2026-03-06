@@ -79,6 +79,17 @@ impl Config {
         self.resolve_theme_paths_from(&base)
     }
 
+    /// Resolve the config directory that should anchor relative theme paths
+    pub fn config_dir_for_path(path: &Path) -> Result<PathBuf, ConfigError> {
+        if let Some(parent) = path.parent() {
+            // Plain file names report an empty parent, so skip that case
+            if !parent.as_os_str().is_empty() {
+                return Ok(parent.to_path_buf());
+            }
+        }
+        env::current_dir().map_err(|err| ConfigError::ReadFailed(err.to_string()))
+    }
+
     /// Resolve configured CSS paths relative to an explicit config directory.
     pub fn resolve_theme_paths_from(&self, base: &Path) -> Result<ThemePaths, ConfigError> {
         // Resolve relative paths against the supplied config directory.
@@ -199,5 +210,5 @@ fn ensure_parent_dir(path: &Path) -> Result<(), ConfigError> {
 }
 
 #[cfg(test)]
-#[path = "config_io/tests.rs"]
+#[path = "config_io_tests.rs"]
 mod tests;

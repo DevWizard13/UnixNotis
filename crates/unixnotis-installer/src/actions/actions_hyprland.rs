@@ -319,5 +319,5 @@ fn strip_hyprland_bootstrap_block(
 }
 
 #[cfg(test)]
-#[path = "actions_hyprland/tests.rs"]
+#[path = "actions_hyprland_tests.rs"]
 mod tests;

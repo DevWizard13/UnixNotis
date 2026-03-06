@@ -86,3 +86,16 @@ fn default_config_dir_accepts_absolute_xdg() {
     restore_env("XDG_CONFIG_HOME", prev_xdg);
     restore_env("HOME", prev_home);
 }
+
+#[test]
+fn config_dir_for_path_uses_current_dir_for_bare_file_name() {
+    let dir = Config::config_dir_for_path(std::path::Path::new("config.toml")).expect("config dir");
+    assert_eq!(dir, env::current_dir().expect("current dir"));
+}
+
+#[test]
+fn config_dir_for_path_uses_parent_for_nested_path() {
+    let dir = Config::config_dir_for_path(std::path::Path::new("nested/config.toml"))
+        .expect("config dir");
+    assert_eq!(dir, PathBuf::from("nested"));
+}

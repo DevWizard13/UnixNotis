@@ -43,5 +43,5 @@ pub fn format_daemon_status(daemon: &DetectedDaemon) -> String {
 }
 
 #[cfg(test)]
-#[path = "actions_format/tests.rs"]
+#[path = "actions_format_tests.rs"]
 mod tests;

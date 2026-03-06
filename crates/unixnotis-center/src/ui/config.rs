@@ -22,13 +22,13 @@ impl UiState {
                 return;
             }
         };
-        let theme_base = self
-            .config_path
-            .parent()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                Config::default_config_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
+        let theme_base = match Config::config_dir_for_path(&self.config_path) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(?err, "failed to resolve config dir");
+                return;
+            }
+        };
         let theme_paths = match config.resolve_theme_paths_from(&theme_base) {
             Ok(paths) => paths,
             Err(err) => {
