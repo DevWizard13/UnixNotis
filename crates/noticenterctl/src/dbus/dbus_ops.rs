@@ -5,7 +5,7 @@ use unixnotis_core::{util, ControlProxy};
 
 use crate::cli_args::{Command, DndState};
 use crate::main_log_follow::follow_debug_logs;
-use crate::main_output::print_notifications;
+use crate::main_output::{print_inhibitors, print_notifications};
 
 pub(crate) async fn handle_command(proxy: &ControlProxy<'_>, command: Command) -> Result<()> {
     match command {
@@ -27,7 +27,7 @@ pub(crate) async fn handle_command(proxy: &ControlProxy<'_>, command: Command) -
             proxy.close_panel().await?;
         }
         Command::Clear => {
-            // Clear removes active notifications but preserves history.
+            // Clear removes both active notifications and history entries.
             proxy.clear_all().await?;
         }
         Command::Dismiss { id } => {
@@ -78,10 +78,8 @@ pub(crate) async fn handle_command(proxy: &ControlProxy<'_>, command: Command) -
         }
         Command::ListInhibitors => {
             let inhibitors = proxy.list_inhibitors().await?;
-            println!("inhibitors: {}", inhibitors.len());
-            for (id, reason, scope, owner) in inhibitors {
-                println!("- #{id} scope={scope} owner={owner} reason={reason}");
-            }
+            // Shared formatter keeps operational output terminal-safe.
+            print_inhibitors(&inhibitors);
         }
         Command::CssCheck => {
             // CSS validation is handled before D-Bus connection setup.

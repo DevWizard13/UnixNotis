@@ -69,7 +69,8 @@ impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
             max_entries: 200,
-            max_active: 500,
+            // Keep the default aligned with the daemon-side active safety ceiling
+            max_active: 12,
             transient_to_history: false,
         }
     }

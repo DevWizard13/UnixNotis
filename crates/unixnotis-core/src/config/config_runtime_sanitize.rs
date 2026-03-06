@@ -14,7 +14,8 @@ const MAX_SPACING: i32 = 256;
 const MAX_MARGIN: i32 = 512;
 const MAX_CARD_HEIGHT: i32 = 2048;
 const MAX_HISTORY_ENTRIES: usize = 5_000;
-const MAX_HISTORY_ACTIVE: usize = 1_000;
+// Match the daemon-side active cap so config, docs, and runtime all agree
+const MAX_HISTORY_ACTIVE: usize = 12;
 // Theme guard rails keep layout values within reasonable bounds.
 const MAX_BORDER_WIDTH: u8 = 16;
 const MAX_CARD_RADIUS: u8 = 64;
@@ -79,7 +80,7 @@ pub(super) fn sanitize_config(config: &mut Config) {
     config.media.denylist = normalize_media_tokens(&config.media.denylist);
     config.media.browser_tokens = normalize_media_tokens(&config.media.browser_tokens);
 
-    // Bound history settings so misconfigurations cannot create unbounded retention pressure.
+    // Bound history settings so docs and runtime limits stay aligned under all load cases.
     config.history.max_active = config.history.max_active.min(MAX_HISTORY_ACTIVE);
     config.history.max_entries = config.history.max_entries.min(MAX_HISTORY_ENTRIES);
 
