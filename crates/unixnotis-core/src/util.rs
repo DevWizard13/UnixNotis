@@ -234,6 +234,42 @@ pub fn log_snippet(value: &str) -> String {
     sanitize_log_value(value, log_limit())
 }
 
+/// Sanitizes text that will be shown to the user inside the UI.
+pub fn sanitize_display_text(value: &str) -> String {
+    // Keep line breaks here
+    sanitize_display_text_with(value, true)
+}
+
+/// Sanitizes text that must remain single-line and safe for display.
+pub fn sanitize_inline_display_text(value: &str) -> String {
+    // Keep inline text on one line
+    sanitize_display_text_with(value, false)
+}
+
+fn sanitize_display_text_with(value: &str, keep_newlines: bool) -> String {
+    // Start with the same size
+    let mut cleaned = String::with_capacity(value.len());
+    for ch in value.chars() {
+        // Directionality controls can visually spoof filenames and message text
+        if is_bidi_control(ch) {
+            continue;
+        }
+
+        let mapped = match ch {
+            // Keep newlines only when asked
+            '\n' if keep_newlines => '\n',
+            // Flatten spacing controls
+            '\t' => ' ',
+            '\r' => ' ',
+            // Drop other control behavior
+            _ if ch.is_control() => ' ',
+            _ => ch,
+        };
+        cleaned.push(mapped);
+    }
+    cleaned
+}
+
 fn is_bidi_control(ch: char) -> bool {
     // Covers directional embeddings/overrides/isolates and directional marks.
     matches!(
@@ -272,6 +308,22 @@ mod tests {
         let value = "safe\u{202E}spoof\u{2066}text\u{2069}";
         let sanitized = sanitize_log_value(value, 80);
         assert_eq!(sanitized, "safespooftext");
+    }
+
+    #[test]
+    fn sanitize_display_text_strips_bidi_controls_and_preserves_newlines() {
+        // Newlines stay, bidi marks do not
+        let value = "safe\u{202E}name\nnext\u{2066}line\u{2069}";
+        let sanitized = sanitize_display_text(value);
+        assert_eq!(sanitized, "safename\nnextline");
+    }
+
+    #[test]
+    fn sanitize_inline_display_text_flattens_control_characters() {
+        // Inline text stays on one row
+        let value = "fake\tname\nrow\u{202E}";
+        let sanitized = sanitize_inline_display_text(value);
+        assert_eq!(sanitized, "fake name row");
     }
 
     #[test]

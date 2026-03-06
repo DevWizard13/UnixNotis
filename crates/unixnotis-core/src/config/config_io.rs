@@ -47,6 +47,7 @@ impl Config {
         let contents =
             fs::read_to_string(path).map_err(|err| ConfigError::ReadFailed(err.to_string()))?;
         let mut ignored_keys = Vec::new();
+        // Build the TOML deserializer from the file text
         let deserializer = toml::de::Deserializer::new(&contents);
         let mut config: Config = serde_ignored::deserialize(deserializer, |path| {
             ignored_keys.push(path.to_string());

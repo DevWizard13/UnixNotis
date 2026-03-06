@@ -8,6 +8,7 @@ use crate::main_log_follow::follow_debug_logs;
 use crate::main_output::{print_inhibitors, print_notifications};
 
 pub(crate) async fn handle_command(proxy: &ControlProxy<'_>, command: Command) -> Result<()> {
+    // CLI forwards work to the daemon
     match command {
         Command::TogglePanel => {
             // Simple toggle keeps the daemon in control of its own visibility rules.
@@ -35,16 +36,18 @@ pub(crate) async fn handle_command(proxy: &ControlProxy<'_>, command: Command) -
             proxy.dismiss(id).await?;
         }
         Command::ListActive { full } => {
-            // Full output is only allowed in diagnostic mode to avoid leaking content.
+            // Full output needs the debug gate
             let allow_full = full && util::diagnostic_mode();
             if full && !util::diagnostic_mode() {
+                // Fall back to the safe view
                 eprintln!("--full requires UNIXNOTIS_DIAGNOSTIC=1; using redacted output");
             }
             let notifications = proxy.list_active().await?;
+            // Shared output helper
             print_notifications("active", &notifications, allow_full);
         }
         Command::ListHistory { full } => {
-            // History output follows the same diagnostic gating as active list.
+            // Same gate for history
             let allow_full = full && util::diagnostic_mode();
             if full && !util::diagnostic_mode() {
                 eprintln!("--full requires UNIXNOTIS_DIAGNOSTIC=1; using redacted output");
@@ -68,7 +71,7 @@ pub(crate) async fn handle_command(proxy: &ControlProxy<'_>, command: Command) -
             }
         },
         Command::Inhibit { reason, scope } => {
-            // Print the token so callers can release the inhibitor later.
+            // Print the token only
             let token = proxy.inhibit(&reason, scope.as_scope()).await?;
             println!("{token}");
         }
@@ -78,7 +81,7 @@ pub(crate) async fn handle_command(proxy: &ControlProxy<'_>, command: Command) -
         }
         Command::ListInhibitors => {
             let inhibitors = proxy.list_inhibitors().await?;
-            // Shared formatter keeps operational output terminal-safe.
+            // Shared output helper
             print_inhibitors(&inhibitors);
         }
         Command::CssCheck => {

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthChar;
-use unixnotis_core::{Action, Config, Notification, NotificationImage, Urgency};
+use unixnotis_core::{util, Action, Config, Notification, NotificationImage, Urgency};
 use zbus::zvariant::{OwnedValue, Value};
 
 use super::limits::{
@@ -42,12 +42,18 @@ pub(super) fn build_notification(input: NotificationInput) -> Notification {
         expire_timeout,
     } = input;
 
-    // Derive commonly used metadata before consuming `hints`
+    // Read shared hint data first
     let urgency = Urgency::from_hint(hints.get("urgency"));
     let category = hints
         .get("category")
         .and_then(owned_to_string)
-        .map(|value| truncate_utf8_bytes(&value, MAX_CATEGORY_BYTES));
+        .map(|value| {
+            // Category stays on one line
+            truncate_utf8_bytes(
+                &util::sanitize_inline_display_text(&value),
+                MAX_CATEGORY_BYTES,
+            )
+        });
     let is_transient = hints
         .get("transient")
         .and_then(|value| bool::try_from(value).ok())
@@ -57,6 +63,10 @@ pub(super) fn build_notification(input: NotificationInput) -> Notification {
         .and_then(|value| bool::try_from(value).ok())
         .unwrap_or(false);
     let image = NotificationImage::from_hints(&app_name, &app_icon, &hints);
+    // Clean text before storing it
+    let app_name = util::sanitize_inline_display_text(&app_name);
+    let summary = util::sanitize_display_text(&summary);
+    let body = util::sanitize_display_text(&body);
 
     Notification {
         id: 0,
@@ -80,6 +90,7 @@ pub(super) fn build_notification(input: NotificationInput) -> Notification {
             MAX_CONTIGUOUS_TOKEN_CHARS,
         ),
         actions: parse_actions(actions),
+        // Keep only needed hints
         hints: sanitize_hints_for_storage(hints),
         urgency,
         category,
@@ -121,6 +132,7 @@ pub(super) fn resolve_expiration(config: &Config, notification: &Notification) -
 }
 
 fn parse_actions(raw: Vec<String>) -> Vec<Action> {
+    // Actions come in key and label pairs
     let mut actions = Vec::with_capacity(raw.len().min(MAX_ACTIONS));
     let mut iter = raw.into_iter();
 
@@ -132,8 +144,13 @@ fn parse_actions(raw: Vec<String>) -> Vec<Action> {
                 break;
             }
             actions.push(Action {
+                // Key is protocol data
                 key: truncate_utf8_bytes(&key, MAX_ACTION_KEY_BYTES),
-                label: truncate_utf8_bytes(&label, MAX_ACTION_LABEL_BYTES),
+                // Label is shown to the user
+                label: truncate_utf8_bytes(
+                    &util::sanitize_inline_display_text(&label),
+                    MAX_ACTION_LABEL_BYTES,
+                ),
             });
         }
     }
@@ -157,6 +174,7 @@ fn sanitize_hints_for_storage(hints: HashMap<String, OwnedValue>) -> HashMap<Str
         let value = match key.as_str() {
             // Keep only hints that matter for daemon behavior and rendering
             "sound-name" | "sound-file" | "category" => owned_to_string(&value).and_then(|text| {
+                // Keep hint text small
                 let bounded = truncate_utf8_bytes(&text, MAX_HINT_STRING_BYTES);
                 string_to_owned_value(&bounded)
             }),
@@ -237,6 +255,7 @@ fn normalize_text_for_layout(value: &str, max_contiguous: usize) -> String {
 
         let width = display_width(ch);
         if run_width.saturating_add(width) <= max_contiguous {
+            // Short runs stay as they are
             out.push(ch);
             run_width = run_width.saturating_add(width);
             continue;
@@ -247,6 +266,7 @@ fn normalize_text_for_layout(value: &str, max_contiguous: usize) -> String {
             let ellipsis_width = display_width('…');
             // Keep final run width bounded by trimming the current run tail first.
             while run_width.saturating_add(ellipsis_width) > max_contiguous {
+                // Pop one char at a time
                 let Some(last) = out.pop() else {
                     break;
                 };
@@ -317,6 +337,29 @@ mod tests {
 
         assert!(notification.summary.len() <= MAX_SUMMARY_BYTES);
         assert!(notification.body.len() <= MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn build_notification_strips_display_spoofing_controls() {
+        let notification = build_notification(NotificationInput {
+            app_name: "mail\u{202E}exe\nfake".to_string(),
+            app_icon: "icon".to_string(),
+            summary: "safe\u{202E}spoof".to_string(),
+            body: "line1\nline2\u{2066}tail".to_string(),
+            actions: vec!["default".to_string(), "Open\u{202E}".to_string()],
+            hints: HashMap::<String, OwnedValue>::new(),
+            sender: SenderMetadata {
+                sender_name: Some(":1.test".to_string()),
+                sender_pid: Some(42),
+                sender_executable: Some("/usr/bin/test-app".to_string()),
+            },
+            expire_timeout: 0,
+        });
+
+        assert_eq!(notification.app_name, "mailexe fake");
+        assert_eq!(notification.summary, "safespoof");
+        assert_eq!(notification.body, "line1\nline2tail");
+        assert_eq!(notification.actions[0].label, "Open");
     }
 
     #[test]

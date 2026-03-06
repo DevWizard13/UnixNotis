@@ -2,9 +2,14 @@
 //!
 //! This file isolates caller validation so the interface file can focus on D-Bus methods
 
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
+use sha2::{Digest, Sha256};
 use tracing::warn;
 use zbus::fdo::DBusProxy;
 use zbus::message::Header;
@@ -19,12 +24,28 @@ const TRUSTED_CONTROL_EXECUTABLES: [&str; 4] = [
     "unixnotis-daemon",
 ];
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct TrustedExecutableSnapshot {
+    // Canonical path ties the trust decision to one concrete on-disk binary
+    canonical_path: PathBuf,
+    // Fingerprint blocks same-path replacement after the daemon has started
+    fingerprint: FileFingerprint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    // File length catches most replacement attempts before hashing even matters
+    len: u64,
+    // Content hash blocks exact-name swaps inside a writable sibling directory
+    sha256: [u8; 32],
+}
+
 pub(super) async fn authorize_control_call(
     state: &Arc<DaemonState>,
     header: &Header<'_>,
     method: &'static str,
 ) -> zbus::fdo::Result<()> {
-    // Reject calls that do not include a sender identity
+    // One guard for all control calls
     let sender = header
         .sender()
         .ok_or_else(|| zbus::fdo::Error::AccessDenied("missing sender".to_string()))?;
@@ -54,7 +75,8 @@ pub(super) async fn authorize_control_call(
         ));
     }
 
-    // The executable path check prevents unrelated same-user programs from control calls
+    // Same user is not enough
+    // The caller path must match a trusted sibling binary
     let pid = proxy.get_connection_unix_process_id(bus_name).await?;
     let exe_path = read_process_executable_path(pid).await;
     if !exe_path
@@ -93,6 +115,19 @@ async fn read_process_executable_path(_pid: u32) -> Option<PathBuf> {
 }
 
 pub(super) fn is_trusted_control_executable_path(path: &Path) -> bool {
+    // Trust only sibling binaries
+    let Some(trusted_dir) = trusted_control_directory() else {
+        return false;
+    };
+    let snapshots = trusted_control_snapshots(&trusted_dir);
+    is_trusted_control_executable_path_in_dir(path, &trusted_dir, snapshots)
+}
+
+pub(super) fn is_trusted_control_executable_path_in_dir(
+    path: &Path,
+    _trusted_dir: &Path,
+    snapshots: &HashMap<String, TrustedExecutableSnapshot>,
+) -> bool {
     // Canonicalize observed path first so comparisons use a stable filesystem identity
     let observed = canonicalize_best_effort(path);
     // Require an exact trusted binary name, not a suffix-alike alias
@@ -102,46 +137,88 @@ pub(super) fn is_trusted_control_executable_path(path: &Path) -> bool {
     if !TRUSTED_CONTROL_EXECUTABLES.contains(&observed_name) {
         return false;
     }
-    // Candidate set includes only discovered binaries with exact trusted names
-    trusted_control_executable_paths().contains(&observed)
+
+    // Snapshot wins over later file swaps
+    let Some(snapshot) = snapshots.get(observed_name) else {
+        return false;
+    };
+
+    // Exact path match keeps trust scoped to the daemon's own sibling binary set.
+    if snapshot.canonical_path != observed {
+        return false;
+    }
+
+    // Recompute the live fingerprint so on-disk swaps after daemon startup are detected.
+    file_fingerprint(&observed).is_some_and(|fingerprint| fingerprint == snapshot.fingerprint)
 }
 
-fn trusted_control_executable_paths() -> std::collections::HashSet<PathBuf> {
-    use std::collections::HashSet;
+fn trusted_control_directory() -> Option<PathBuf> {
+    // Use the daemon install dir
+    let current_exe = std::env::current_exe().ok()?;
+    let current_exe = canonicalize_best_effort(&current_exe);
+    current_exe.parent().map(|parent| parent.to_path_buf())
+}
 
-    // Build a deduplicated set so lookups stay O(1)
-    let mut candidates = HashSet::new();
-    let mut directories = Vec::new();
+fn trusted_control_snapshots(
+    trusted_dir: &Path,
+) -> &'static HashMap<String, TrustedExecutableSnapshot> {
+    static SNAPSHOTS: OnceLock<HashMap<String, TrustedExecutableSnapshot>> = OnceLock::new();
+    // Build the snapshot once
+    SNAPSHOTS.get_or_init(|| build_trusted_control_snapshots(trusted_dir))
+}
 
-    // Include the current binary directory for local builds and dev runs
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            directories.push(parent.to_path_buf());
+pub(super) fn build_trusted_control_snapshots(
+    trusted_dir: &Path,
+) -> HashMap<String, TrustedExecutableSnapshot> {
+    // Read trusted files once
+    let mut snapshots = HashMap::new();
+    for executable in TRUSTED_CONTROL_EXECUTABLES {
+        // Missing file means not trusted
+        let candidate = trusted_dir.join(executable);
+        if !candidate.is_file() {
+            continue;
         }
+
+        let canonical = canonicalize_best_effort(&candidate);
+        let Some(fingerprint) = file_fingerprint(&canonical) else {
+            continue;
+        };
+        snapshots.insert(
+            executable.to_string(),
+            TrustedExecutableSnapshot {
+                canonical_path: canonical,
+                fingerprint,
+            },
+        );
     }
-    // Include standard install locations used by packaged builds
-    directories.push(PathBuf::from("/usr/local/bin"));
-    directories.push(PathBuf::from("/usr/bin"));
-    directories.push(PathBuf::from("/bin"));
-    // Include common per-user install location used by UnixNotis installer
-    if let Some(home) = std::env::var_os("HOME") {
-        directories.push(PathBuf::from(home).join(".local/bin"));
+    snapshots
+}
+
+fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
     }
 
-    for directory in directories {
-        for executable in TRUSTED_CONTROL_EXECUTABLES {
-            // Exact name match only; suffix aliases like *.exe are not accepted on Linux
-            let candidate = directory.join(executable);
-            // Keep only files that exist at discovery time
-            if candidate.exists() {
-                candidates.insert(canonicalize_best_effort(&candidate));
-            }
+    // Hash the whole file
+    let mut file = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            break;
         }
+        hasher.update(&buf[..read]);
     }
-    candidates
+
+    Some(FileFingerprint {
+        len: metadata.len(),
+        sha256: hasher.finalize().into(),
+    })
 }
 
 fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    // If canonicalization fails, compare the original path as a fallback
+    // Fall back to the raw path
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

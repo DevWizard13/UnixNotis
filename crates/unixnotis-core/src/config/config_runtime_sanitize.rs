@@ -25,6 +25,7 @@ const MIN_PLUGIN_OUTPUT_BYTES: usize = 128;
 const MAX_PLUGIN_OUTPUT_BYTES: usize = 128 * 1024;
 
 pub(super) fn sanitize_config(config: &mut Config) {
+    // Clean config before use
     // Clamp refresh intervals to avoid busy loops or runaway timers.
     // A value of 0 disables polling and must be preserved for UI correctness.
     let fast = clamp_refresh_interval(
@@ -80,16 +81,20 @@ pub(super) fn sanitize_config(config: &mut Config) {
     config.media.denylist = normalize_media_tokens(&config.media.denylist);
     config.media.browser_tokens = normalize_media_tokens(&config.media.browser_tokens);
 
-    // Bound history settings so docs and runtime limits stay aligned under all load cases.
+    // Match the daemon cap
     config.history.max_active = config.history.max_active.min(MAX_HISTORY_ACTIVE);
+    // Keep history bounded too
     config.history.max_entries = config.history.max_entries.min(MAX_HISTORY_ENTRIES);
 
     // Clamp min-height values directly; clamp covers negative inputs.
     for stat in &mut config.widgets.stats {
+        // Keep widget size in range
         stat.min_height = stat.min_height.clamp(0, MAX_CARD_HEIGHT);
+        // Check plugin config here
         sanitize_widget_plugin(&mut stat.plugin, "stat", &stat.label);
     }
     for card in &mut config.widgets.cards {
+        // Same size rules for cards
         card.min_height = card.min_height.clamp(0, MAX_CARD_HEIGHT);
         sanitize_widget_plugin(&mut card.plugin, "card", &card.title);
     }
@@ -140,6 +145,7 @@ fn normalize_media_tokens(tokens: &[String]) -> Vec<String> {
 }
 
 fn clamp_alpha(value: &mut f32, fallback: f32) {
+    // Bad alpha falls back
     if !value.is_finite() {
         *value = fallback;
         return;
@@ -148,10 +154,12 @@ fn clamp_alpha(value: &mut f32, fallback: f32) {
 }
 
 fn clamp_alpha_finite(value: &mut f32) {
+    // Clamp to the valid range
     *value = value.clamp(0.0, 1.0);
 }
 
 fn clamp_refresh_interval(value: u64, min: u64, max: u64) -> u64 {
+    // Zero means off
     if value == 0 {
         return 0;
     }
@@ -166,6 +174,7 @@ fn sanitize_widget_plugin(
     let Some(plugin_cfg) = plugin.as_mut() else {
         return;
     };
+    // Unknown plugin version means off
     if plugin_cfg.api_version != WidgetPluginConfig::API_VERSION_V1 {
         // Unknown contract versions are disabled rather than best-effort parsed.
         warn!(
@@ -179,6 +188,7 @@ fn sanitize_widget_plugin(
     }
 
     let command = plugin_cfg.command.trim();
+    // Empty command means off
     if command.is_empty() {
         warn!(
             widget_type,
@@ -188,7 +198,7 @@ fn sanitize_widget_plugin(
         return;
     }
     if !util::is_simple_command(command) {
-        // External widget plugins intentionally disallow shell meta syntax for security.
+        // Shell syntax is not allowed here
         warn!(
             widget_type,
             widget_label, "widget plugin command must be a simple command; disabling plugin"
@@ -218,6 +228,7 @@ fn sanitize_widget_plugin(
 }
 
 fn warn_missing_shell(config: &Config) {
+    // Only warn when needed
     if program_in_path("sh") {
         return;
     }
@@ -378,6 +389,7 @@ mod tests {
 
     #[test]
     fn sanitize_clamps_history_limits() {
+        // History stays within the cap
         let mut config = Config::default();
         config.history.max_active = MAX_HISTORY_ACTIVE + 1_000;
         config.history.max_entries = MAX_HISTORY_ENTRIES + 10_000;
@@ -493,6 +505,7 @@ mod tests {
 
     #[test]
     fn sanitize_widget_plugin_clamps_bounds_and_trim_command() {
+        // Trim and clamp the plugin config
         let mut config = Config::default();
         config.widgets.stats[0].plugin = Some(WidgetPluginConfig {
             command: "  script arg  ".to_string(),
@@ -513,6 +526,7 @@ mod tests {
 
     #[test]
     fn sanitize_widget_plugin_rejects_shell_meta_commands() {
+        // Shell syntax is rejected
         let mut config = Config::default();
         config.widgets.cards[0].plugin = Some(WidgetPluginConfig {
             command: "sh -c 'echo pwned | cat'".to_string(),

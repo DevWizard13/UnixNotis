@@ -14,6 +14,7 @@ use super::config_widgets::WidgetsConfig;
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    // Main config sections
     pub general: GeneralConfig,
     pub inhibit: InhibitConfig,
     pub popups: PopupConfig,
@@ -60,8 +61,11 @@ pub enum InhibitMode {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct HistoryConfig {
+    // Saved items
     pub max_entries: usize,
+    // Live items
     pub max_active: usize,
+    // Save transient items too
     pub transient_to_history: bool,
 }
 
@@ -69,7 +73,7 @@ impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
             max_entries: 200,
-            // Keep the default aligned with the daemon-side active safety ceiling
+            // Match the daemon cap
             max_active: 12,
             transient_to_history: false,
         }

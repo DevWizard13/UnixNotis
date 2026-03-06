@@ -16,18 +16,22 @@ use zbus::{interface, SignalContext};
 use super::{to_fdo_error, DaemonState, NotificationServer, NOTIFICATIONS_OBJECT_PATH};
 
 // Split auth logic out so this file stays focused on control interface behavior
+// Auth checks live there
 #[path = "daemon_control/auth.rs"]
 mod auth;
 // Split input normalization out so validation is shared and easy to test
+// Input cleanup lives there
 #[path = "daemon_control/sanitize.rs"]
 mod sanitize;
 // Split owner-watch logic out so background cleanup code is isolated
+// Owner watch lives there
 #[path = "daemon_control/watch.rs"]
 mod watch;
 
 /// D-Bus server for com.unixnotis.Control.
 pub struct ControlServer {
     // Shared daemon state used by all control methods
+    // The server stays thin
     state: Arc<DaemonState>,
 }
 
@@ -47,7 +51,7 @@ impl ControlServer {
         header: &Header<'_>,
         method: &'static str,
     ) -> zbus::fdo::Result<()> {
-        // Keep access control centralized so every privileged method uses the same rules.
+        // One auth path
         auth::authorize_control_call(&self.state, header, method).await
     }
 }
@@ -62,7 +66,7 @@ impl ControlServer {
         self.authorize_control_call(&header, "GetState").await?;
         // Single lock read keeps state snapshot internally consistent
         let store = self.state.store.lock().await;
-        // Read cached inhibitor values to keep state queries constant-time.
+        // Cheap state snapshot
         Ok(ControlState {
             dnd_enabled: store.dnd_enabled(),
             history_count: store.history_len() as u32,
@@ -78,7 +82,7 @@ impl ControlServer {
         // Guard against untrusted callers before reading any notification content
         self.authorize_control_call(&header, "ListActive").await?;
         let store = self.state.store.lock().await;
-        // Active list is used for popup seeding and panel hydration.
+        // Return active items
         Ok(store.list_active())
     }
 
@@ -89,7 +93,7 @@ impl ControlServer {
         // History can contain sensitive content, so it uses the same auth gate
         self.authorize_control_call(&header, "ListHistory").await?;
         let store = self.state.store.lock().await;
-        // History list is used for panel hydration and pagination.
+        // Return saved items
         Ok(store.list_history())
     }
 
@@ -155,7 +159,7 @@ impl ControlServer {
             // Persist outside the main store lock to avoid blocking notify paths on I/O
             if let Err(err) = store.persist(enabled) {
                 warn!(?err, "failed to persist do-not-disturb state");
-                // Revert in-memory state so success always implies durable state.
+                // Undo the in-memory change
                 let mut state = self.state.store.lock().await;
                 let _ = state.set_dnd(previous);
                 return Err(zbus::fdo::Error::Failed(
@@ -183,7 +187,7 @@ impl ControlServer {
         let sender = header
             .sender()
             .ok_or_else(|| zbus::fdo::Error::Failed("missing sender".to_string()))?;
-        // Convert incoming values into safe canonical values before storing.
+        // Clean caller input first
         let normalized_scope = sanitize::normalize_inhibit_scope(scope)?;
         let sanitized_reason = sanitize::sanitize_inhibit_reason(reason);
         // Track inhibitors by unique bus name so cleanup on disconnect is reliable.
@@ -223,7 +227,7 @@ impl ControlServer {
             .sender()
             .ok_or_else(|| zbus::fdo::Error::Failed("missing sender".to_string()))?;
         let owner = sender.to_string();
-        // Owner checks prevent one client from clearing another client's inhibitor.
+        // Only the owner can remove it
         let (removed, active, count) = {
             let mut store = self.state.store.lock().await;
             match store.remove_inhibitor(id, &owner) {
@@ -296,7 +300,7 @@ impl ControlServer {
         let ids = {
             let mut store = self.state.store.lock().await;
             let ids = store.drain_active_ids();
-            // Keep clear-all semantics simple: active + history are both reset
+            // Clear live and saved items
             store.clear_history();
             ids
         };
@@ -309,7 +313,7 @@ impl ControlServer {
         let notif_ctx = SignalContext::new(self.state.connection(), NOTIFICATIONS_OBJECT_PATH).ok();
         let control_ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH).ok();
         if notif_ctx.is_none() || control_ctx.is_none() {
-            // Local store mutation already happened, so signal errors are logged but non-fatal
+            // The clear already happened
             warn!("failed to build signal context for clear_all; continuing with local state");
         }
         // Emit close signals with a bounded concurrency limit to avoid task spikes.
@@ -405,76 +409,104 @@ pub async fn spawn_inhibitor_owner_watch(state: Arc<DaemonState>) -> zbus::Resul
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use unixnotis_core::{INHIBIT_SCOPE_ALL, INHIBIT_SCOPE_POPUPS};
 
-    use super::auth::is_trusted_control_executable_path;
+    use super::auth::{build_trusted_control_snapshots, is_trusted_control_executable_path_in_dir};
     use super::sanitize::{normalize_inhibit_scope, sanitize_inhibit_reason};
 
-    #[test]
-    fn trusted_control_executable_paths_in_known_dirs() {
-        // Use real binaries discovered on this machine instead of assuming test-binary layout
-        let mut directories = Vec::new();
-        if let Ok(current_exe) = std::env::current_exe() {
-            if let Some(parent) = current_exe.parent() {
-                directories.push(parent.to_path_buf());
-            }
-        }
-        directories.push(std::path::PathBuf::from("/usr/local/bin"));
-        directories.push(std::path::PathBuf::from("/usr/bin"));
-        directories.push(std::path::PathBuf::from("/bin"));
-        if let Some(home) = std::env::var_os("HOME") {
-            directories.push(std::path::PathBuf::from(home).join(".local/bin"));
-        }
-
-        let trusted_names = [
-            "noticenterctl",
-            "unixnotis-center",
-            "unixnotis-popups",
-            "unixnotis-daemon",
-        ];
-        // At least one trusted binary should be present on a normal dev or install layout
-        let mut found_any = false;
-        for directory in directories {
-            for executable in trusted_names {
-                let candidate = directory.join(executable);
-                if candidate.exists() {
-                    found_any = true;
-                    // Every discovered trusted-name binary path should pass path validation
-                    assert!(is_trusted_control_executable_path(&candidate));
-                }
-            }
-        }
-        assert!(
-            found_any,
-            "expected at least one trusted control binary to exist"
-        );
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        // Fresh temp dir per test
+        let pid = std::process::id();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("unixnotis-auth-{label}-{pid}-{nanos}"));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
     }
 
     #[test]
     fn rejects_unknown_or_untrusted_paths() {
-        assert!(!is_trusted_control_executable_path(Path::new(
-            "/tmp/noticenterctl"
-        )));
-        assert!(!is_trusted_control_executable_path(Path::new(
-            "/usr/bin/python3"
-        )));
+        // Random path must fail
+        let trusted_dir = temp_dir("rejects-unknown");
+        let outsider = trusted_dir.join("python3");
+        fs::write(&outsider, "#!/bin/sh\n").expect("write outsider");
+        let snapshots = build_trusted_control_snapshots(&trusted_dir);
+
+        assert!(!is_trusted_control_executable_path_in_dir(
+            Path::new("/tmp/noticenterctl"),
+            &trusted_dir,
+            &snapshots,
+        ));
+        assert!(!is_trusted_control_executable_path_in_dir(
+            &outsider,
+            &trusted_dir,
+            &snapshots,
+        ));
+
+        let _ = fs::remove_dir_all(trusted_dir);
     }
 
     #[test]
     fn rejects_trusted_name_alias_suffixes() {
-        let current_dir = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
-            .expect("current exe parent");
-        assert!(!is_trusted_control_executable_path(
-            &current_dir.join("noticenterctl.exe")
+        // Lookalike names must fail
+        let trusted_dir = temp_dir("rejects-alias");
+        let alias = trusted_dir.join("noticenterctl.exe");
+        fs::write(&alias, "#!/bin/sh\n").expect("write alias");
+        let snapshots = build_trusted_control_snapshots(&trusted_dir);
+
+        assert!(!is_trusted_control_executable_path_in_dir(
+            &alias,
+            &trusted_dir,
+            &snapshots,
         ));
+
+        let _ = fs::remove_dir_all(trusted_dir);
+    }
+
+    #[test]
+    fn accepts_trusted_sibling_binary_only() {
+        // Only the real sibling file should pass
+        let trusted_dir = temp_dir("accepts-sibling");
+        let trusted = trusted_dir.join("noticenterctl");
+        fs::write(&trusted, "#!/bin/sh\n").expect("write trusted sibling");
+        let snapshots = build_trusted_control_snapshots(&trusted_dir);
+
+        assert!(is_trusted_control_executable_path_in_dir(
+            &trusted,
+            &trusted_dir,
+            &snapshots,
+        ));
+
+        let other_dir = temp_dir("other-sibling");
+        let forged = other_dir.join("noticenterctl");
+        fs::write(&forged, "#!/bin/sh\n").expect("write forged sibling");
+        assert!(!is_trusted_control_executable_path_in_dir(
+            &forged,
+            &trusted_dir,
+            &snapshots,
+        ));
+
+        // Replacing the file must break trust
+        fs::write(&trusted, "#!/bin/sh\necho forged\n").expect("overwrite trusted sibling");
+        assert!(!is_trusted_control_executable_path_in_dir(
+            &trusted,
+            &trusted_dir,
+            &snapshots,
+        ));
+
+        let _ = fs::remove_dir_all(trusted_dir);
+        let _ = fs::remove_dir_all(other_dir);
     }
 
     #[test]
     fn sanitize_inhibit_reason_trims_and_bounds() {
+        // Empty falls back
         assert_eq!(sanitize_inhibit_reason("   "), "manual");
         let long = format!("{}🙂", "a".repeat(512));
         let bounded = sanitize_inhibit_reason(&long);
@@ -483,6 +515,7 @@ mod tests {
 
     #[test]
     fn normalize_inhibit_scope_accepts_supported_values() {
+        // Only known scopes pass
         assert_eq!(
             normalize_inhibit_scope(INHIBIT_SCOPE_ALL).expect("scope"),
             0
