@@ -4,12 +4,18 @@ use unixnotis_core::Notification;
 use super::NotificationStore;
 
 impl NotificationStore {
-    pub fn is_notification_owned_by(&self, id: u32, sender: &str, sender_pid: Option<u32>) -> bool {
+    pub fn is_notification_owned_by(
+        &self,
+        id: u32,
+        sender: &str,
+        sender_pid: Option<u32>,
+        sender_start_time: Option<u64>,
+    ) -> bool {
         // Ownership checks are valid only against active notifications
         let Some(notification) = self.active.get(&id) else {
             return false;
         };
-        notification_is_owned_by(notification, Some(sender), sender_pid)
+        notification_is_owned_by(notification, Some(sender), sender_pid, sender_start_time)
     }
 
     pub(super) fn next_id(&mut self) -> u32 {
@@ -49,12 +55,13 @@ impl NotificationStore {
         id: u32,
         sender: Option<&str>,
         sender_pid: Option<u32>,
+        sender_start_time: Option<u64>,
     ) -> bool {
         // Replacement is allowed only for the sender that owns the original notification
         let Some(existing) = self.active.get(&id).or_else(|| self.history.get(&id)) else {
             return false;
         };
-        notification_is_owned_by(existing, sender, sender_pid)
+        notification_is_owned_by(existing, sender, sender_pid, sender_start_time)
     }
 }
 
@@ -62,16 +69,23 @@ pub(super) fn notification_is_owned_by(
     notification: &Notification,
     sender: Option<&str>,
     sender_pid: Option<u32>,
+    sender_start_time: Option<u64>,
 ) -> bool {
-    // PID matching permits reconnecting clients without enabling cross-process takeover
-    if let (Some(caller_pid), Some(owner_pid)) = (sender_pid, notification.sender_pid) {
-        if caller_pid == owner_pid {
+    // Exact bus-name match is the strongest ownership proof on the session bus
+    match (sender, notification.sender_name.as_deref()) {
+        (Some(caller), Some(owner)) if caller == owner => return true,
+        _ => {}
+    }
+    // Process-lifetime match keeps reconnect support without trusting pid reuse alone
+    if let (Some(caller_pid), Some(owner_pid), Some(caller_start), Some(owner_start)) = (
+        sender_pid,
+        notification.sender_pid,
+        sender_start_time,
+        notification.sender_start_time,
+    ) {
+        if caller_pid == owner_pid && caller_start == owner_start {
             return true;
         }
     }
-    // Bus-name fallback handles senders without stable PID metadata
-    match (sender, notification.sender_name.as_deref()) {
-        (Some(caller), Some(owner)) => caller == owner,
-        _ => false,
-    }
+    false
 }

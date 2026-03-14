@@ -41,6 +41,7 @@ pub struct Notification {
     pub sender_name: Option<String>,
     // Sender process metadata is retained for diagnostics and audit logging.
     pub sender_pid: Option<u32>,
+    pub sender_start_time: Option<u64>,
     pub sender_executable: Option<String>,
 }
 
@@ -105,6 +106,7 @@ impl Notification {
             received_at: self.received_at,
             sender_name: self.sender_name.clone(),
             sender_pid: self.sender_pid,
+            sender_start_time: self.sender_start_time,
             sender_executable: self.sender_executable.clone(),
         }
     }

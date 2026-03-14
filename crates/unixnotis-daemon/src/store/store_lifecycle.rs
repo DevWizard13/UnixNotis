@@ -34,6 +34,7 @@ impl NotificationStore {
                 replaces_id,
                 notification.sender_name.as_deref(),
                 notification.sender_pid,
+                notification.sender_start_time,
             );
         // Replacement preserves ID only when sender ownership is confirmed
         let assigned_id = if replaced {

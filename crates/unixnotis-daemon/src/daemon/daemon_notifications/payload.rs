@@ -103,6 +103,7 @@ pub(super) fn build_notification(input: NotificationInput) -> Notification {
         received_at: chrono::Utc::now(),
         sender_name: sender.sender_name,
         sender_pid: sender.sender_pid,
+        sender_start_time: sender.sender_start_time,
         sender_executable: sender.sender_executable,
     }
 }

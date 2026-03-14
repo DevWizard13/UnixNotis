@@ -223,7 +223,12 @@ impl NotificationServer {
         let owned = {
             let store = self.state.store.lock().await;
             // Ownership check allows reconnect-safe close by same sender pid
-            store.is_notification_owned_by(id, sender_name, sender.sender_pid)
+            store.is_notification_owned_by(
+                id,
+                sender_name,
+                sender.sender_pid,
+                sender.sender_start_time,
+            )
         };
         if !owned {
             debug!(

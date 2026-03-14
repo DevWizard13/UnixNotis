@@ -30,6 +30,7 @@ fn build_notification_clamps_summary_and_body_sizes() {
         sender: SenderMetadata {
             sender_name: Some(":1.test".to_string()),
             sender_pid: Some(42),
+            sender_start_time: Some(77),
             sender_executable: Some("/usr/bin/test-app".to_string()),
         },
         expire_timeout: 0,
@@ -51,6 +52,7 @@ fn build_notification_strips_display_spoofing_controls() {
         sender: SenderMetadata {
             sender_name: Some(":1.test".to_string()),
             sender_pid: Some(42),
+            sender_start_time: Some(77),
             sender_executable: Some("/usr/bin/test-app".to_string()),
         },
         expire_timeout: 0,
