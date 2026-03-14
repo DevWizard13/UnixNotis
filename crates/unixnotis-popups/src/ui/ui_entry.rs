@@ -18,6 +18,8 @@ use crate::dbus::UiCommand;
 use super::UiState;
 
 pub(super) struct PopupEntry {
+    // Keep the last payload so seed reconcile can detect real content changes
+    pub(super) notification: NotificationView,
     pub(super) revealer: gtk::Revealer,
     pub(super) root: gtk::Box,
 }
@@ -163,7 +165,12 @@ impl UiState {
         revealer.set_child(Some(&root));
         revealer.set_reveal_child(true);
 
-        PopupEntry { revealer, root }
+        PopupEntry {
+            // Store the payload used to build this row so later seeds can compare safely
+            notification: notification.clone(),
+            revealer,
+            root,
+        }
     }
 }
 

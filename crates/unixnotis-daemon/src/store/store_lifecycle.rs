@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use unixnotis_core::{Notification, Urgency};
+use unixnotis_core::{popup_allowed_by_state, ControlState, Notification, Urgency};
 
 use super::{DismissOutcome, InsertOutcome, NotificationStore};
 
@@ -166,15 +166,16 @@ impl NotificationStore {
         if notification.suppress_popup {
             return false;
         }
-        // Runtime inhibitor suppression applies after rule transforms
-        if self.inhibited {
-            return false;
-        }
-        // DND allows only critical popups
-        if self.dnd_enabled {
-            return notification.urgency == Urgency::Critical;
-        }
-        true
+        // Shared gate keeps daemon admission aligned with popup-side cleanup
+        popup_allowed_by_state(
+            notification.urgency as u8,
+            &ControlState {
+                dnd_enabled: self.dnd_enabled,
+                history_count: 0,
+                inhibited: self.inhibited,
+                inhibitor_count: self.inhibitor_count,
+            },
+        )
     }
 
     fn should_play_sound(&self, notification: &Notification) -> bool {

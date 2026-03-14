@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use tokio::sync::mpsc::Sender;
 use tracing::debug;
-use unixnotis_core::{Config, Urgency};
+use unixnotis_core::{Config, ControlState};
 
 use crate::dbus::{UiCommand, UiEvent};
 use unixnotis_ui::css::{self, CssManager};
@@ -38,6 +38,8 @@ pub struct UiState {
     popup_input_region: PopupInputRegionState,
     popups: HashMap<u32, PopupEntry>,
     popup_order: VecDeque<u32>,
+    // Latest daemon gate state used to keep visible popups in policy
+    control_state: ControlState,
     // Desktop icon index caches resolved icon themes for known applications.
     desktop_icons: DesktopIconIndex,
     // Cache resolved icon names per app to reduce repeated theme lookups.
@@ -69,6 +71,8 @@ impl UiState {
             popup_input_region,
             popups: HashMap::new(),
             popup_order: VecDeque::new(),
+            // Start permissive until the first seed arrives from the daemon
+            control_state: ControlState::default(),
             desktop_icons: DesktopIconIndex::new(),
             icon_cache: HashMap::new(),
             icon_cache_order: VecDeque::new(),
@@ -79,21 +83,10 @@ impl UiState {
     pub fn handle_event(&mut self, event: UiEvent) {
         match event {
             UiEvent::Seed { state, active } => {
-                if state.inhibited {
-                    // Inhibits suppress popup rendering while preserving history elsewhere.
-                    return;
-                }
-                if state.dnd_enabled {
-                    for notification in active {
-                        if notification.urgency == Urgency::Critical as u8 {
-                            self.add_popup(notification);
-                        }
-                    }
-                } else {
-                    for notification in active {
-                        self.add_popup(notification);
-                    }
-                }
+                // Seed is the daemon truth, so local popup state must reconcile to it
+                // Control state is stored first so seed filtering uses the newest gate
+                self.control_state = state;
+                self.reconcile_seed(active);
             }
             UiEvent::NotificationAdded(notification, show_popup) => {
                 if show_popup {
@@ -118,13 +111,10 @@ impl UiState {
                 self.remove_popup(id);
             }
             UiEvent::StateChanged(state) => {
-                if state.inhibited {
-                    debug!("clearing popups due to inhibition");
-                    self.clear_popups();
-                } else if state.dnd_enabled {
-                    debug!("clearing popups due to dnd");
-                    self.clear_popups();
-                }
+                // State transitions only remove now-invalid popups
+                // Old popups are not resurrected here because popup history stays ephemeral
+                self.control_state = state;
+                self.retain_allowed_popups();
             }
             UiEvent::CssReload => {
                 debug!("popup css reload requested");

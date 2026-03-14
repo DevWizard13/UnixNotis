@@ -38,7 +38,7 @@ impl Urgency {
 }
 
 /// Action pair in the notification protocol.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct Action {
     pub key: String,
     pub label: String,

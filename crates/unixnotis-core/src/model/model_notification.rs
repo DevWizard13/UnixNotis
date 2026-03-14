@@ -111,7 +111,7 @@ impl Notification {
 }
 
 /// Serializable view of a notification for D-Bus signals.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 pub struct NotificationView {
     // Identifier matches Notification::id.
     pub id: u32,

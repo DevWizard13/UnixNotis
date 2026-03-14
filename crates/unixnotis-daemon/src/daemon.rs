@@ -4,6 +4,7 @@
 //! responsibilities clear and files smaller.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use tokio::sync::Mutex;
 use tracing::info;
@@ -11,6 +12,7 @@ use unixnotis_core::{CloseReason, Config, CONTROL_BUS_NAME, CONTROL_OBJECT_PATH}
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::{Connection, SignalContext};
 
+use crate::expire::ExpirationScheduler;
 use crate::sound::SoundSettings;
 use crate::store::NotificationStore;
 
@@ -30,6 +32,8 @@ pub struct DaemonState {
     /// Immutable sound settings resolved at startup.
     pub sound: SoundSettings,
     connection: Connection,
+    // Scheduler is installed after state startup so close paths can cancel timers
+    scheduler: OnceLock<ExpirationScheduler>,
 }
 
 impl DaemonState {
@@ -39,7 +43,37 @@ impl DaemonState {
             store: Mutex::new(store),
             sound,
             connection,
+            scheduler: OnceLock::new(),
         })
+    }
+
+    pub fn set_scheduler(&self, scheduler: ExpirationScheduler) {
+        // Scheduler is wired once during daemon startup
+        let _ = self.scheduler.set(scheduler);
+    }
+
+    fn scheduler(&self) -> Option<ExpirationScheduler> {
+        // Cloning the sender handle is cheap and keeps await points simple
+        self.scheduler.get().cloned()
+    }
+
+    async fn cancel_expiration(&self, id: u32) {
+        // Missing scheduler means startup is still incomplete, so skip quietly
+        let Some(scheduler) = self.scheduler() else {
+            return;
+        };
+        scheduler.schedule(id, None).await;
+    }
+
+    pub async fn cancel_expirations(&self, ids: &[u32]) {
+        // Cancel timers for every removed active id so stale wakeups do not build up
+        // Per-id cancel keeps the existing lazy heap design simple and predictable
+        let Some(scheduler) = self.scheduler() else {
+            return;
+        };
+        for id in ids {
+            scheduler.schedule(*id, None).await;
+        }
     }
 
     pub async fn close_notification(&self, id: u32, reason: CloseReason) -> zbus::Result<()> {
@@ -50,6 +84,8 @@ impl DaemonState {
         if removed.is_none() {
             return Ok(());
         }
+        // Timer cancel happens before signal fanout so stale wakeups stop right away
+        self.cancel_expiration(id).await;
 
         let notif_ctx = SignalContext::new(&self.connection, NOTIFICATIONS_OBJECT_PATH)?;
         NotificationServer::notification_closed(&notif_ctx, id, reason as u32).await?;
@@ -72,6 +108,8 @@ impl DaemonState {
         }
 
         if outcome.removed_active {
+            // Panel dismiss removes the active entry, so its timer must go too
+            self.cancel_expiration(id).await;
             let notif_ctx = SignalContext::new(&self.connection, NOTIFICATIONS_OBJECT_PATH)?;
             NotificationServer::notification_closed(
                 &notif_ctx,
@@ -101,6 +139,12 @@ impl DaemonState {
         };
         let control_ctx = SignalContext::new(&self.connection, CONTROL_OBJECT_PATH)?;
         ControlServer::state_changed(&control_ctx, state).await
+    }
+
+    pub async fn emit_snapshot_invalidated(&self) -> zbus::Result<()> {
+        // This signal tells clients their local materialized view may be stale
+        let control_ctx = SignalContext::new(&self.connection, CONTROL_OBJECT_PATH)?;
+        ControlServer::snapshot_invalidated(&control_ctx).await
     }
 
     pub(crate) fn connection(&self) -> &Connection {

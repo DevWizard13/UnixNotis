@@ -297,14 +297,19 @@ impl ControlServer {
     async fn clear_all(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "ClearAll").await?;
         // Drain active notifications in one lock to avoid quadratic scans.
-        let ids = {
+        let (ids, had_history) = {
             let mut store = self.state.store.lock().await;
             let ids = store.drain_active_ids();
+            // History-only clears still need a fresh snapshot on every client
+            let had_history = store.history_len() != 0;
             // Clear live and saved items
             store.clear_history();
-            ids
+            (ids, had_history)
         };
-        if ids.is_empty() {
+        // Active timers no longer matter once the list has been wiped
+        self.state.cancel_expirations(&ids).await;
+
+        if ids.is_empty() && !had_history {
             if let Err(err) = self.state.emit_state_changed().await {
                 warn!(?err, "failed to emit state_changed after clear_all");
             }
@@ -353,6 +358,10 @@ impl ControlServer {
                 }
             })
             .await;
+        if let Err(err) = self.state.emit_snapshot_invalidated().await {
+            // Clients can still fall back to later reconnect seeding if this broadcast is missed
+            warn!(?err, "failed to emit snapshot_invalidated after clear_all");
+        }
         if let Err(err) = self.state.emit_state_changed().await {
             // State was updated locally even if listeners missed this broadcast
             warn!(?err, "failed to emit state_changed after clear_all");
@@ -386,6 +395,9 @@ impl ControlServer {
         ctx: &SignalContext<'_>,
         state: ControlState,
     ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    pub(crate) async fn snapshot_invalidated(ctx: &SignalContext<'_>) -> zbus::Result<()>;
 
     /// Emitted when inhibitor state toggles or count changes.
     #[zbus(signal)]

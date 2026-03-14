@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use zbus::zvariant::{Array, OwnedValue, Structure, Type, Value};
 
 /// Raw image data payload from hints.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
 pub struct ImageData {
     pub width: i32,
     pub height: i32,
@@ -19,7 +19,7 @@ pub struct ImageData {
 }
 
 /// Image information derived from standard hints and app_icon.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
 pub struct NotificationImage {
     pub has_image_data: bool,
     pub image_data: ImageData,

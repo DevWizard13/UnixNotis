@@ -96,6 +96,14 @@ async fn run_dbus_loop(
                 continue;
             }
         };
+        let mut invalidated_stream = match proxy.receive_snapshot_invalidated().await {
+            Ok(stream) => stream,
+            Err(err) => {
+                subscribe_log.warn_or_debug(&err, "failed to subscribe to snapshot_invalidated");
+                tokio::time::sleep(subscribe_backoff.next_sleep()).await;
+                continue;
+            }
+        };
         let mut panel_stream = match proxy.receive_panel_requested().await {
             Ok(stream) => stream,
             Err(err) => {
@@ -173,6 +181,15 @@ async fn run_dbus_loop(
                     if let Ok(args) = signal.args() {
                         let _ = sender.send(UiEvent::StateChanged(args.state().clone())).await;
                     }
+                }
+                signal = invalidated_stream.next() => {
+                    let Some(_signal) = signal else {
+                        warn!("snapshot_invalidated stream ended");
+                        break;
+                    };
+                    // A fresh seed is the only safe way to recover deleted rows across clients
+                    // Replacement from seed keeps local GTK state in sync after global wipes
+                    seed_state_with_retry(&proxy, &sender).await;
                 }
                 signal = panel_stream.next() => {
                     let Some(signal) = signal else {

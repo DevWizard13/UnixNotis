@@ -5,7 +5,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 use zbus::proxy;
 use zbus::zvariant::Type;
 
-use crate::NotificationView;
+use crate::{NotificationView, Urgency};
 
 /// Well-known bus name for the UnixNotis control interface.
 pub const CONTROL_BUS_NAME: &str = "com.unixnotis.Control";
@@ -19,7 +19,7 @@ pub const INHIBIT_SCOPE_ALL: u32 = 0;
 pub const INHIBIT_SCOPE_POPUPS: u32 = 1;
 
 /// Control-plane state broadcast to the UI.
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
 pub struct ControlState {
     pub dnd_enabled: bool,
     pub history_count: u32,
@@ -27,6 +27,45 @@ pub struct ControlState {
     pub inhibited: bool,
     /// Total number of active inhibitors (all scopes).
     pub inhibitor_count: u32,
+}
+
+/// Shared popup gate used by the daemon and popup UI.
+pub fn popup_allowed_by_state(urgency: u8, state: &ControlState) -> bool {
+    // Inhibitors hide all popups no matter what the notification says
+    if state.inhibited {
+        return false;
+    }
+    // DND still allows critical popups so urgent issues stay visible
+    if state.dnd_enabled {
+        return urgency == Urgency::Critical as u8;
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{popup_allowed_by_state, ControlState};
+    use crate::Urgency;
+
+    #[test]
+    fn popup_gate_blocks_everything_when_inhibited() {
+        let state = ControlState {
+            inhibited: true,
+            ..ControlState::default()
+        };
+        assert!(!popup_allowed_by_state(Urgency::Critical as u8, &state));
+        assert!(!popup_allowed_by_state(Urgency::Normal as u8, &state));
+    }
+
+    #[test]
+    fn popup_gate_keeps_only_critical_during_dnd() {
+        let state = ControlState {
+            dnd_enabled: true,
+            ..ControlState::default()
+        };
+        assert!(popup_allowed_by_state(Urgency::Critical as u8, &state));
+        assert!(!popup_allowed_by_state(Urgency::Normal as u8, &state));
+    }
 }
 
 /// Tuple layout for inhibitor listings: (id, reason, scope, owner).
@@ -185,6 +224,10 @@ trait Control {
 
     #[zbus(signal)]
     fn state_changed(&self, state: ControlState) -> zbus::Result<()>;
+
+    /// Emitted when local notification snapshots must be refreshed from the daemon.
+    #[zbus(signal)]
+    fn snapshot_invalidated(&self) -> zbus::Result<()>;
 
     /// Emitted when inhibitor state toggles or count changes.
     #[zbus(signal)]

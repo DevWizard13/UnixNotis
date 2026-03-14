@@ -244,6 +244,14 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> mpsc::Sende
                         continue;
                     }
                 };
+                let mut invalidated_stream = match proxy.receive_snapshot_invalidated().await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        subscribe_log.warn_or_debug(&err, "failed to subscribe to snapshot_invalidated");
+                        tokio::time::sleep(subscribe_backoff.next_sleep()).await;
+                        continue;
+                    }
+                };
 
                 // Seed only after subscriptions are active to avoid missing events during startup.
                 seed_state_with_retry(&proxy, &sender).await;
@@ -308,6 +316,15 @@ pub fn start_dbus_runtime(sender: async_channel::Sender<UiEvent>) -> mpsc::Sende
                             if let Ok(args) = signal.args() {
                                 let _ = sender.send(UiEvent::StateChanged(args.state().clone())).await;
                             }
+                        }
+                        signal = invalidated_stream.next() => {
+                            let Some(_signal) = signal else {
+                                warn!("snapshot_invalidated stream ended");
+                                break;
+                            };
+                            // A fresh seed clears stale popups after remote clears or daemon restart drift
+                            // Seed reconcile also updates same-id payload changes without trusting missed signals
+                            seed_state_with_retry(&proxy, &sender).await;
                         }
                     }
                 }
