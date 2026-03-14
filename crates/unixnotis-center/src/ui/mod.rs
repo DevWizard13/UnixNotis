@@ -23,6 +23,7 @@ mod icons;
 mod init;
 mod list;
 mod marquee;
+mod media_art;
 mod media_widget;
 mod panel;
 mod refresh;
