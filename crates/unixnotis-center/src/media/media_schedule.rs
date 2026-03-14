@@ -1,7 +1,3 @@
-//! Scheduling helpers for delayed media refreshes.
-//!
-//! Handles retry timing for players that emit late metadata.
-
 use std::collections::HashMap;
 use std::time::Duration;
 

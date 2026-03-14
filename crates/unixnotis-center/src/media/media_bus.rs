@@ -1,7 +1,3 @@
-//! D-Bus discovery and command handling for MPRIS players.
-//!
-//! Keeps bus interactions isolated from cache and UI update logic.
-
 use std::collections::{HashMap, HashSet};
 
 use futures_util::StreamExt;
@@ -11,6 +7,7 @@ use unixnotis_core::{MediaConfig, PanelDebugLevel};
 use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::{Connection, Proxy, ProxyBuilder};
 
+use super::media_policy::{detect_browser_family, remote_art_allowed};
 use super::{MediaCommand, MediaSignal, MPRIS_APP, MPRIS_PATH, MPRIS_PLAYER, MPRIS_PREFIX};
 use crate::debug;
 
@@ -18,6 +15,8 @@ use crate::debug;
 pub(super) struct PlayerState {
     pub(super) bus_name: String,
     pub(super) identity: String,
+    pub(super) browser_family: Option<String>,
+    pub(super) remote_art_allowed: bool,
     pub(super) player: Proxy<'static>,
     pub(super) properties: PropertiesProxy<'static>,
     // Cancellation sender for the properties listener task.
@@ -67,7 +66,7 @@ pub(super) async fn refresh_players(
         if players.contains_key(&name) {
             continue;
         }
-        let state = match build_player_state(connection, &name).await {
+        let state = match build_player_state(connection, &name, config).await {
             Ok(state) => state,
             Err(err) => {
                 warn!(?err, player = %name, "failed to build media player state");
@@ -209,10 +208,18 @@ pub(super) async fn handle_command(
 pub(super) async fn build_player_state(
     connection: &Connection,
     name: &str,
+    config: &MediaConfig,
 ) -> zbus::Result<Option<PlayerState>> {
     let identity = fetch_identity(connection, name)
         .await
         .unwrap_or_else(|| name.to_string());
+    let owner_executable = resolve_player_owner_executable(connection, name).await;
+    let browser_family = detect_browser_family(&identity, name, &config.browser_tokens);
+    let remote_art_allowed = remote_art_allowed(
+        browser_family.as_deref(),
+        owner_executable.as_deref(),
+        config.remote_art_policy,
+    );
     let player = ProxyBuilder::new(connection)
         .destination(name.to_string())?
         .path(MPRIS_PATH)?
@@ -229,6 +236,8 @@ pub(super) async fn build_player_state(
     Ok(Some(PlayerState {
         bus_name: name.to_string(),
         identity,
+        browser_family,
+        remote_art_allowed,
         player,
         properties,
         listener_cancel,
@@ -247,6 +256,27 @@ async fn fetch_identity(connection: &Connection, name: &str) -> Option<String> {
         .await
         .ok()?;
     proxy.get_property("Identity").await.ok()
+}
+
+async fn resolve_player_owner_executable(connection: &Connection, name: &str) -> Option<String> {
+    let bus_name = zbus::names::BusName::try_from(name).ok()?;
+    let proxy = DBusProxy::new(connection).await.ok()?;
+    let pid = proxy.get_connection_unix_process_id(bus_name).await.ok()?;
+    read_process_executable_path(pid)
+        .await
+        .map(|path| path.display().to_string())
+}
+
+#[cfg(target_os = "linux")]
+async fn read_process_executable_path(pid: u32) -> Option<std::path::PathBuf> {
+    // Reading /proc keeps the trust hint tied to the real bus owner process
+    tokio::fs::read_link(format!("/proc/{pid}/exe")).await.ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn read_process_executable_path(_pid: u32) -> Option<std::path::PathBuf> {
+    // Non-Linux builds degrade to local-file-only artwork
+    None
 }
 
 pub(super) fn is_allowed_player(name: &str, config: &MediaConfig) -> bool {
@@ -272,67 +302,5 @@ fn is_browser_name(lower: &str, browser_tokens: &[String]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{is_allowed_player, is_relevant_media_change};
-    use std::collections::HashMap;
-    use unixnotis_core::MediaConfig;
-
-    #[test]
-    fn is_allowed_player_respects_lists() {
-        let mut config = MediaConfig::default();
-        config.include_browsers = false;
-        config.allowlist = vec!["spotify".to_string()];
-        config.denylist = vec!["playerctld".to_string()];
-        config.allowlist = config
-            .allowlist
-            .into_iter()
-            .map(|entry| entry.to_lowercase())
-            .collect();
-        config.denylist = config
-            .denylist
-            .into_iter()
-            .map(|entry| entry.to_lowercase())
-            .collect();
-        config.browser_tokens = config
-            .browser_tokens
-            .into_iter()
-            .map(|entry| entry.to_lowercase())
-            .collect();
-
-        assert!(is_allowed_player("org.mpris.MediaPlayer2.spotify", &config));
-        assert!(!is_allowed_player(
-            "org.mpris.MediaPlayer2.playerctld",
-            &config
-        ));
-        assert!(!is_allowed_player(
-            "org.mpris.MediaPlayer2.firefox",
-            &config
-        ));
-    }
-
-    #[test]
-    fn relevant_media_change_detects_updates() {
-        let mut changed = HashMap::new();
-        changed.insert("Metadata", zbus::zvariant::Value::from("track"));
-        let invalidated: [&str; 0] = [];
-
-        assert!(is_relevant_media_change(&changed, &invalidated));
-    }
-
-    #[test]
-    fn relevant_media_change_detects_invalidations() {
-        let changed: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
-        let invalidated = ["CanPlay"];
-
-        assert!(is_relevant_media_change(&changed, &invalidated));
-    }
-
-    #[test]
-    fn relevant_media_change_ignores_unrelated_updates() {
-        let mut changed = HashMap::new();
-        changed.insert("Volume", zbus::zvariant::Value::from(0.5_f64));
-        let invalidated = ["Position"];
-
-        assert!(!is_relevant_media_change(&changed, &invalidated));
-    }
-}
+#[path = "media_bus_tests.rs"]
+mod tests;

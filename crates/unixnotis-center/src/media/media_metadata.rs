@@ -1,13 +1,9 @@
-//! Metadata extraction helpers for MPRIS players.
-//!
-//! Converts raw MPRIS metadata into display-ready media info.
-
 use std::collections::HashMap;
-use std::path::Path;
 
 use zbus::zvariant::OwnedValue;
 
 use super::media_bus::PlayerState;
+use super::media_policy::normalize_art_source;
 use super::MediaInfo;
 
 pub(super) async fn fetch_media_info(state: &PlayerState) -> Option<MediaInfo> {
@@ -19,7 +15,8 @@ pub(super) async fn fetch_media_info(state: &PlayerState) -> Option<MediaInfo> {
         .unwrap_or_default();
     let title = metadata_string(&metadata, "xesam:title").unwrap_or_default();
     let artist = metadata_artist(&metadata).unwrap_or_default();
-    let art_uri = metadata_string(&metadata, "mpris:artUrl").and_then(normalize_art_uri);
+    let art_source = metadata_string(&metadata, "mpris:artUrl")
+        .and_then(|value| normalize_art_source(&value, state.remote_art_allowed));
 
     let playback_status: String = state
         .player
@@ -42,12 +39,12 @@ pub(super) async fn fetch_media_info(state: &PlayerState) -> Option<MediaInfo> {
     Some(MediaInfo {
         bus_name: state.bus_name.clone(),
         identity: state.identity.clone(),
-        // Browser family tagging is computed in the cache layer with config-aware tokens.
-        browser_family: None,
+        // Browser family is decided once when the player is admitted.
+        browser_family: state.browser_family.clone(),
         title,
         artist,
         playback_status,
-        art_uri,
+        art_source,
         can_play,
         can_pause,
         can_next,
@@ -72,23 +69,6 @@ fn metadata_artist(map: &HashMap<String, OwnedValue>) -> Option<String> {
         if !artist.trim().is_empty() {
             return Some(artist);
         }
-    }
-    None
-}
-
-fn normalize_art_uri(value: String) -> Option<String> {
-    // Accept both local paths and remote URLs to support players like Spotify.
-    if value.starts_with("file://") {
-        return Some(value);
-    }
-    if value.starts_with("https://") || value.starts_with("http://") {
-        return Some(value);
-    }
-    if value.starts_with('/') {
-        return Some(value);
-    }
-    if Path::new(&value).is_file() {
-        return Some(value);
     }
     None
 }

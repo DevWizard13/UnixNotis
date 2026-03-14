@@ -145,6 +145,10 @@ fn sanitize_normalizes_media_tokens() {
     assert_eq!(config.media.allowlist, vec!["spotify".to_string()]);
     assert_eq!(config.media.denylist, vec!["playerctld".to_string()]);
     assert_eq!(config.media.browser_tokens, vec!["firefox".to_string()]);
+    assert_eq!(
+        config.media.remote_art_policy,
+        super::super::config_types::MediaRemoteArtPolicy::NativeOnly
+    );
 }
 
 #[test]

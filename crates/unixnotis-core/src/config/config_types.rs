@@ -95,6 +95,19 @@ pub struct MediaConfig {
     pub allowlist: Vec<String>,
     /// Denylist of player identifiers or bus names (case-insensitive substrings).
     pub denylist: Vec<String>,
+    /// Controls which players may trigger remote media artwork fetches.
+    pub remote_art_policy: MediaRemoteArtPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaRemoteArtPolicy {
+    /// Disable remote artwork fetches for every player.
+    Disabled,
+    /// Allow remote artwork only for non-browser players.
+    NativeOnly,
+    /// Allow remote artwork for browsers too.
+    BrowsersToo,
 }
 
 impl Default for MediaConfig {
@@ -120,6 +133,8 @@ impl Default for MediaConfig {
             title_char_limit: 32,
             allowlist: Vec::new(),
             denylist: vec!["playerctld".to_string()],
+            // Browsers stay opt-in because webpage metadata can choose artwork URLs.
+            remote_art_policy: MediaRemoteArtPolicy::NativeOnly,
         }
     }
 }

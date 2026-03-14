@@ -1,7 +1,3 @@
-//! Cache management and snapshot building for media players.
-//!
-//! Ensures UI updates are derived from consistent cached state.
-
 use std::collections::HashMap;
 
 use async_channel::Sender;
@@ -15,14 +11,12 @@ use super::MediaInfo;
 
 pub(super) async fn refresh_cache(
     players: &HashMap<String, PlayerState>,
-    browser_tokens: &[String],
     cache: &mut HashMap<String, MediaInfo>,
 ) {
     cache.clear();
     let states: Vec<PlayerState> = players.values().cloned().collect();
     for state in states {
         if let Some(info) = fetch_media_info(&state).await {
-            let info = with_browser_family(info, browser_tokens);
             cache.insert(state.bus_name.clone(), info);
         }
     }
@@ -30,7 +24,6 @@ pub(super) async fn refresh_cache(
 
 pub(super) async fn refresh_player_cache(
     players: &HashMap<String, PlayerState>,
-    browser_tokens: &[String],
     cache: &mut HashMap<String, MediaInfo>,
     bus_name: &str,
 ) {
@@ -39,7 +32,6 @@ pub(super) async fn refresh_player_cache(
         return;
     };
     if let Some(info) = fetch_media_info(&state).await {
-        let info = with_browser_family(info, browser_tokens);
         cache.insert(bus_name.to_string(), info);
     } else {
         cache.remove(bus_name);
@@ -137,51 +129,8 @@ fn dedupe_key(info: &MediaInfo) -> Option<String> {
 
 fn media_score(info: &MediaInfo) -> (u8, u8) {
     let status = playback_rank(&info.playback_status);
-    let art_rank = if info.art_uri.is_some() { 0 } else { 1 };
+    let art_rank = if info.art_source.is_some() { 0 } else { 1 };
     (status, art_rank)
-}
-
-fn with_browser_family(mut info: MediaInfo, browser_tokens: &[String]) -> MediaInfo {
-    // Browser tokens are config-driven to avoid hardcoded identification lists.
-    info.browser_family = detect_browser_family(&info.identity, &info.bus_name, browser_tokens);
-    info
-}
-
-fn detect_browser_family(
-    identity: &str,
-    bus_name: &str,
-    browser_tokens: &[String],
-) -> Option<String> {
-    if browser_tokens.is_empty() {
-        return None;
-    }
-    let bus_lower = bus_name.to_lowercase();
-    if let Some(family) = browser_family_from_value(&bus_lower, browser_tokens) {
-        return Some(family);
-    }
-    let identity_lower = identity.to_lowercase();
-    browser_family_from_value(&identity_lower, browser_tokens).or_else(|| {
-        // Fall back to MPRIS suffix when identity signals a browser but tokens miss.
-        if !identity_lower.contains("browser") {
-            return None;
-        }
-        mpris_suffix(&bus_lower).map(|suffix| suffix.to_string())
-    })
-}
-
-fn browser_family_from_value(value: &str, browser_tokens: &[String]) -> Option<String> {
-    for token in browser_tokens {
-        if value.contains(token) {
-            return Some(token.clone());
-        }
-    }
-    None
-}
-
-fn mpris_suffix(bus_name: &str) -> Option<&str> {
-    let suffix = bus_name.strip_prefix("org.mpris.mediaplayer2.")?;
-    // Keep only the first segment to group instance-specific bus names together.
-    Some(suffix.split('.').next().unwrap_or(suffix))
 }
 
 fn normalize_token(value: &str) -> String {
@@ -211,7 +160,7 @@ mod tests {
         bus_name: &str,
         identity: &str,
         playback_status: &str,
-        art_uri: Option<&str>,
+        has_art: bool,
         browser_family: Option<&str>,
     ) -> MediaInfo {
         MediaInfo {
@@ -221,7 +170,9 @@ mod tests {
             title: "title".to_string(),
             artist: "artist".to_string(),
             playback_status: playback_status.to_string(),
-            art_uri: art_uri.map(|uri| uri.to_string()),
+            art_source: has_art.then(|| {
+                crate::media::MediaArtSource::LocalFile(std::path::PathBuf::from("/tmp/art.png"))
+            }),
             can_play: true,
             can_pause: true,
             can_next: true,
@@ -234,15 +185,15 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(
             "org.mpris.MediaPlayer2.b".to_string(),
-            make_info("org.mpris.MediaPlayer2.b", "Zeta", "Paused", None, None),
+            make_info("org.mpris.MediaPlayer2.b", "Zeta", "Paused", false, None),
         );
         cache.insert(
             "org.mpris.MediaPlayer2.a".to_string(),
-            make_info("org.mpris.MediaPlayer2.a", "Alpha", "Playing", None, None),
+            make_info("org.mpris.MediaPlayer2.a", "Alpha", "Playing", false, None),
         );
         cache.insert(
             "org.mpris.MediaPlayer2.c".to_string(),
-            make_info("org.mpris.MediaPlayer2.c", "Beta", "Playing", None, None),
+            make_info("org.mpris.MediaPlayer2.c", "Beta", "Playing", false, None),
         );
 
         let snapshot = build_snapshot(&cache);
@@ -259,7 +210,7 @@ mod tests {
                 "org.mpris.MediaPlayer2.firefox",
                 "Firefox",
                 "Paused",
-                Some("art://paused"),
+                true,
                 Some("firefox"),
             ),
         );
@@ -269,7 +220,7 @@ mod tests {
                 "org.mpris.MediaPlayer2.firefox.instance",
                 "Firefox",
                 "Playing",
-                None,
+                false,
                 Some("firefox"),
             ),
         );
