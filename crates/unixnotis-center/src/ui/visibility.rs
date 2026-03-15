@@ -127,11 +127,6 @@ impl UiState {
                 // Apply any deferred list rebuilds once the panel becomes visible.
                 self.list.flush_rebuild();
             }
-            // Refresh counts after applying deferred updates to keep UI consistent.
-            // Refresh counts after pending updates land so header stays accurate.
-            self.refresh_counts();
-            self.refresh_widgets(true);
-            self.start_refresh_timer();
             // Resolve work-area margins before showing the window to avoid a layout shift.
             // This prevents a first-frame resize when Hyprland publishes margins after open.
             // Only hit the compositor once per open when the cache is empty.
@@ -143,6 +138,12 @@ impl UiState {
             }
             // Only show the window after geometry is correct to avoid visible jitter.
             self.panel.window.set_visible(true);
+            // Refresh counts after pending updates land so header stays accurate.
+            self.refresh_counts();
+            // Run the first widget pass after the window is visible
+            // This avoids leaving plugin-backed stats on the n/a placeholder until a later tick
+            self.refresh_widgets(true);
+            self.start_refresh_timer();
             let width = self.panel.window.allocated_width();
             let height = self.panel.window.allocated_height();
             let message = format!("panel allocated size: {width}x{height}");
