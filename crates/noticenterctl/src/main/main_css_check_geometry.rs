@@ -1,0 +1,171 @@
+//! Geometry-aware lint rules for css-check
+
+#[path = "main_css_check_geometry/model.rs"]
+mod model;
+#[path = "main_css_check_geometry/parse.rs"]
+mod parse;
+#[path = "main_css_check_geometry/stock.rs"]
+mod stock;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use unixnotis_core::Config;
+
+use self::model::GeometryModel;
+use self::parse::collect_geometry_from_contents;
+use super::main_css_check_files::format_display_path;
+use super::main_css_check_runtime::display_config_path;
+
+pub(super) fn lint_geometry_css_files(
+    files: &[PathBuf],
+    config_dir: &Path,
+    display_root: &str,
+) -> Result<usize> {
+    let config_path = Config::default_config_path()?;
+    if !config_path.exists() {
+        // Geometry lint needs the live config because panel width and widget enablement matter
+        return Ok(0);
+    }
+
+    let config = Config::load_from_path(&config_path)?;
+    let config_display = display_config_path(config_dir, display_root, &config_path);
+
+    // One shared model lets multiple CSS files contribute to the same width estimate
+    let mut model = GeometryModel::default();
+    let mut warnings = 0usize;
+    for path in files {
+        let display_path = format_display_path(config_dir, display_root, path);
+        // Geometry lint works from raw text so it can merge rules across files before judging width
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("read css file {}", path.display()))?;
+        let report = collect_geometry_from_contents(&contents, &mut model);
+        for warning in report {
+            warnings += 1;
+            eprintln!("css warning: {}: {}", display_path, warning);
+        }
+    }
+
+    // Final warnings need the full CSS picture plus the live config
+    for warning in model.finalize_warnings(&config) {
+        warnings += 1;
+        eprintln!("css warning: {}: {}", config_display, warning);
+    }
+
+    Ok(warnings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_geometry_from_contents, GeometryModel};
+    use unixnotis_core::{
+        Config, DEFAULT_BASE_CSS, DEFAULT_PANEL_CSS, DEFAULT_POPUP_CSS, DEFAULT_WIDGETS_CSS,
+    };
+
+    #[test]
+    fn warns_when_toggle_grid_outgrows_panel_budget() {
+        let mut config = Config::default();
+        config.panel.width = 320;
+        let css = r#"
+            .unixnotis-panel { padding: 16px; }
+            .unixnotis-toggle { min-width: 104px; padding: 10px 12px; border: 1px solid red; }
+        "#;
+
+        let mut model = GeometryModel::default();
+        let file_warnings = collect_geometry_from_contents(css, &mut model);
+        assert!(file_warnings.is_empty());
+
+        let warnings = model.finalize_warnings(&config);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("toggle grid")));
+    }
+
+    #[test]
+    fn skips_toggle_warning_when_budget_is_safe() {
+        let mut config = Config::default();
+        config.panel.width = 520;
+        let css = r#"
+            .unixnotis-panel { padding: 16px; }
+            .unixnotis-toggle { min-width: 80px; padding: 6px 8px; border: 1px solid red; }
+        "#;
+
+        let mut model = GeometryModel::default();
+        let file_warnings = collect_geometry_from_contents(css, &mut model);
+        assert!(file_warnings.is_empty());
+
+        let warnings = model.finalize_warnings(&config);
+        assert!(!warnings
+            .iter()
+            .any(|warning| warning.contains("toggle grid")));
+    }
+
+    #[test]
+    fn stock_theme_geometry_is_quiet() {
+        let config = Config::default();
+        let mut model = GeometryModel::default();
+        for css in [
+            DEFAULT_BASE_CSS,
+            DEFAULT_PANEL_CSS,
+            DEFAULT_POPUP_CSS,
+            DEFAULT_WIDGETS_CSS,
+        ] {
+            let file_warnings = collect_geometry_from_contents(css, &mut model);
+            assert!(file_warnings.is_empty(), "{file_warnings:?}");
+        }
+
+        let warnings = model.finalize_warnings(&config);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn warns_when_media_row_budget_is_exceeded() {
+        let mut config = Config::default();
+        config.panel.width = 340;
+        let css = r#"
+            .unixnotis-panel { padding: 16px; }
+            .unixnotis-media-nav { min-width: 30px; padding: 6px; border: 1px solid red; }
+            .unixnotis-media-card { padding: 12px 16px; border: 1px solid red; }
+            .unixnotis-media-art-frame { min-width: 84px; padding: 4px; border: 1px solid red; }
+            .unixnotis-media-button { min-width: 34px; padding: 6px 8px; border: 1px solid red; }
+        "#;
+
+        let mut model = GeometryModel::default();
+        let file_warnings = collect_geometry_from_contents(css, &mut model);
+        assert!(file_warnings.is_empty());
+
+        let warnings = model.finalize_warnings(&config);
+        assert!(warnings.iter().any(|warning| warning.contains("media row")));
+    }
+
+    #[test]
+    fn warns_when_media_art_outgrows_its_frame() {
+        let config = Config::default();
+        let css = r#"
+            .unixnotis-media-art { min-width: 82px; }
+            .unixnotis-media-art-frame { min-width: 54px; }
+        "#;
+
+        let mut model = GeometryModel::default();
+        let file_warnings = collect_geometry_from_contents(css, &mut model);
+        assert!(file_warnings.is_empty());
+
+        let warnings = model.finalize_warnings(&config);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains(".unixnotis-media-art")));
+    }
+
+    #[test]
+    fn warns_for_unknown_unixnotis_size_selector() {
+        let css = r#"
+            .unixnotis-media-image { min-width: 80px; }
+        "#;
+
+        let mut model = GeometryModel::default();
+        let warnings = collect_geometry_from_contents(css, &mut model);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("unknown UnixNotis class"));
+    }
+}

@@ -2,6 +2,8 @@
 
 #[path = "main_css_check_files.rs"]
 mod main_css_check_files;
+#[path = "main_css_check_geometry.rs"]
+mod main_css_check_geometry;
 #[path = "main_css_check_lint.rs"]
 mod main_css_check_lint;
 #[path = "main_css_check_parse.rs"]
@@ -17,6 +19,7 @@ use std::sync::Arc;
 use unixnotis_core::Config;
 
 use self::main_css_check_files::{collect_css_files, display_config_root, format_display_path};
+use self::main_css_check_geometry::lint_geometry_css_files;
 use self::main_css_check_lint::lint_css_files;
 use self::main_css_check_runtime::lint_runtime_config;
 
@@ -97,6 +100,8 @@ pub(crate) fn run_css_check() -> Result<()> {
     let mut warnings = lint_css_files(&css_files, &config_dir, &display_root)?;
     // Live config can still override how css feels at runtime, so report those clashes too
     warnings += lint_runtime_config(&config_dir, &display_root)?;
+    // Geometry warnings look for child layouts that can outgrow the requested panel width
+    warnings += lint_geometry_css_files(&css_files, &config_dir, &display_root)?;
     if warnings > 0 {
         println!(
             "css-check warnings: {} issue(s) under {}",

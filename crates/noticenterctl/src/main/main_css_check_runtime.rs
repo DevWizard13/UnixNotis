@@ -6,6 +6,7 @@ use unixnotis_core::{Config, PANEL_RUNTIME_WIDTH_MIN};
 pub(super) fn lint_runtime_config(config_dir: &Path, display_root: &str) -> Result<usize> {
     let config_path = Config::default_config_path()?;
     if !config_path.exists() {
+        // No live config means there is nothing runtime-specific to compare
         return Ok(0);
     }
 
@@ -14,6 +15,7 @@ pub(super) fn lint_runtime_config(config_dir: &Path, display_root: &str) -> Resu
 
     if let Some(message) = panel_width_floor_warning(&config) {
         warnings += 1;
+        // Point at config.toml because this warning comes from runtime config, not CSS text
         eprintln!(
             "css warning: {}: {}",
             display_config_path(config_dir, display_root, &config_path),
@@ -24,10 +26,16 @@ pub(super) fn lint_runtime_config(config_dir: &Path, display_root: &str) -> Resu
     Ok(warnings)
 }
 
-fn display_config_path(config_dir: &Path, display_root: &str, config_path: &Path) -> String {
+pub(super) fn display_config_path(
+    config_dir: &Path,
+    display_root: &str,
+    config_path: &Path,
+) -> String {
+    // Keep config.toml paths in the same user-facing style as CSS file warnings
     config_path
         .strip_prefix(config_dir)
         .map(|path| format!("{display_root}/{}", path.display()))
+        // Fallback keeps the message usable even when the file lives outside the config tree
         .unwrap_or_else(|_| config_path.display().to_string())
 }
 
