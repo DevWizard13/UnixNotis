@@ -5,12 +5,14 @@ use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use gtk::Align;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
-use unixnotis_core::{Anchor, Config, Margins, PanelKeyboardInteractivity};
+use unixnotis_core::{
+    Anchor, Config, Margins, PanelKeyboardInteractivity, PANEL_RUNTIME_WIDTH_MIN,
+};
 
 // Keep panel width reasonable on narrow displays to avoid dominating screen real estate.
 const PANEL_WIDTH_MONITOR_RATIO_CAP: f32 = 0.32;
 // Width floor keeps controls readable when monitor geometry is very small.
-const PANEL_WIDTH_MIN: i32 = 260;
+const PANEL_WIDTH_MIN: i32 = PANEL_RUNTIME_WIDTH_MIN;
 
 /// GTK widgets backing the notification center panel window.
 pub struct PanelWidgets {

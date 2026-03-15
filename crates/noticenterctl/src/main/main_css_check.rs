@@ -6,6 +6,8 @@ mod main_css_check_files;
 mod main_css_check_lint;
 #[path = "main_css_check_parse.rs"]
 mod main_css_check_parse;
+#[path = "main_css_check_runtime.rs"]
+mod main_css_check_runtime;
 
 use anyhow::{anyhow, Context, Result};
 use gtk::prelude::*;
@@ -16,6 +18,7 @@ use unixnotis_core::Config;
 
 use self::main_css_check_files::{collect_css_files, display_config_root, format_display_path};
 use self::main_css_check_lint::lint_css_files;
+use self::main_css_check_runtime::lint_runtime_config;
 
 pub(crate) fn run_css_check() -> Result<()> {
     // GTK must be ready before CSS parsing is used
@@ -91,7 +94,9 @@ pub(crate) fn run_css_check() -> Result<()> {
     }
 
     // Lint warnings are useful, but they do not block valid CSS
-    let warnings = lint_css_files(&css_files, &config_dir, &display_root)?;
+    let mut warnings = lint_css_files(&css_files, &config_dir, &display_root)?;
+    // Live config can still override how css feels at runtime, so report those clashes too
+    warnings += lint_runtime_config(&config_dir, &display_root)?;
     if warnings > 0 {
         println!(
             "css-check warnings: {} issue(s) under {}",

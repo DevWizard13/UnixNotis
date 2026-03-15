@@ -4,6 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 
+// Center runtime keeps side panels at or above this width
+pub const PANEL_RUNTIME_WIDTH_MIN: i32 = 260;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PopupConfig {

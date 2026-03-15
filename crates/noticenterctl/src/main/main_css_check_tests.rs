@@ -1,5 +1,7 @@
 use super::main_css_check_lint::lint_css_contents;
 use super::main_css_check_parse::split_selectors;
+use super::main_css_check_runtime::panel_width_floor_warning;
+use unixnotis_core::{Config, PANEL_RUNTIME_WIDTH_MIN};
 
 #[test]
 fn split_selectors_handles_is_commas() {
@@ -29,4 +31,25 @@ fn lint_css_contents_scans_layer_blocks() {
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("duplicate selector '.a'"));
     assert!(warnings[0].contains("within @layer theme"));
+}
+
+#[test]
+fn panel_width_floor_warning_reports_runtime_clamp() {
+    // Width below the runtime floor should explain why the panel can still look fat
+    let mut config = Config::default();
+    config.panel.width = PANEL_RUNTIME_WIDTH_MIN - 1;
+
+    let warning = panel_width_floor_warning(&config).expect("warning expected");
+    assert!(warning.contains("[panel].width"));
+    assert!(warning.contains("runtime floor"));
+    assert!(warning.contains("panel may look wider"));
+}
+
+#[test]
+fn panel_width_floor_warning_skips_safe_widths() {
+    // Width at or above the runtime floor should stay quiet
+    let mut config = Config::default();
+    config.panel.width = PANEL_RUNTIME_WIDTH_MIN;
+
+    assert!(panel_width_floor_warning(&config).is_none());
 }
