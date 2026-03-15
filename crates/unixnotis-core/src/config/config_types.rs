@@ -92,8 +92,10 @@ pub struct MediaConfig {
     /// Characters allowed before marquee scrolling begins.
     pub title_char_limit: usize,
     /// Allowlist of player identifiers or bus names (case-insensitive substrings).
+    #[serde(alias = "whitelist")]
     pub allowlist: Vec<String>,
     /// Denylist of player identifiers or bus names (case-insensitive substrings).
+    #[serde(alias = "blacklist")]
     pub denylist: Vec<String>,
     /// Controls which players may trigger remote media artwork fetches.
     pub remote_art_policy: MediaRemoteArtPolicy,

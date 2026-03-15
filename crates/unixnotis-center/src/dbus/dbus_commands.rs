@@ -1,5 +1,3 @@
-//! Command handling and offline queue management for center D-Bus actions.
-
 use std::collections::VecDeque;
 
 use tokio::sync::mpsc;
@@ -7,10 +5,10 @@ use tracing::warn;
 use unixnotis_core::{ControlProxy, PanelDebugLevel};
 use zbus::Result as ZbusResult;
 
-use crate::debug;
 use super::dbus_types::UiCommand;
+use crate::debug;
 
-// Cap offline queue length to avoid unbounded memory use when the bus is unavailable.
+// Cap offline queue length so a dead bus does not keep growing memory use
 const MAX_OFFLINE_COMMANDS: usize = 128;
 
 pub(crate) async fn handle_command(

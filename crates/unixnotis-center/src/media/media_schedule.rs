@@ -8,12 +8,12 @@ use super::{MediaInfo, MediaSignal};
 
 pub(super) type DelayedRefreshTasks = HashMap<String, JoinHandle<()>>;
 
-// Short retries capture immediate state transitions after transport commands.
+// Short retries catch button-triggered state changes quickly
 const COMMAND_REFRESH_DELAYS_MS: [u64; 2] = [150, 650];
-// Longer retries catch players that publish metadata a little later.
-const METADATA_REFRESH_DELAYS_MS: [u64; 3] = [1200, 2400, 3600];
-// Command path includes both immediate retries and metadata fallback retries.
-const COMMAND_METADATA_REFRESH_DELAYS_MS: [u64; 5] = [150, 650, 1200, 2400, 3600];
+// Passive track changes need an early retry so late art does not feel stuck
+const METADATA_REFRESH_DELAYS_MS: [u64; 4] = [250, 900, 1800, 3200];
+// Command path keeps the quick button retries and then falls into the same late-art sweep
+const COMMAND_METADATA_REFRESH_DELAYS_MS: [u64; 6] = [150, 450, 900, 1800, 3200, 4800];
 
 pub(super) fn cancel_delayed_refresh(tasks: &mut DelayedRefreshTasks, bus_name: &str) {
     // Player-specific cancellation keeps delayed refresh growth bounded.
@@ -113,5 +113,60 @@ fn needs_metadata_fallback(cache: &HashMap<String, MediaInfo>, bus_name: &str) -
     let Some(info) = cache.get(bus_name) else {
         return false;
     };
-    info.playback_status == "Playing" && info.title.is_empty()
+    // Some players publish track text first and artwork a moment later
+    // Keep one retry plan active while playback is live so late art updates are not missed
+    info.playback_status == "Playing"
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::media::MediaInfo;
+
+    use super::needs_metadata_fallback;
+
+    fn make_info(status: &str) -> MediaInfo {
+        MediaInfo {
+            bus_name: "org.mpris.MediaPlayer2.spotify".to_string(),
+            identity: "Spotify".to_string(),
+            browser_family: None,
+            title: "track".to_string(),
+            artist: "artist".to_string(),
+            playback_status: status.to_string(),
+            art_source: None,
+            can_play: true,
+            can_pause: true,
+            can_next: true,
+            can_prev: true,
+        }
+    }
+
+    #[test]
+    fn metadata_fallback_stays_on_while_playing() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "org.mpris.MediaPlayer2.spotify".to_string(),
+            make_info("Playing"),
+        );
+
+        assert!(needs_metadata_fallback(
+            &cache,
+            "org.mpris.MediaPlayer2.spotify"
+        ));
+    }
+
+    #[test]
+    fn metadata_fallback_stops_when_not_playing() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "org.mpris.MediaPlayer2.spotify".to_string(),
+            make_info("Paused"),
+        );
+
+        assert!(!needs_metadata_fallback(
+            &cache,
+            "org.mpris.MediaPlayer2.spotify"
+        ));
+    }
 }

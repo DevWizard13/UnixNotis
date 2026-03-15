@@ -2,6 +2,23 @@ use super::super::config_widgets::{CardWidgetConfig, StatWidgetConfig, WidgetPlu
 use super::*;
 
 #[test]
+fn media_aliases_load_blacklist_and_whitelist() {
+    // Legacy names still need to map to the same media lists
+    let mut config: Config = toml::from_str(
+        r#"
+        [media]
+        whitelist = ["Spotify"]
+        blacklist = ["Playerctld"]
+        "#,
+    )
+    .expect("config should parse");
+    sanitize_config(&mut config);
+
+    assert_eq!(config.media.allowlist, vec!["spotify".to_string()]);
+    assert_eq!(config.media.denylist, vec!["playerctld".to_string()]);
+}
+
+#[test]
 fn sanitize_clamps_refresh_intervals_and_preserves_ordering() {
     // Ensure the fast interval clamps to bounds and slow interval does not undercut fast.
     let mut config = Config::default();
