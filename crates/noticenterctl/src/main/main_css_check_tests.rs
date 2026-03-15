@@ -46,6 +46,25 @@ fn panel_width_floor_warning_reports_runtime_clamp() {
 }
 
 #[test]
+fn lint_css_contents_warns_on_web_length_tokens_in_layout_props() {
+    // Web CSS length helpers can slip through GTK parsing, so lint should still flag them
+    let css = r#"
+        .unixnotis-panel {
+            min-width: calc(30px + 4px);
+            padding-left: var(--pad);
+        }
+    "#;
+
+    let warnings = lint_css_contents(css);
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("uses calc()")));
+    assert!(warnings
+        .iter()
+        .any(|warning| warning.contains("uses var()")));
+}
+
+#[test]
 fn panel_width_floor_warning_skips_safe_widths() {
     // Width at or above the runtime floor should stay quiet
     let mut config = Config::default();

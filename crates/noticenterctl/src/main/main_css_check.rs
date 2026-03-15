@@ -10,18 +10,23 @@ mod main_css_check_lint;
 mod main_css_check_parse;
 #[path = "main_css_check_runtime.rs"]
 mod main_css_check_runtime;
+#[path = "main_css_check_theme.rs"]
+mod main_css_check_theme;
 
 use anyhow::{anyhow, Context, Result};
 use gtk::prelude::*;
 use gtk::CssProvider;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use unixnotis_core::Config;
 
-use self::main_css_check_files::{collect_css_files, display_config_root, format_display_path};
+use self::main_css_check_files::{display_config_root, format_display_path};
 use self::main_css_check_geometry::lint_geometry_css_files;
 use self::main_css_check_lint::lint_css_files;
 use self::main_css_check_runtime::lint_runtime_config;
+use self::main_css_check_theme::collect_css_check_inputs;
 
 pub(crate) fn run_css_check() -> Result<()> {
     // GTK must be ready before CSS parsing is used
@@ -37,13 +42,14 @@ pub(crate) fn run_css_check() -> Result<()> {
         return Err(anyhow!("config path is not a directory: {}", display_root));
     }
 
-    // Gather files once so parse and lint walk the same set
-    let css_files = collect_css_files(&config_dir)?;
+    // Follow the same active theme targets the live UI resolves from config.toml
+    let css_inputs = collect_css_check_inputs(&config_dir, &display_root)?;
+    for line in &css_inputs.info_lines {
+        println!("{line}");
+    }
+    let css_files = css_inputs.files;
     if css_files.is_empty() {
-        return Err(anyhow!(
-            "no css files found under {} (backup directories are skipped)",
-            display_root
-        ));
+        return Err(anyhow!("no active css files found for {}", display_root));
     }
 
     // Count parser failures and print each one as GTK reports it
@@ -55,6 +61,7 @@ pub(crate) fn run_css_check() -> Result<()> {
     provider.connect_parsing_error(move |_provider, section, error| {
         error_count_clone.fetch_add(1, Ordering::Relaxed);
         let location = section.start_location();
+        // GTK reports the source section, so convert it into the same path style used elsewhere
         let file = section
             .file()
             .and_then(|file| file.path())
@@ -67,6 +74,21 @@ pub(crate) fn run_css_check() -> Result<()> {
             location.line_chars() + 1,
             error.message()
         );
+        // The raw GTK error is often short, so print one extra hint from the broken line when possible
+        if let Some(line_text) = source_line_text(
+            section.file().and_then(|file| file.path()).as_deref(),
+            location.lines() + 1,
+        ) {
+            if let Some(hint) = parsing_error_hint(&line_text) {
+                eprintln!(
+                    "css hint: {}:{}:{}: {}",
+                    file,
+                    location.lines() + 1,
+                    location.line_chars() + 1,
+                    hint
+                );
+            }
+        }
     });
 
     for path in &css_files {
@@ -83,6 +105,7 @@ pub(crate) fn run_css_check() -> Result<()> {
             eprintln!("css error: {}: not a regular file", display_path);
             continue;
         }
+        // Feed each file into the same provider so GTK parses them like the live app does
         provider.load_from_path(path);
     }
 
@@ -96,8 +119,15 @@ pub(crate) fn run_css_check() -> Result<()> {
         ));
     }
 
+    // Theme-path warnings come first because they explain which files were actually checked
+    let mut warnings = 0usize;
+    for warning in css_inputs.warnings {
+        warnings += 1;
+        eprintln!("css warning: {}: {}", warning.display_path, warning.message);
+    }
+
     // Lint warnings are useful, but they do not block valid CSS
-    let mut warnings = lint_css_files(&css_files, &config_dir, &display_root)?;
+    warnings += lint_css_files(&css_files, &config_dir, &display_root)?;
     // Live config can still override how css feels at runtime, so report those clashes too
     warnings += lint_runtime_config(&config_dir, &display_root)?;
     // Geometry warnings look for child layouts that can outgrow the requested panel width
@@ -115,6 +145,42 @@ pub(crate) fn run_css_check() -> Result<()> {
         display_root
     );
     Ok(())
+}
+
+fn source_line_text(path: Option<&Path>, line_number: usize) -> Option<String> {
+    let path = path?;
+    if line_number == 0 {
+        return None;
+    }
+    // Read on demand so the happy path does not carry file contents around
+    let contents = fs::read_to_string(path).ok()?;
+    contents
+        .lines()
+        // GTK line numbers are one-based, while iterator indexing is zero-based
+        .nth(line_number.saturating_sub(1))
+        .map(str::to_string)
+}
+
+fn parsing_error_hint(line_text: &str) -> Option<&'static str> {
+    // Trim once so hint checks are not thrown off by surrounding whitespace
+    let trimmed = line_text.trim();
+    if trimmed.contains('%') {
+        // GTK size properties are much stricter than web CSS
+        return Some(
+            "percentage lengths often fail in GTK CSS size properties; prefer fixed pixel values",
+        );
+    }
+    if trimmed.contains("calc(") {
+        // calc() is a common web habit that GTK CSS does not handle here
+        return Some(
+            "GTK CSS does not support calc() in layout properties here; use a fixed value instead",
+        );
+    }
+    if trimmed.contains("var(") {
+        // GTK supports @define-color, not web CSS custom properties
+        return Some("GTK CSS does not use var() custom properties; use @define-color for colors and fixed lengths for layout");
+    }
+    None
 }
 
 #[cfg(test)]

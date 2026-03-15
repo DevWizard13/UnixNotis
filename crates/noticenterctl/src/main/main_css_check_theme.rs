@@ -1,0 +1,228 @@
+//! Active theme target discovery and path sanity checks for css-check
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use unixnotis_core::{Config, ThemePaths};
+
+use super::main_css_check_files::{collect_css_files, format_display_path};
+
+pub(super) struct CssCheckInputs {
+    pub(super) files: Vec<PathBuf>,
+    pub(super) info_lines: Vec<String>,
+    pub(super) warnings: Vec<CssCheckWarning>,
+}
+
+pub(super) struct CssCheckWarning {
+    pub(super) display_path: String,
+    pub(super) message: String,
+}
+
+struct ThemeTarget {
+    slot_name: &'static str,
+    config_key: &'static str,
+    path: PathBuf,
+}
+
+impl ThemeTarget {
+    fn display_path(&self, config_dir: &Path, display_root: &str) -> String {
+        format_display_path(config_dir, display_root, &self.path)
+    }
+}
+
+pub(super) fn collect_css_check_inputs(
+    config_dir: &Path,
+    display_root: &str,
+) -> Result<CssCheckInputs> {
+    let config_path = Config::default_config_path().context("resolve config path")?;
+    let config = Config::load_default().context("load config for active theme paths")?;
+    collect_css_check_inputs_from(config_dir, display_root, &config_path, &config)
+}
+
+fn collect_css_check_inputs_from(
+    config_dir: &Path,
+    display_root: &str,
+    config_path: &Path,
+    config: &Config,
+) -> Result<CssCheckInputs> {
+    let config_display = format_display_path(config_dir, display_root, config_path);
+
+    // css-check should follow the same theme path resolution that the UI uses
+    let theme_paths = config
+        .resolve_theme_paths_from(config_dir)
+        .context("resolve theme paths for css-check")?;
+
+    // Collect extra *.css files so the command can explain what was skipped
+    let root_css_files = collect_css_files(config_dir)?;
+    let root_css_set: HashSet<PathBuf> = root_css_files.iter().cloned().collect();
+
+    let targets = theme_targets(theme_paths);
+    let mut warnings = Vec::new();
+    let mut info_lines = Vec::new();
+    let mut files = Vec::new();
+    let mut seen_files = HashSet::new();
+    let mut duplicate_slots: BTreeMap<PathBuf, Vec<&'static str>> = BTreeMap::new();
+    let mut outside_root = 0usize;
+    let mut non_css_targets = 0usize;
+
+    // Print the active theme slot map once so the user can see what css-check is really reading
+    info_lines.push(format!(
+        "css info: active theme files: {}",
+        active_theme_summary(&targets, config_dir, display_root)
+    ));
+
+    for target in &targets {
+        if !target.path.starts_with(config_dir) {
+            // Absolute or sibling theme files are valid, but they need to be called out explicitly
+            outside_root += 1;
+        }
+        if !has_css_extension(&target.path) {
+            // The UI will still load these files, so css-check must not silently skip them
+            non_css_targets += 1;
+        }
+
+        duplicate_slots
+            .entry(normalize_target_key(&target.path))
+            .or_default()
+            .push(target.config_key);
+
+        if !target.path.exists() {
+            warnings.push(CssCheckWarning {
+                display_path: target.display_path(config_dir, display_root),
+                message: format!(
+                    "configured {} target is missing; UnixNotis will create a default theme file there on startup, so css-check is validating less than the live UI expects",
+                    target.slot_name
+                ),
+            });
+            continue;
+        }
+
+        if !target.path.is_file() {
+            warnings.push(CssCheckWarning {
+                display_path: target.display_path(config_dir, display_root),
+                message: format!(
+                    "configured {} target is not a regular file",
+                    target.slot_name
+                ),
+            });
+            continue;
+        }
+
+        // Each unique active file only needs one GTK parse and one lint pass
+        if seen_files.insert(target.path.clone()) {
+            files.push(target.path.clone());
+        }
+    }
+
+    for slots in duplicate_slots.values() {
+        if slots.len() < 2 {
+            continue;
+        }
+
+        // One file loaded into multiple provider layers can look much stronger than expected
+        warnings.push(CssCheckWarning {
+            display_path: config_display.clone(),
+            message: format!(
+                "{} all resolve to the same file; that stylesheet will be loaded into multiple UnixNotis theme slots",
+                join_config_keys(slots)
+            ),
+        });
+    }
+
+    let configured_existing: HashSet<PathBuf> = files.iter().cloned().collect();
+    let skipped_extra_css = root_css_set
+        .iter()
+        .filter(|path| !configured_existing.contains(*path))
+        .count();
+
+    if outside_root > 0 {
+        info_lines.push(format!(
+            "css info: {outside_root} configured theme file(s) live outside {display_root} and were checked directly"
+        ));
+    }
+    if non_css_targets > 0 {
+        info_lines.push(format!(
+            "css info: {non_css_targets} configured theme file(s) do not end in .css and were checked because config.toml points to them"
+        ));
+    }
+    if skipped_extra_css > 0 {
+        info_lines.push(format!(
+            "css info: {skipped_extra_css} extra css file(s) under {display_root} are not referenced by config.toml and were skipped"
+        ));
+    }
+
+    files.sort();
+    Ok(CssCheckInputs {
+        files,
+        info_lines,
+        warnings,
+    })
+}
+
+fn theme_targets(theme_paths: ThemePaths) -> [ThemeTarget; 4] {
+    [
+        ThemeTarget {
+            slot_name: "base css",
+            config_key: "[theme].base_css",
+            path: theme_paths.base_css,
+        },
+        ThemeTarget {
+            slot_name: "panel css",
+            config_key: "[theme].panel_css",
+            path: theme_paths.panel_css,
+        },
+        ThemeTarget {
+            slot_name: "popup css",
+            config_key: "[theme].popup_css",
+            path: theme_paths.popup_css,
+        },
+        ThemeTarget {
+            slot_name: "widgets css",
+            config_key: "[theme].widgets_css",
+            path: theme_paths.widgets_css,
+        },
+    ]
+}
+
+fn active_theme_summary(
+    targets: &[ThemeTarget; 4],
+    config_dir: &Path,
+    display_root: &str,
+) -> String {
+    targets
+        .iter()
+        .map(|target| {
+            format!(
+                "{}={}",
+                target.config_key,
+                target.display_path(config_dir, display_root)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn has_css_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("css"))
+        .unwrap_or(false)
+}
+
+fn normalize_target_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn join_config_keys(keys: &[&'static str]) -> String {
+    keys.iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+#[path = "main_css_check_theme_tests.rs"]
+mod tests;

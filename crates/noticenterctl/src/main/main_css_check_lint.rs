@@ -124,10 +124,11 @@ fn lint_css_properties(selector: &str, block: &str, context: Option<&str>) -> Ve
             continue;
         }
 
-        let Some((name, _)) = trimmed.split_once(':') else {
+        let Some((name, value)) = trimmed.split_once(':') else {
             continue;
         };
         let prop = name.trim();
+        let value = value.trim();
         if prop.is_empty() {
             continue;
         }
@@ -140,6 +141,62 @@ fn lint_css_properties(selector: &str, block: &str, context: Option<&str>) -> Ve
                 prop, selector, context_note
             ));
         }
+
+        if let Some(message) = web_length_value_warning(prop, value, selector, context) {
+            warnings.push(message);
+        }
     }
     warnings
+}
+
+fn web_length_value_warning(
+    property: &str,
+    value: &str,
+    selector: &str,
+    context: Option<&str>,
+) -> Option<String> {
+    if !is_horizontal_size_property(property) {
+        return None;
+    }
+
+    let hint = if value.contains('%') {
+        // Percentage widths are a common web habit that often breaks GTK layout rules
+        Some("uses percentage lengths that GTK layout properties often reject or ignore")
+    } else if value.contains("calc(") {
+        // calc() can look valid while still not acting like web CSS
+        Some("uses calc(), which GTK layout properties often do not evaluate the way web CSS does")
+    } else if value.contains("var(") {
+        // GTK color tokens use @define-color rather than web custom properties
+        Some("uses var(), but GTK CSS does not support web custom properties for layout values")
+    } else {
+        None
+    }?;
+
+    let context_note = context
+        .map(|ctx| format!(" within {ctx}"))
+        .unwrap_or_default();
+    Some(format!(
+        "property '{}' in selector '{}'{} {}",
+        property, selector, context_note, hint
+    ))
+}
+
+fn is_horizontal_size_property(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "width"
+            | "min-width"
+            | "margin"
+            | "margin-left"
+            | "margin-right"
+            | "padding"
+            | "padding-left"
+            | "padding-right"
+            | "border"
+            | "border-width"
+            | "border-left"
+            | "border-left-width"
+            | "border-right"
+            | "border-right-width"
+    )
 }
