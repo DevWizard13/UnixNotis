@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
@@ -13,6 +13,7 @@ pub(super) struct MediaCardWidgets {
     pub(super) root: gtk::Box,
     pub(super) art: gtk::Picture,
     pub(super) text_box: gtk::Box,
+    pub(super) meta_row: gtk::Box,
     pub(super) source_label: gtk::Label,
     pub(super) position_label: gtk::Label,
     pub(super) title_label: MarqueeLabel,
@@ -21,9 +22,19 @@ pub(super) struct MediaCardWidgets {
     pub(super) next_button: gtk::Button,
     pub(super) prev_button: gtk::Button,
     pub(super) art_key: Rc<RefCell<Option<String>>>,
+    pub(super) show_source_pref: Rc<Cell<bool>>,
+    pub(super) show_position_pref: Rc<Cell<bool>>,
+    pub(super) player_total: Rc<Cell<usize>>,
 }
 
 impl MediaCardWidgets {
+    pub(super) fn apply_metadata_visibility(&self, show_source: bool, show_position: bool) {
+        // Keep config intent cached so live player count can refine visibility later
+        self.show_source_pref.set(show_source);
+        self.show_position_pref.set(show_position);
+        self.sync_metadata_visibility();
+    }
+
     pub(super) fn update(&self, info: &MediaInfo, current: usize, total: usize) {
         // Skip text work when the value already matches the visible label
         if self.source_label.text() != info.identity.as_str() {
@@ -33,6 +44,8 @@ impl MediaCardWidgets {
         if self.position_label.text() != position.as_str() {
             self.position_label.set_text(&position);
         }
+        self.player_total.set(total);
+        self.sync_metadata_visibility();
 
         let title = if info.title.is_empty() {
             // Missing titles fall back to the player name instead of a blank line
@@ -53,6 +66,17 @@ impl MediaCardWidgets {
         }
 
         update_playing_class(&self.root, &info.playback_status);
+    }
+
+    fn sync_metadata_visibility(&self) {
+        // The source follows config directly
+        let show_source = self.show_source_pref.get();
+        self.source_label.set_visible(show_source);
+
+        // The position badge only matters when more than one player can be cycled
+        let show_position = self.show_position_pref.get() && self.player_total.get() > 1;
+        self.position_label.set_visible(show_position);
+        self.meta_row.set_visible(show_source || show_position);
     }
 }
 

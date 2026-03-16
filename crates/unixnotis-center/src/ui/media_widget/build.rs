@@ -3,12 +3,75 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::Align;
+use unixnotis_core::{MediaConfig, MediaLayout};
 
 use crate::media::MediaHandle;
 
-use super::super::marquee::MarqueeLabel;
 use super::card::MediaCardWidgets;
+use super::layout::{
+    card_height_for_layout, card_layout_class, marquee_width_for_layout, row_layout_class,
+    stack_layout_class,
+};
+use super::parts::{build_media_card_parts, MediaCardLayoutParts};
 use super::selection::MediaSelection;
+
+pub(super) struct MediaWidgetParts {
+    pub(super) root: gtk::Box,
+    pub(super) nav_prev: gtk::Button,
+    pub(super) nav_next: gtk::Button,
+    pub(super) card: MediaCardWidgets,
+}
+
+pub(super) fn build_media_widget(
+    handle: &MediaHandle,
+    selection: Rc<RefCell<MediaSelection>>,
+    panel_width: i32,
+    config: &MediaConfig,
+) -> MediaWidgetParts {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    root.add_css_class("unixnotis-media-stack");
+    root.add_css_class(stack_layout_class(config.layout));
+    root.set_visible(false);
+
+    let row = gtk::Box::new(row_orientation(config.layout), 6);
+    row.add_css_class("unixnotis-media-row");
+    row.add_css_class(row_layout_class(config.layout));
+    row.set_hexpand(true);
+    row.set_halign(Align::Fill);
+    row.set_valign(Align::Center);
+
+    let nav_prev = build_navigation_button("<");
+    let nav_next = build_navigation_button(">");
+    let marquee_width = marquee_width_for_layout(config.layout, panel_width);
+    let parts = build_media_card_parts(handle, selection, marquee_width, config.title_char_limit);
+    parts
+        .card
+        .root
+        .add_css_class(card_layout_class(config.layout));
+    // Fixed heights keep each preset steady while metadata changes underneath
+    parts
+        .card
+        .root
+        .set_size_request(-1, card_height_for_layout(config.layout));
+    parts
+        .card
+        .apply_metadata_visibility(config.show_source, config.show_position);
+
+    match config.layout {
+        MediaLayout::Carousel => compose_carousel(&row, &nav_prev, &parts, &nav_next),
+        MediaLayout::Inline => compose_inline(&row, &nav_prev, &parts, &nav_next),
+        MediaLayout::Stacked => compose_stacked(&row, &nav_prev, &parts, &nav_next),
+        MediaLayout::Showcase => compose_showcase(&row, &nav_prev, &parts, &nav_next),
+    }
+
+    root.append(&row);
+    MediaWidgetParts {
+        root,
+        nav_prev,
+        nav_next,
+        card: parts.card,
+    }
+}
 
 pub(super) fn build_navigation_button(label_text: &str) -> gtk::Button {
     let button = gtk::Button::with_label(label_text);
@@ -26,167 +89,161 @@ pub(super) fn build_navigation_button(label_text: &str) -> gtk::Button {
     button
 }
 
-pub(super) fn build_media_card(
-    handle: &MediaHandle,
-    selection: Rc<RefCell<MediaSelection>>,
-    marquee_width: i32,
-    title_char_limit: usize,
-) -> MediaCardWidgets {
-    let root = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    root.add_css_class("unixnotis-media-card");
-    root.set_hexpand(true);
-    root.set_halign(Align::Fill);
-    root.set_valign(Align::Center);
-    // Fixed height keeps the media pill steady across metadata changes
-    root.set_size_request(-1, 72);
-
-    let art = build_art_picture();
-    // The frame keeps the card shape steady even when art is missing
-    let art_frame = build_art_frame(&art);
-    let info_row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    info_row.set_hexpand(true);
-    info_row.set_halign(Align::Fill);
-    info_row.set_valign(Align::Center);
-
-    let text_box = build_text_box(marquee_width);
-    let source_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let source_label = gtk::Label::new(Some(""));
-    source_label.set_xalign(0.0);
-    source_label.add_css_class("unixnotis-media-source");
-
-    let position_label = gtk::Label::new(Some(""));
-    position_label.set_xalign(1.0);
-    position_label.add_css_class("unixnotis-media-position");
-
-    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 1);
-    spacer.set_hexpand(true);
-    source_row.append(&source_label);
-    source_row.append(&spacer);
-    source_row.append(&position_label);
-
-    let title_label = MarqueeLabel::new("unixnotis-media-title", marquee_width, title_char_limit);
-    let marquee_widget = title_label.widget();
-    marquee_widget.set_hexpand(false);
-    marquee_widget.set_halign(Align::Start);
-
-    let artist_label = gtk::Label::new(None);
-    artist_label.set_xalign(0.0);
-    artist_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    artist_label.add_css_class("unixnotis-media-artist");
-
-    text_box.append(&source_row);
-    text_box.append(&marquee_widget);
-    text_box.append(&artist_label);
-
-    let (controls, prev_button, play_button, next_button) = build_controls();
-    info_row.append(&text_box);
-    info_row.append(&controls);
-    root.append(&art_frame);
-    root.append(&info_row);
-
-    connect_playback_buttons(handle, selection, &play_button, &next_button, &prev_button);
-    // The art key lets async art loads ignore stale completions
-    let art_key = Rc::new(RefCell::new(None));
-
-    MediaCardWidgets {
-        root,
-        art,
-        text_box,
-        source_label,
-        position_label,
-        title_label,
-        artist_label,
-        play_button,
-        next_button,
-        prev_button,
-        art_key,
+fn row_orientation(layout: MediaLayout) -> gtk::Orientation {
+    match layout {
+        MediaLayout::Carousel => gtk::Orientation::Horizontal,
+        MediaLayout::Inline | MediaLayout::Stacked | MediaLayout::Showcase => {
+            gtk::Orientation::Vertical
+        }
     }
 }
 
-fn build_art_picture() -> gtk::Picture {
-    let art = gtk::Picture::new();
-    art.add_css_class("unixnotis-media-art");
-    art.set_can_shrink(true);
-    art.set_size_request(50, 50);
-    art.set_keep_aspect_ratio(true);
-    art.set_hexpand(false);
-    art.set_vexpand(false);
-    art.set_halign(Align::Center);
-    art.set_valign(Align::Center);
-    art.set_visible(false);
-    art
-}
-
-fn build_art_frame(art: &gtk::Picture) -> gtk::Box {
-    let art_frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    art_frame.add_css_class("unixnotis-media-art-frame");
-    art_frame.set_size_request(54, 54);
-    art_frame.set_hexpand(false);
-    art_frame.set_vexpand(false);
-    art_frame.set_halign(Align::Center);
-    art_frame.set_valign(Align::Center);
-    art_frame.append(art);
-    art_frame
-}
-
-fn build_text_box(marquee_width: i32) -> gtk::Box {
-    let text_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    text_box.set_hexpand(false);
-    text_box.set_halign(Align::Fill);
-    text_box.set_size_request(marquee_width, -1);
-    text_box
-}
-
-fn build_controls() -> (gtk::Box, gtk::Button, gtk::Button, gtk::Button) {
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    controls.add_css_class("unixnotis-media-controls");
-    controls.set_halign(Align::End);
-    controls.set_valign(Align::Center);
-
-    let prev_button = gtk::Button::from_icon_name("media-skip-backward-symbolic");
-    let play_button = gtk::Button::from_icon_name("media-playback-start-symbolic");
-    let next_button = gtk::Button::from_icon_name("media-skip-forward-symbolic");
-
-    prev_button.add_css_class("unixnotis-media-button");
-    play_button.add_css_class("unixnotis-media-button");
-    play_button.add_css_class("primary");
-    next_button.add_css_class("unixnotis-media-button");
-
-    controls.append(&prev_button);
-    controls.append(&play_button);
-    controls.append(&next_button);
-    (controls, prev_button, play_button, next_button)
-}
-
-fn connect_playback_buttons(
-    handle: &MediaHandle,
-    selection: Rc<RefCell<MediaSelection>>,
-    play_button: &gtk::Button,
-    next_button: &gtk::Button,
-    prev_button: &gtk::Button,
+fn compose_carousel(
+    row: &gtk::Box,
+    nav_prev: &gtk::Button,
+    parts: &MediaCardLayoutParts,
+    nav_next: &gtk::Button,
 ) {
-    let selection_play = selection.clone();
-    let handle_play = handle.clone();
-    play_button.connect_clicked(move |_| {
-        // The current card decides which player receives transport commands
-        if let Some(bus_name) = selection_play.borrow().current_bus() {
-            handle_play.play_pause(&bus_name);
-        }
-    });
+    let main = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    main.add_css_class("unixnotis-media-main");
+    main.set_hexpand(true);
+    main.set_halign(Align::Fill);
+    main.set_valign(Align::Center);
 
-    let selection_next = selection.clone();
-    let handle_next = handle.clone();
-    next_button.connect_clicked(move |_| {
-        if let Some(bus_name) = selection_next.borrow().current_bus() {
-            handle_next.next(&bus_name);
-        }
-    });
+    parts
+        .card
+        .root
+        .set_orientation(gtk::Orientation::Horizontal);
+    parts.card.root.set_spacing(10);
+    parts.card.root.append(&parts.art_frame);
+    main.append(&parts.card.text_box);
+    main.append(&parts.controls);
+    parts.card.root.append(&main);
 
-    let selection_prev = selection;
-    let handle_prev = handle.clone();
-    prev_button.connect_clicked(move |_| {
-        if let Some(bus_name) = selection_prev.borrow().current_bus() {
-            handle_prev.previous(&bus_name);
-        }
-    });
+    // The carousel preset keeps player navigation outside the transport card
+    row.append(nav_prev);
+    row.append(&parts.card.root);
+    row.append(nav_next);
+}
+
+fn compose_inline(
+    row: &gtk::Box,
+    nav_prev: &gtk::Button,
+    parts: &MediaCardLayoutParts,
+    nav_next: &gtk::Button,
+) {
+    let main = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    main.add_css_class("unixnotis-media-main");
+    main.set_hexpand(true);
+    main.set_halign(Align::Fill);
+    main.set_valign(Align::Center);
+
+    let control_strip = build_control_strip(nav_prev, &parts.controls, nav_next);
+
+    parts
+        .card
+        .root
+        .set_orientation(gtk::Orientation::Horizontal);
+    parts.card.root.set_spacing(10);
+    parts.card.root.append(&parts.art_frame);
+    main.append(&parts.card.text_box);
+    main.append(&control_strip);
+    parts.card.root.append(&main);
+
+    // Inline keeps the whole interaction model inside one card for easier theme experiments
+    row.append(&parts.card.root);
+}
+
+fn compose_stacked(
+    row: &gtk::Box,
+    nav_prev: &gtk::Button,
+    parts: &MediaCardLayoutParts,
+    nav_next: &gtk::Button,
+) {
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    header.add_css_class("unixnotis-media-main");
+    header.set_hexpand(true);
+    header.set_halign(Align::Fill);
+    header.set_valign(Align::Center);
+
+    let control_strip = build_control_strip(nav_prev, &parts.controls, nav_next);
+
+    parts.card.root.set_orientation(gtk::Orientation::Vertical);
+    parts.card.root.set_spacing(10);
+    header.append(&parts.art_frame);
+    header.append(&parts.card.text_box);
+    parts.card.root.append(&header);
+    parts.card.root.append(&control_strip);
+
+    // Stacked opens more room for vertical themes without changing playback semantics
+    row.append(&parts.card.root);
+}
+
+fn compose_showcase(
+    row: &gtk::Box,
+    nav_prev: &gtk::Button,
+    parts: &MediaCardLayoutParts,
+    nav_next: &gtk::Button,
+) {
+    let main = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    main.add_css_class("unixnotis-media-main");
+    main.set_hexpand(true);
+    main.set_halign(Align::Fill);
+    main.set_valign(Align::Center);
+
+    let action_rail = build_action_rail(nav_prev, &parts.controls, nav_next);
+
+    parts
+        .card
+        .root
+        .set_orientation(gtk::Orientation::Horizontal);
+    parts.card.root.set_spacing(12);
+    // Showcase spends width on text first and keeps controls in their own rail
+    parts.card.text_box.set_hexpand(true);
+    parts.card.text_box.set_halign(Align::Fill);
+    main.append(&parts.card.text_box);
+    main.append(&action_rail);
+    parts.card.root.append(&parts.art_frame);
+    parts.card.root.append(&main);
+
+    // Showcase stays as one wide card so themes can treat it like a dashboard module
+    row.append(&parts.card.root);
+}
+
+fn build_control_strip(
+    nav_prev: &gtk::Button,
+    controls: &gtk::Box,
+    nav_next: &gtk::Button,
+) -> gtk::Box {
+    let control_strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    control_strip.add_css_class("unixnotis-media-control-strip");
+    control_strip.set_halign(Align::Fill);
+    control_strip.set_valign(Align::Center);
+
+    control_strip.append(nav_prev);
+    control_strip.append(controls);
+    control_strip.append(nav_next);
+    control_strip
+}
+
+fn build_action_rail(
+    nav_prev: &gtk::Button,
+    controls: &gtk::Box,
+    nav_next: &gtk::Button,
+) -> gtk::Box {
+    let action_rail = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    action_rail.add_css_class("unixnotis-media-action-rail");
+    action_rail.set_halign(Align::End);
+    action_rail.set_valign(Align::Center);
+
+    let nav_strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    nav_strip.add_css_class("unixnotis-media-nav-strip");
+    nav_strip.set_halign(Align::Center);
+    nav_strip.set_valign(Align::Center);
+
+    nav_strip.append(nav_prev);
+    nav_strip.append(nav_next);
+    action_rail.append(controls);
+    action_rail.append(&nav_strip);
+    action_rail
 }

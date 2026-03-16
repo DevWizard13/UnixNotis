@@ -52,7 +52,7 @@ impl UiState {
                 &panel.media_container,
                 handle.clone(),
                 panel_width,
-                init.config.media.title_char_limit,
+                &init.config.media,
             )
         });
         if media.is_none() {

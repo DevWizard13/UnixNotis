@@ -45,14 +45,14 @@ struct ToggleItem {
 }
 
 impl ToggleGrid {
-    pub fn new(configs: &[ToggleWidgetConfig]) -> Option<Self> {
+    pub fn new(configs: &[ToggleWidgetConfig], show_tooltips: bool) -> Option<Self> {
         // Keep only enabled entries so UI wiring stays small and deterministic
         let mut items = Vec::new();
         for config in configs {
             if !config.enabled {
                 continue;
             }
-            items.push(ToggleItem::new(config.clone()));
+            items.push(ToggleItem::new(config.clone(), show_tooltips));
         }
         if items.is_empty() {
             // Caller skips widget wiring entirely when no toggles are enabled
@@ -107,7 +107,7 @@ impl ToggleGrid {
 }
 
 impl ToggleItem {
-    fn new(config: ToggleWidgetConfig) -> Self {
+    fn new(config: ToggleWidgetConfig, show_tooltips: bool) -> Self {
         // Guard and generation tokens are per-item to isolate async updates
         let guard = Rc::new(Cell::new(false));
         let refresh_gen = Arc::new(AtomicU64::new(0));
@@ -117,8 +117,10 @@ impl ToggleItem {
         // Base class applies shared visual treatment for all toggle cards
         button.add_css_class("unixnotis-toggle");
         button.set_focusable(true);
-        // Tooltip mirrors label so icon-only layouts still expose accessible text
-        button.set_tooltip_text(Some(&config.label));
+        // Tooltip stays optional so hover can stay visually quiet in compact layouts
+        if show_tooltips {
+            button.set_tooltip_text(Some(&config.label));
+        }
 
         // Stable per-kind CSS classes let themes target each toggle consistently
         if let Some(kind) = config.kind.as_deref() {

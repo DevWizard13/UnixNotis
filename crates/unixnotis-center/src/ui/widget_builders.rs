@@ -49,7 +49,8 @@ pub(super) fn build_extra_widgets(
     Option<widgets::cards::CardGrid>,
 ) {
     // Toggle widgets represent binary state controls and their watchers.
-    let toggles = widgets::toggles::ToggleGrid::new(&config.widgets.toggles);
+    let toggles =
+        widgets::toggles::ToggleGrid::new(&config.widgets.toggles, config.widgets.toggle_tooltips);
     if let Some(grid) = toggles.as_ref() {
         panel.toggle_container.set_visible(true);
         panel.toggle_container.append(grid.root());

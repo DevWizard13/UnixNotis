@@ -90,11 +90,42 @@ impl UiState {
         self.panel.media_container.set_visible(true);
         // Use the live panel width so media layout stays aligned after adaptive sizing.
         let panel_width = self.panel.root.width_request().max(1);
+        if self
+            .media
+            .as_ref()
+            .is_some_and(|media| !media.matches_layout(&config.media))
+        {
+            // Shell changes need a rebuild because GTK structure really changes here
+            let snapshot = self
+                .media
+                .as_ref()
+                .map(media_widget::MediaWidget::snapshot)
+                .unwrap_or_default();
+            // Drop the old shell first so the container never briefly shows two cards
+            self.clear_media_container();
+            self.media = None;
+            if let Some(handle) = self.media_handle.as_ref() {
+                debug!("media widget rebuilt for layout change");
+                let mut media = media_widget::MediaWidget::new(
+                    &self.panel.media_container,
+                    handle.clone(),
+                    panel_width,
+                    &config.media,
+                );
+                if !snapshot.is_empty() {
+                    // Re-apply the live snapshot so config reload does not blank the card
+                    media.restore_snapshot(&snapshot);
+                }
+                // Store the rebuilt shell so later refreshes reuse it
+                self.media = Some(media);
+                return;
+            }
+        }
         match (self.media.as_mut(), self.media_handle.as_ref()) {
             (Some(media), _) => {
                 // Reuse existing widget to avoid extra allocations during reloads.
                 debug!("media layout updated");
-                media.apply_layout(panel_width, config.media.title_char_limit);
+                media.apply_layout(panel_width, &config.media);
             }
             (None, Some(handle)) => {
                 debug!("media widget created");
@@ -102,7 +133,7 @@ impl UiState {
                     &self.panel.media_container,
                     handle.clone(),
                     panel_width,
-                    config.media.title_char_limit,
+                    &config.media,
                 );
                 self.media = Some(media);
             }

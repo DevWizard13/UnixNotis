@@ -1,5 +1,7 @@
 mod build;
 mod card;
+mod layout;
+mod parts;
 mod selection;
 
 use std::cell::RefCell;
@@ -9,49 +11,45 @@ use glib::clone;
 use gtk::prelude::*;
 
 use crate::media::{MediaHandle, MediaInfo};
+use unixnotis_core::{MediaConfig, MediaLayout};
 
-use self::build::{build_media_card, build_navigation_button};
+use self::build::build_media_widget;
 use self::card::MediaCardWidgets;
-use self::selection::MediaSelection;
+use self::layout::marquee_width_for_layout;
+use self::selection::{MediaSelection, MediaSelectionSnapshot};
 
 pub struct MediaWidget {
+    // The outer stack is what gets attached to the panel container
     root: gtk::Box,
+    // Outer nav buttons are still used by the carousel shell and reused elsewhere
     nav_prev: gtk::Button,
     nav_next: gtk::Button,
+    // The shared card owns labels, art, and transport buttons
     card: MediaCardWidgets,
+    // Selection state is shared with button handlers and update calls
     selection: Rc<RefCell<MediaSelection>>,
+    // The current shell preset decides whether a rebuild is needed on reload
+    layout: MediaLayout,
 }
 
 impl MediaWidget {
-    pub fn new(
+    pub(super) fn new(
         container: &gtk::Box,
         handle: MediaHandle,
         panel_width: i32,
-        title_char_limit: usize,
+        config: &MediaConfig,
     ) -> Self {
-        // Reserve room for controls and art so the marquee width stays stable
-        let marquee_width = panel_width.saturating_sub(240).max(140);
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        root.add_css_class("unixnotis-media-stack");
-        root.set_visible(false);
-
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        row.add_css_class("unixnotis-media-row");
-        row.set_hexpand(true);
-
-        // The nav buttons stay outside the card so the center text width stays stable
-        let nav_prev = build_navigation_button("<");
-        let nav_next = build_navigation_button(">");
         let selection = Rc::new(RefCell::new(MediaSelection::default()));
-        // The card builder owns the playback buttons and artwork widget setup
-        let card = build_media_card(&handle, selection.clone(), marquee_width, title_char_limit);
-
-        row.append(&nav_prev);
-        row.append(&card.root);
-        row.append(&nav_next);
-        root.append(&row);
+        // One build call assembles the shared card parts into the requested preset
+        let built = build_media_widget(&handle, selection.clone(), panel_width, config);
+        let root = built.root;
+        let nav_prev = built.nav_prev;
+        let nav_next = built.nav_next;
+        let card = built.card;
+        // The container only ever holds one media shell at a time
         container.append(&root);
 
+        // Nav buttons update selection only, never the player list itself
         connect_prev_button(&nav_prev, &nav_next, &root, selection.clone(), card.clone());
         connect_next_button(&nav_prev, &nav_next, &root, selection.clone(), card.clone());
 
@@ -61,10 +59,11 @@ impl MediaWidget {
             nav_next,
             card,
             selection,
+            layout: config.layout,
         }
     }
 
-    pub fn update(&mut self, infos: &[MediaInfo]) {
+    pub(super) fn update(&mut self, infos: &[MediaInfo]) {
         // Snapshot replacement keeps the carousel in sync with the latest media list
         self.selection.borrow_mut().set_players(infos.to_vec());
         apply_selection(
@@ -76,19 +75,44 @@ impl MediaWidget {
         );
     }
 
-    pub fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         // Clearing hides the whole media stack so stale art never lingers
         self.selection.borrow_mut().players.clear();
         self.root.set_visible(false);
     }
 
-    pub fn apply_layout(&mut self, panel_width: i32, title_char_limit: usize) {
-        // The text box is the only part that needs a live width update
-        let marquee_width = panel_width.saturating_sub(240).max(140);
+    pub(super) fn matches_layout(&self, config: &MediaConfig) -> bool {
+        self.layout == config.layout
+    }
+
+    pub(super) fn snapshot(&self) -> MediaSelectionSnapshot {
+        // Reload code uses this to rebuild the shell without losing context
+        self.selection.borrow().snapshot()
+    }
+
+    pub(super) fn restore_snapshot(&mut self, snapshot: &MediaSelectionSnapshot) {
+        // Layout rebuilds should preserve the visible player when the old bus still exists
+        self.selection.borrow_mut().restore_snapshot(snapshot);
+        apply_selection(
+            &self.selection.borrow(),
+            &self.card,
+            &self.root,
+            &self.nav_prev,
+            &self.nav_next,
+        );
+    }
+
+    pub(super) fn apply_layout(&mut self, panel_width: i32, config: &MediaConfig) {
+        // Width updates stay lightweight when the structural preset is unchanged
+        let marquee_width = marquee_width_for_layout(self.layout, panel_width);
+        // These flags can change without rebuilding the whole shell
+        self.card
+            .apply_metadata_visibility(config.show_source, config.show_position);
+        // Text width stays the only size request that changes on a light relayout
         self.card.text_box.set_size_request(marquee_width, -1);
         self.card
             .title_label
-            .update_limits(marquee_width, title_char_limit);
+            .update_limits(marquee_width, config.title_char_limit);
     }
 }
 
@@ -173,6 +197,7 @@ fn apply_selection(
         card.update(info, current, total);
         root.set_visible(true);
     } else {
+        // No active player means the whole media shell should disappear
         root.set_visible(false);
     }
 
