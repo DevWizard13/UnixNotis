@@ -3,7 +3,8 @@
 use gtk::gdk;
 use gtk::CssProvider;
 use unixnotis_core::{
-    ThemeConfig, ThemePaths, DEFAULT_PANEL_CSS, DEFAULT_POPUP_CSS, DEFAULT_WIDGETS_CSS,
+    ThemeConfig, ThemePaths, DEFAULT_MEDIA_CSS, DEFAULT_PANEL_CSS, DEFAULT_POPUP_CSS,
+    DEFAULT_WIDGETS_CSS,
 };
 
 use super::css_loader::load_provider_with_overrides;
@@ -26,6 +27,7 @@ pub struct CssManager {
     base: CssProvider,
     panel: Option<CssProvider>,
     widgets: Option<CssProvider>,
+    media: Option<CssProvider>,
     popup: Option<CssProvider>,
 }
 
@@ -37,6 +39,7 @@ impl CssManager {
             base: CssProvider::new(),
             panel: Some(CssProvider::new()),
             widgets: Some(CssProvider::new()),
+            media: Some(CssProvider::new()),
             popup: None,
         }
     }
@@ -48,6 +51,7 @@ impl CssManager {
             base: CssProvider::new(),
             panel: None,
             widgets: None,
+            media: None,
             popup: Some(CssProvider::new()),
         }
     }
@@ -84,6 +88,14 @@ impl CssManager {
                     gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
                 );
             }
+            if let Some(media) = self.media.as_ref() {
+                // Media sits above widgets so layout preset rules can stay focused and override cleanly.
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    media,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
+                );
+            }
         }
     }
 
@@ -117,6 +129,17 @@ impl CssManager {
                 &self.theme_paths.widgets_css,
                 DEFAULT_WIDGETS_CSS,
                 &widgets_overrides,
+                false,
+            );
+        }
+
+        if let Some(media) = self.media.as_ref() {
+            // Media css is intentionally isolated so ricing one widget does not pollute widgets.css.
+            load_provider_with_overrides(
+                media,
+                &self.theme_paths.media_css,
+                DEFAULT_MEDIA_CSS,
+                "",
                 false,
             );
         }

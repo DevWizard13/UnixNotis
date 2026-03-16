@@ -285,6 +285,7 @@ pub(crate) fn restore_config(ctx: &mut ActionContext) -> Result<()> {
         ("panel.css", theme_paths.panel_css),
         ("popup.css", theme_paths.popup_css),
         ("widgets.css", theme_paths.widgets_css),
+        ("media.css", theme_paths.media_css),
     ];
 
     for (name, target) in theme_targets {

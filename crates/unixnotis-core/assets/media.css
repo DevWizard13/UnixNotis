@@ -1,0 +1,173 @@
+/*
+ * Media widget
+ *
+ * Keeps media styling in its own layer so users can rice the player card
+ * without touching the rest of widgets.css
+ */
+.unixnotis-media-container {
+  margin-bottom: 10px;
+}
+
+.unixnotis-media-stack {
+  background: transparent;
+}
+
+.unixnotis-media-row {
+  background: transparent;
+}
+
+.unixnotis-media-stack-carousel,
+.unixnotis-media-stack-inline,
+.unixnotis-media-stack-stacked,
+.unixnotis-media-stack-showcase,
+.unixnotis-media-row-carousel,
+.unixnotis-media-row-inline,
+.unixnotis-media-row-stacked,
+.unixnotis-media-row-showcase,
+.unixnotis-media-main,
+.unixnotis-media-meta,
+.unixnotis-media-control-strip,
+.unixnotis-media-action-rail,
+.unixnotis-media-nav-strip {
+  background: transparent;
+}
+
+.unixnotis-media-nav {
+  background-image: linear-gradient(150deg, @unixnotis-action-bg, alpha(@unixnotis-surface, 0.9));
+  border-radius: 12px;
+  padding: 4px;
+  border: 1px solid alpha(@unixnotis-accent, 0.2);
+  font-weight: 700;
+  font-size: 12px;
+  min-width: 22px;
+  color: @unixnotis-text;
+  box-shadow:
+    0 6px 12px -10px @unixnotis-shadow-soft,
+    0 0 16px -14px @unixnotis-glow-cyan;
+}
+
+.unixnotis-media-nav:hover {
+  background-image: linear-gradient(150deg, @unixnotis-action-bg-hover, alpha(@unixnotis-accent-2, 0.16));
+  border-color: alpha(@unixnotis-accent, 0.5);
+}
+
+.unixnotis-media-position {
+  color: @unixnotis-muted;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+}
+
+.unixnotis-media-card {
+  background-image: linear-gradient(165deg, @unixnotis-notification-bg-1, alpha(#0f1828, 0.94));
+  border-radius: 18px;
+  border: 1px solid @unixnotis-card-border;
+  padding: 8px 10px;
+  min-height: 68px;
+  box-shadow:
+    0 14px 26px -20px @unixnotis-shadow-strong,
+    0 0 22px -20px alpha(@unixnotis-accent-2, 0.16),
+    inset 0 0 0 1px alpha(#ffffff, 0.04);
+}
+
+.unixnotis-media-card-carousel {
+  padding: 8px 10px;
+  min-height: 68px;
+}
+
+.unixnotis-media-card-inline {
+  padding: 10px 12px;
+  min-height: 88px;
+}
+
+.unixnotis-media-card-stacked {
+  padding: 12px;
+  min-height: 108px;
+}
+
+.unixnotis-media-card-showcase {
+  padding: 10px 12px;
+  min-height: 92px;
+}
+
+.unixnotis-media-card.playing {
+  border-left: 1px solid @unixnotis-card-border;
+}
+
+.unixnotis-media-art {
+  min-width: 50px;
+  min-height: 50px;
+  border-radius: 12px;
+  background: alpha(#000000, 0.12);
+}
+
+.unixnotis-media-art-frame {
+  min-width: 54px;
+  min-height: 54px;
+  border-radius: 14px;
+  background: alpha(#000000, 0.12);
+  border: 1px solid alpha(@unixnotis-outline, 0.35);
+  box-shadow: inset 0 0 0 1px alpha(#ffffff, 0.04);
+}
+
+.unixnotis-media-art.empty {
+  background: alpha(#000000, 0.18);
+}
+
+.unixnotis-media-source {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: @unixnotis-muted;
+}
+
+.unixnotis-media-title {
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.unixnotis-marquee {
+  background: transparent;
+  padding: 0;
+  margin: 0;
+}
+
+.unixnotis-media-artist {
+  color: @unixnotis-muted;
+  font-size: 12px;
+}
+
+.unixnotis-media-artist.empty {
+  color: transparent;
+}
+
+.unixnotis-media-controls {
+  background: transparent;
+}
+
+.unixnotis-media-action-rail {
+  background: transparent;
+}
+
+.unixnotis-media-nav-strip {
+  background: transparent;
+}
+
+.unixnotis-media-button {
+  background-image: linear-gradient(160deg, @unixnotis-action-bg, alpha(@unixnotis-surface, 0.95));
+  border-radius: 10px;
+  border: 1px solid alpha(@unixnotis-accent, 0.2);
+  padding: 4px 6px;
+  box-shadow:
+    0 6px 14px -12px @unixnotis-shadow-soft,
+    0 0 14px -14px @unixnotis-glow-cyan;
+}
+
+.unixnotis-media-button:hover {
+  background-image: linear-gradient(160deg, @unixnotis-action-bg-hover, alpha(@unixnotis-accent-2, 0.2));
+  border-color: alpha(@unixnotis-accent, 0.5);
+}
+
+.unixnotis-media-button.primary {
+  background-image: linear-gradient(160deg, @unixnotis-action-bg-active, alpha(@unixnotis-accent-2, 0.28));
+  border-color: alpha(@unixnotis-accent, 0.75);
+}

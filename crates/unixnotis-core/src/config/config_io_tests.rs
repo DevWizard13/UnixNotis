@@ -99,3 +99,15 @@ fn config_dir_for_path_uses_parent_for_nested_path() {
         .expect("config dir");
     assert_eq!(dir, PathBuf::from("nested"));
 }
+
+#[test]
+fn resolve_theme_paths_from_includes_media_css() {
+    let config: Config =
+        toml::from_str("[theme]\nmedia_css = \"rice/media.css\"\n").expect("config should parse");
+    let base = PathBuf::from("/tmp/unixnotis-theme-paths");
+    let paths = config
+        .resolve_theme_paths_from(&base)
+        .expect("theme paths should resolve");
+
+    assert_eq!(paths.media_css, base.join("rice").join("media.css"));
+}

@@ -16,7 +16,12 @@ use super::CssKind;
 pub fn start_css_watcher(paths: &ThemePaths, kind: CssKind, on_reload: impl Fn() + Send + 'static) {
     let mut watched_dirs = HashSet::new();
     let css_paths = match kind {
-        CssKind::Panel => vec![&paths.base_css, &paths.panel_css, &paths.widgets_css],
+        CssKind::Panel => vec![
+            &paths.base_css,
+            &paths.panel_css,
+            &paths.widgets_css,
+            &paths.media_css,
+        ],
         CssKind::Popup => vec![&paths.base_css, &paths.popup_css],
     };
     for path in css_paths {

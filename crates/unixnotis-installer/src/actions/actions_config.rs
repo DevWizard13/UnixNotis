@@ -55,6 +55,7 @@ pub fn ensure_config(ctx: &mut ActionContext) -> Result<()> {
         ("panel.css", &theme_paths.panel_css),
         ("popup.css", &theme_paths.popup_css),
         ("widgets.css", &theme_paths.widgets_css),
+        ("media.css", &theme_paths.media_css),
     ];
 
     let pre_existing = theme_entries
@@ -137,6 +138,12 @@ pub fn reset_config(ctx: &mut ActionContext) -> Result<()> {
         "widgets.css",
         backup_dir.as_deref(),
     )?;
+    backup_existing_file(
+        ctx,
+        &theme_paths.media_css,
+        "media.css",
+        backup_dir.as_deref(),
+    )?;
 
     write_atomic(&theme_paths.base_css, unixnotis_core::DEFAULT_BASE_CSS)
         .with_context(|| "failed to write base.css")?;
@@ -149,6 +156,8 @@ pub fn reset_config(ctx: &mut ActionContext) -> Result<()> {
         unixnotis_core::DEFAULT_WIDGETS_CSS,
     )
     .with_context(|| "failed to write widgets.css")?;
+    write_atomic(&theme_paths.media_css, unixnotis_core::DEFAULT_MEDIA_CSS)
+        .with_context(|| "failed to write media.css")?;
 
     log_line(
         ctx,

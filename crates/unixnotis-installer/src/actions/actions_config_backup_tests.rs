@@ -84,12 +84,14 @@ base_css = "themes/custom/base.css"
 panel_css = "themes/custom/panel.css"
 popup_css = "themes/custom/popup.css"
 widgets_css = "themes/custom/widgets.css"
+media_css = "themes/custom/media.css"
 "#;
     fs::write(backup_dir.join("config.toml"), config_toml).expect("write config");
     fs::write(backup_dir.join("base.css"), "base").expect("write base");
     fs::write(backup_dir.join("panel.css"), "panel").expect("write panel");
     fs::write(backup_dir.join("popup.css"), "popup").expect("write popup");
     fs::write(backup_dir.join("widgets.css"), "widgets").expect("write widgets");
+    fs::write(backup_dir.join("media.css"), "media").expect("write media");
 
     // Restore path selection is driven through ActionContext just like runtime
     let detection = Detection {
@@ -109,17 +111,19 @@ widgets_css = "themes/custom/widgets.css"
 
     super::restore_config(&mut ctx).expect("restore should succeed");
 
-    // Restored config drives target resolution for all four theme files
+    // Restored config drives target resolution for every theme file
     let config_path = config_dir.join("config.toml");
     assert!(config_path.exists());
     let custom_base = config_dir.join("themes").join("custom").join("base.css");
     let custom_panel = config_dir.join("themes").join("custom").join("panel.css");
     let custom_popup = config_dir.join("themes").join("custom").join("popup.css");
     let custom_widgets = config_dir.join("themes").join("custom").join("widgets.css");
+    let custom_media = config_dir.join("themes").join("custom").join("media.css");
     assert!(custom_base.exists());
     assert!(custom_panel.exists());
     assert!(custom_popup.exists());
     assert!(custom_widgets.exists());
+    assert!(custom_media.exists());
 
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&root);
@@ -153,7 +157,7 @@ fn restore_config_skips_absolute_theme_targets() {
     let _ = fs::remove_file(&escaped_target);
 
     let config_toml = format!(
-        "[theme]\nbase_css = \"{}\"\npanel_css = \"panel.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\n",
+        "[theme]\nbase_css = \"{}\"\npanel_css = \"panel.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\nmedia_css = \"media.css\"\n",
         escaped_target.display()
     );
     fs::write(backup_dir.join("config.toml"), config_toml).expect("write config");
@@ -161,6 +165,7 @@ fn restore_config_skips_absolute_theme_targets() {
     fs::write(backup_dir.join("panel.css"), "panel").expect("write panel");
     fs::write(backup_dir.join("popup.css"), "popup").expect("write popup");
     fs::write(backup_dir.join("widgets.css"), "widgets").expect("write widgets");
+    fs::write(backup_dir.join("media.css"), "media").expect("write media");
 
     let detection = Detection {
         owner: None,
@@ -187,6 +192,7 @@ fn restore_config_skips_absolute_theme_targets() {
     assert!(config_dir.join("panel.css").exists());
     assert!(config_dir.join("popup.css").exists());
     assert!(config_dir.join("widgets.css").exists());
+    assert!(config_dir.join("media.css").exists());
 
     let _ = fs::remove_file(&escaped_target);
     let _ = fs::remove_dir_all(&root);

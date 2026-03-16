@@ -10,6 +10,8 @@ pub struct ThemeConfig {
     pub popup_css: String,
     pub panel_css: String,
     pub widgets_css: String,
+    /// Media widget theme layer loaded above widgets.css for layout-specific ricing.
+    pub media_css: String,
     /// Border thickness for cards and controls (pixels).
     pub border_width: u8,
     /// Corner radius for notification cards (pixels).
@@ -33,6 +35,7 @@ impl Default for ThemeConfig {
             popup_css: "popup.css".to_string(),
             panel_css: "panel.css".to_string(),
             widgets_css: "widgets.css".to_string(),
+            media_css: "media.css".to_string(),
             border_width: 1,
             // Matches the default card radius used by the bundled theme.
             card_radius: 22,
