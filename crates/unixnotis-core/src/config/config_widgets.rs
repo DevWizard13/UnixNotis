@@ -11,6 +11,8 @@ use super::config_commands;
 pub struct WidgetsConfig {
     pub volume: SliderWidgetConfig,
     pub brightness: SliderWidgetConfig,
+    /// Controls whether toggle buttons expose GTK tooltips on hover
+    pub toggle_tooltips: bool,
     pub toggles: Vec<ToggleWidgetConfig>,
     pub stats: Vec<StatWidgetConfig>,
     pub cards: Vec<CardWidgetConfig>,
@@ -23,6 +25,8 @@ impl Default for WidgetsConfig {
         Self {
             volume: SliderWidgetConfig::default_volume(),
             brightness: SliderWidgetConfig::default_brightness(),
+            // Tooltips stay off by default so hover does not add extra noise
+            toggle_tooltips: false,
             toggles: vec![
                 ToggleWidgetConfig::default_wifi(),
                 ToggleWidgetConfig::default_bluetooth(),

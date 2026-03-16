@@ -169,6 +169,41 @@ fn sanitize_normalizes_media_tokens() {
 }
 
 #[test]
+fn media_layout_and_metadata_flags_parse_cleanly() {
+    let mut config: Config = toml::from_str(
+        r#"
+        [media]
+        layout = "showcase"
+        show_source = false
+        show_position = false
+        "#,
+    )
+    .expect("config should parse");
+    sanitize_config(&mut config);
+
+    assert_eq!(
+        config.media.layout,
+        super::super::config_types::MediaLayout::Showcase
+    );
+    assert!(!config.media.show_source);
+    assert!(!config.media.show_position);
+}
+
+#[test]
+fn widget_toggle_tooltips_parse_cleanly() {
+    let mut config: Config = toml::from_str(
+        r#"
+        [widgets]
+        toggle_tooltips = true
+        "#,
+    )
+    .expect("config should parse");
+    sanitize_config(&mut config);
+
+    assert!(config.widgets.toggle_tooltips);
+}
+
+#[test]
 fn sanitize_clamps_alpha_and_theme_limits() {
     // Validate alpha values clamp to [0, 1] and fall back on non-finite inputs.
     let mut config = Config::default();
