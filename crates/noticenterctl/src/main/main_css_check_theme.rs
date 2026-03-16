@@ -160,7 +160,7 @@ fn collect_css_check_inputs_from(
     })
 }
 
-fn theme_targets(theme_paths: ThemePaths) -> [ThemeTarget; 4] {
+fn theme_targets(theme_paths: ThemePaths) -> [ThemeTarget; 5] {
     [
         ThemeTarget {
             slot_name: "base css",
@@ -182,11 +182,16 @@ fn theme_targets(theme_paths: ThemePaths) -> [ThemeTarget; 4] {
             config_key: "[theme].widgets_css",
             path: theme_paths.widgets_css,
         },
+        ThemeTarget {
+            slot_name: "media css",
+            config_key: "[theme].media_css",
+            path: theme_paths.media_css,
+        },
     ]
 }
 
 fn active_theme_summary(
-    targets: &[ThemeTarget; 4],
+    targets: &[ThemeTarget; 5],
     config_dir: &Path,
     display_root: &str,
 ) -> String {

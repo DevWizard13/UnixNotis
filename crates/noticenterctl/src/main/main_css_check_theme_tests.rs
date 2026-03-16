@@ -70,6 +70,11 @@ fn includes_active_targets_outside_config_root_and_skips_unused_css() {
         ".unixnotis-toggle { color: red; }",
     )
     .expect("write widgets.css");
+    fs::write(
+        config_dir.join("media.css"),
+        ".unixnotis-media-card { color: red; }",
+    )
+    .expect("write media.css");
     fs::write(&external_panel, ".unixnotis-panel { color: blue; }").expect("write external panel");
     fs::write(config_dir.join("unused.css"), ".unused { color: red; }").expect("write unused.css");
     root.write(
@@ -87,7 +92,7 @@ fn includes_active_targets_outside_config_root_and_skips_unused_css() {
     )
     .expect("inputs");
 
-    assert_eq!(inputs.files.len(), 4);
+    assert_eq!(inputs.files.len(), 5);
     assert!(inputs.files.iter().any(|path| path == &external_panel));
     assert!(inputs
         .info_lines
@@ -115,8 +120,12 @@ fn warns_when_theme_slots_share_one_file() {
         ".unixnotis-toggle { color: red; }",
     );
     root.write(
+        "xdg/unixnotis/media.css",
+        ".unixnotis-media-card { color: red; }",
+    );
+    root.write(
         "xdg/unixnotis/config.toml",
-        "[theme]\nbase_css = \"shared.css\"\npanel_css = \"shared.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\n",
+        "[theme]\nbase_css = \"shared.css\"\npanel_css = \"shared.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\nmedia_css = \"media.css\"\n",
     );
     root.write(
         "xdg/unixnotis/shared.css",
@@ -152,6 +161,10 @@ fn warns_when_configured_theme_target_is_missing() {
     root.write(
         "xdg/unixnotis/widgets.css",
         ".unixnotis-toggle { color: red; }",
+    );
+    root.write(
+        "xdg/unixnotis/media.css",
+        ".unixnotis-media-card { color: red; }",
     );
     root.write(
         "xdg/unixnotis/config.toml",
