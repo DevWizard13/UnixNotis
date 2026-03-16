@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use super::super::main_css_check_parse::{
     next_css_block, normalize_selector, should_recurse_at_rule, split_selectors, strip_css_comments,
 };
-use super::model::{GeometryModel, HorizontalEdges};
+use super::model::{is_tracked_class, GeometryModel, HorizontalEdges};
 use super::stock::known_unixnotis_classes;
 
 pub(super) fn collect_geometry_from_contents(
@@ -62,11 +62,6 @@ fn collect_geometry_selector(
     warnings: &mut Vec<String>,
     warned_classes: &mut HashSet<String>,
 ) {
-    // Keep selector matching strict so guessed width math does not drift from real widgets
-    let Some(class_name) = simple_class_selector(selector) else {
-        return;
-    };
-
     // Parse declarations once so both warning checks and width updates use the same view
     let properties = css_properties(block);
     if properties.is_empty() {
@@ -76,6 +71,21 @@ fn collect_geometry_selector(
     let has_horizontal_size_rules = properties
         .iter()
         .any(|(name, _)| is_horizontal_size_property(name));
+    let has_complex_width_driver_rules = properties
+        .iter()
+        .any(|(name, _)| is_complex_warning_property(name));
+    // Keep selector matching strict so guessed width math does not drift from real widgets
+    let Some(class_name) = simple_class_selector(selector) else {
+        // Complex tracked selectors are better warned than silently skipped
+        maybe_warn_for_complex_unixnotis_selector(
+            selector,
+            has_complex_width_driver_rules,
+            warnings,
+            warned_classes,
+        );
+        return;
+    };
+
     if has_horizontal_size_rules
         && class_name.starts_with(".unixnotis-")
         && !known_unixnotis_classes().contains(class_name)
@@ -99,6 +109,76 @@ fn collect_geometry_selector(
             target.apply_property(&name, &value);
         }
     }
+}
+
+fn maybe_warn_for_complex_unixnotis_selector(
+    selector: &str,
+    has_horizontal_size_rules: bool,
+    warnings: &mut Vec<String>,
+    warned_classes: &mut HashSet<String>,
+) {
+    if !has_horizontal_size_rules
+        || !is_compound_class_selector(selector)
+        || !selector_mentions_tracked_class(selector)
+    {
+        // Descendant GTK node selectors are noisy here and do not map cleanly to width math
+        return;
+    }
+
+    let warning_key = format!("complex:{selector}");
+    if !warned_classes.insert(warning_key) {
+        return;
+    }
+
+    warnings.push(format!(
+        "size rules target complex UnixNotis selector '{}'; geometry lint only models single-class selectors, so width pressure may be missed",
+        selector
+    ));
+}
+
+fn is_compound_class_selector(selector: &str) -> bool {
+    let trimmed = selector.trim();
+    // Only same-element class chains are warned here
+    trimmed.starts_with('.')
+        && trimmed.matches('.').count() > 1
+        && !trimmed.contains(' ')
+        && !trimmed.contains('>')
+        && !trimmed.contains('+')
+        && !trimmed.contains('~')
+        && !trimmed.contains(':')
+        && !trimmed.contains('[')
+        && !trimmed.contains('#')
+        && !trimmed.contains(',')
+}
+
+fn selector_mentions_tracked_class(selector: &str) -> bool {
+    let bytes = selector.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'.' {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            // Class scanning stops at the first non class-name byte
+            if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+                index += 1;
+            } else {
+                break;
+            }
+        }
+
+        if index > start + 1 && is_tracked_class(&selector[start..index]) {
+            // One tracked class is enough to make the selector relevant to geometry lint
+            return true;
+        }
+    }
+
+    false
 }
 
 fn css_properties(block: &str) -> Vec<(String, String)> {
@@ -165,6 +245,21 @@ fn is_horizontal_size_property(name: &str) -> bool {
             | "border-left-width"
             | "border-right"
             | "border-right-width"
+    )
+}
+
+fn is_complex_warning_property(name: &str) -> bool {
+    // Border-only tweaks are common state styling and usually do not drive row width by themselves
+    matches!(
+        name.trim(),
+        "width"
+            | "min-width"
+            | "margin"
+            | "margin-left"
+            | "margin-right"
+            | "padding"
+            | "padding-left"
+            | "padding-right"
     )
 }
 

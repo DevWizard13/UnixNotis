@@ -60,7 +60,8 @@ pub(super) fn lint_geometry_css_files(
 mod tests {
     use super::{collect_geometry_from_contents, GeometryModel};
     use unixnotis_core::{
-        Config, DEFAULT_BASE_CSS, DEFAULT_PANEL_CSS, DEFAULT_POPUP_CSS, DEFAULT_WIDGETS_CSS,
+        Config, MediaLayout, DEFAULT_BASE_CSS, DEFAULT_MEDIA_CSS, DEFAULT_PANEL_CSS,
+        DEFAULT_POPUP_CSS, DEFAULT_WIDGETS_CSS,
     };
 
     #[test]
@@ -110,6 +111,7 @@ mod tests {
             DEFAULT_PANEL_CSS,
             DEFAULT_POPUP_CSS,
             DEFAULT_WIDGETS_CSS,
+            DEFAULT_MEDIA_CSS,
         ] {
             let file_warnings = collect_geometry_from_contents(css, &mut model);
             assert!(file_warnings.is_empty(), "{file_warnings:?}");
@@ -127,6 +129,29 @@ mod tests {
             .unixnotis-panel { padding: 16px; }
             .unixnotis-media-nav { min-width: 30px; padding: 6px; border: 1px solid red; }
             .unixnotis-media-card { padding: 12px 16px; border: 1px solid red; }
+            .unixnotis-media-art-frame { min-width: 84px; padding: 4px; border: 1px solid red; }
+            .unixnotis-media-button { min-width: 34px; padding: 6px 8px; border: 1px solid red; }
+        "#;
+
+        let mut model = GeometryModel::default();
+        let file_warnings = collect_geometry_from_contents(css, &mut model);
+        assert!(file_warnings.is_empty());
+
+        let warnings = model.finalize_warnings(&config);
+        assert!(warnings.iter().any(|warning| warning.contains("media row")));
+    }
+
+    #[test]
+    fn warns_when_stacked_media_layout_outgrows_panel_budget() {
+        let mut config = Config::default();
+        config.panel.width = 340;
+        config.media.layout = MediaLayout::Stacked;
+        let css = r#"
+            .unixnotis-panel { padding: 16px; }
+            .unixnotis-media-card { padding: 12px 16px; border: 1px solid red; }
+            .unixnotis-media-main { padding: 0 18px; }
+            .unixnotis-media-meta { padding: 0 20px; }
+            .unixnotis-media-control-strip { padding: 0 14px; }
             .unixnotis-media-art-frame { min-width: 84px; padding: 4px; border: 1px solid red; }
             .unixnotis-media-button { min-width: 34px; padding: 6px 8px; border: 1px solid red; }
         "#;
@@ -167,5 +192,17 @@ mod tests {
         let warnings = collect_geometry_from_contents(css, &mut model);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("unknown UnixNotis class"));
+    }
+
+    #[test]
+    fn warns_for_complex_unixnotis_size_selector() {
+        let css = r#"
+            .unixnotis-media-button.primary { min-width: 44px; }
+        "#;
+
+        let mut model = GeometryModel::default();
+        let warnings = collect_geometry_from_contents(css, &mut model);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("complex UnixNotis selector"));
     }
 }

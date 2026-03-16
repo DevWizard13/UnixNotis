@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use unixnotis_core::{
-    Config, DEFAULT_BASE_CSS, DEFAULT_PANEL_CSS, DEFAULT_POPUP_CSS, DEFAULT_WIDGETS_CSS,
+    Config, DEFAULT_BASE_CSS, DEFAULT_MEDIA_CSS, DEFAULT_PANEL_CSS, DEFAULT_POPUP_CSS,
+    DEFAULT_WIDGETS_CSS,
 };
 
 use super::model::GeometryModel;
@@ -20,6 +21,7 @@ pub(super) fn known_unixnotis_classes() -> &'static HashSet<&'static str> {
             DEFAULT_PANEL_CSS,
             DEFAULT_POPUP_CSS,
             DEFAULT_WIDGETS_CSS,
+            DEFAULT_MEDIA_CSS,
         ] {
             collect_unixnotis_classes(css, &mut classes);
         }
@@ -43,6 +45,7 @@ pub(super) fn stock_geometry_model() -> &'static GeometryModel {
             DEFAULT_PANEL_CSS,
             DEFAULT_POPUP_CSS,
             DEFAULT_WIDGETS_CSS,
+            DEFAULT_MEDIA_CSS,
         ] {
             // The shipped theme is the baseline used to keep false positives low
             let _ = collect_geometry_from_contents(css, &mut model);

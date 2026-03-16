@@ -1,6 +1,6 @@
 //! Geometry model and width-pressure math for css-check
 
-use unixnotis_core::Config;
+use unixnotis_core::{Config, MediaLayout};
 
 use super::stock::{stock_config, stock_geometry_model};
 
@@ -19,10 +19,14 @@ const CARD_GRID_SPACING_PX: i32 = 8;
 const CARD_FALLBACK_CONTENT_WIDTH_PX: i32 = 104;
 
 const MEDIA_TEXT_WIDTH_FLOOR_PX: i32 = 140;
-const MEDIA_NON_TEXT_BUDGET_PX: i32 = 240;
+const MEDIA_CAROUSEL_TEXT_RESERVE_PX: i32 = 240;
+const MEDIA_INLINE_TEXT_RESERVE_PX: i32 = 196;
+const MEDIA_STACKED_TEXT_RESERVE_PX: i32 = 116;
+const MEDIA_SHOWCASE_TEXT_RESERVE_PX: i32 = 224;
 const MEDIA_ROW_SPACING_PX: i32 = 6;
 const MEDIA_CARD_CONTENT_SPACING_PX: i32 = 10;
 const MEDIA_CONTROL_BUTTON_SPACING_PX: i32 = 6;
+const MEDIA_ACTION_RAIL_SPACING_PX: i32 = 8;
 const MEDIA_NAV_FALLBACK_WIDTH_PX: i32 = 22;
 const MEDIA_ART_FALLBACK_WIDTH_PX: i32 = 50;
 const MEDIA_ART_FRAME_FALLBACK_WIDTH_PX: i32 = 54;
@@ -130,10 +134,15 @@ pub(super) struct GeometryModel {
     media_container: HorizontalBoxMetrics,
     media_stack: HorizontalBoxMetrics,
     media_row: HorizontalBoxMetrics,
+    media_main: HorizontalBoxMetrics,
+    media_meta: HorizontalBoxMetrics,
     media_nav: HorizontalBoxMetrics,
+    media_nav_strip: HorizontalBoxMetrics,
     media_card: HorizontalBoxMetrics,
     media_art: HorizontalBoxMetrics,
     media_art_frame: HorizontalBoxMetrics,
+    media_control_strip: HorizontalBoxMetrics,
+    media_action_rail: HorizontalBoxMetrics,
     media_controls: HorizontalBoxMetrics,
     media_button: HorizontalBoxMetrics,
 }
@@ -177,11 +186,28 @@ impl GeometryModel {
             ".unixnotis-info-card" => Some(&mut self.card_item),
             ".unixnotis-media-container" => Some(&mut self.media_container),
             ".unixnotis-media-stack" => Some(&mut self.media_stack),
+            ".unixnotis-media-stack-carousel" => Some(&mut self.media_stack),
+            ".unixnotis-media-stack-inline" => Some(&mut self.media_stack),
+            ".unixnotis-media-stack-stacked" => Some(&mut self.media_stack),
+            ".unixnotis-media-stack-showcase" => Some(&mut self.media_stack),
             ".unixnotis-media-row" => Some(&mut self.media_row),
+            ".unixnotis-media-row-carousel" => Some(&mut self.media_row),
+            ".unixnotis-media-row-inline" => Some(&mut self.media_row),
+            ".unixnotis-media-row-stacked" => Some(&mut self.media_row),
+            ".unixnotis-media-row-showcase" => Some(&mut self.media_row),
+            ".unixnotis-media-main" => Some(&mut self.media_main),
+            ".unixnotis-media-meta" => Some(&mut self.media_meta),
             ".unixnotis-media-nav" => Some(&mut self.media_nav),
+            ".unixnotis-media-nav-strip" => Some(&mut self.media_nav_strip),
             ".unixnotis-media-card" => Some(&mut self.media_card),
+            ".unixnotis-media-card-carousel" => Some(&mut self.media_card),
+            ".unixnotis-media-card-inline" => Some(&mut self.media_card),
+            ".unixnotis-media-card-stacked" => Some(&mut self.media_card),
+            ".unixnotis-media-card-showcase" => Some(&mut self.media_card),
             ".unixnotis-media-art" => Some(&mut self.media_art),
             ".unixnotis-media-art-frame" => Some(&mut self.media_art_frame),
+            ".unixnotis-media-control-strip" => Some(&mut self.media_control_strip),
+            ".unixnotis-media-action-rail" => Some(&mut self.media_action_rail),
             ".unixnotis-media-controls" => Some(&mut self.media_controls),
             ".unixnotis-media-button" => Some(&mut self.media_button),
             _ => None,
@@ -385,10 +411,11 @@ impl GeometryModel {
     }
 
     fn media_required_panel_width_px(&self, config: &Config) -> i32 {
-        let pressure = self.media_pressure_px(config.panel.width);
+        let pressure = self.media_pressure_px(config.panel.width, config.media.layout);
         let stock = stock_geometry_model();
         let stock_config = stock_config();
-        let stock_pressure = stock.media_pressure_px(stock_config.panel.width);
+        let stock_pressure =
+            stock.media_pressure_px(stock_config.panel.width, stock_config.media.layout);
 
         // The delta from stock is easier to reason about than an absolute guess
         stock_config.panel.width + (pressure - stock_pressure)
@@ -413,11 +440,15 @@ impl GeometryModel {
             + ((columns.saturating_sub(1)) as i32 * spacing_px)
     }
 
-    fn media_pressure_px(&self, panel_width_px: i32) -> i32 {
-        // The live media widget already reserves a fixed non-text budget
+    fn media_pressure_px(&self, panel_width_px: i32, layout: MediaLayout) -> i32 {
+        // Keep css-check aligned with the real text width reserve used by the widget builder
         let text_width_px = panel_width_px
-            .saturating_sub(MEDIA_NON_TEXT_BUDGET_PX)
+            .saturating_sub(media_text_reserve_px(layout))
             .max(MEDIA_TEXT_WIDTH_FLOOR_PX);
+        let meta_width_px = self
+            .media_meta
+            .outer_width_px(text_width_px)
+            .max(text_width_px);
 
         // Buttons and artwork are the parts most likely to widen the row
         let controls_width_px = self.media_controls.outer_insets_px()
@@ -426,24 +457,106 @@ impl GeometryModel {
                 .outer_width_px(MEDIA_BUTTON_FALLBACK_WIDTH_PX)
                 * 3)
             + (MEDIA_CONTROL_BUTTON_SPACING_PX * 2);
-        // Card width is frame + gap + text + gap + controls
-        let card_inner_width_px = self
+        let nav_pair_width_px =
+            (self.media_nav.outer_width_px(MEDIA_NAV_FALLBACK_WIDTH_PX) * 2) + MEDIA_ROW_SPACING_PX;
+        let text_row_width_px = self
             .media_art_frame
             .outer_width_px(MEDIA_ART_FRAME_FALLBACK_WIDTH_PX)
             + MEDIA_CARD_CONTENT_SPACING_PX
-            + text_width_px
-            + MEDIA_CARD_CONTENT_SPACING_PX
+            + meta_width_px;
+        let control_strip_width_px = self.media_control_strip.outer_insets_px()
+            + nav_pair_width_px
+            + MEDIA_ROW_SPACING_PX
             + controls_width_px;
+        let action_nav_width_px = self.media_nav_strip.outer_insets_px() + nav_pair_width_px;
+        let action_rail_width_px = self.media_action_rail.outer_insets_px()
+            + controls_width_px.max(action_nav_width_px)
+            + MEDIA_ACTION_RAIL_SPACING_PX;
+
+        // Each layout spends its fixed chrome differently, so keep the width math explicit
+        let card_inner_width_px = match layout {
+            MediaLayout::Carousel => {
+                text_row_width_px
+                    + MEDIA_CARD_CONTENT_SPACING_PX
+                    + controls_width_px
+                    + self.media_main.outer_insets_px()
+            }
+            MediaLayout::Inline | MediaLayout::Stacked => {
+                text_row_width_px.max(control_strip_width_px) + self.media_main.outer_insets_px()
+            }
+            MediaLayout::Showcase => {
+                text_row_width_px
+                    + MEDIA_CARD_CONTENT_SPACING_PX
+                    + action_rail_width_px
+                    + self.media_main.outer_insets_px()
+            }
+        };
         let card_outer_width_px = self.media_card.outer_width_px(card_inner_width_px);
 
-        // The full row also carries panel, container, stack, row, and nav button chrome
+        let external_nav_width_px = match layout {
+            MediaLayout::Carousel => nav_pair_width_px + MEDIA_ROW_SPACING_PX,
+            MediaLayout::Inline | MediaLayout::Stacked | MediaLayout::Showcase => 0,
+        };
+
+        // The full row also carries panel, container, stack, row, and any outer nav chrome
         self.panel.inner_insets_px()
             + self.media_container.outer_insets_px()
             + self.media_stack.outer_insets_px()
             + self.media_row.outer_insets_px()
             + card_outer_width_px
-            + (self.media_nav.outer_width_px(MEDIA_NAV_FALLBACK_WIDTH_PX) * 2)
-            + (MEDIA_ROW_SPACING_PX * 2)
+            + external_nav_width_px
+    }
+}
+
+pub(super) fn is_tracked_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        ".unixnotis-panel"
+            | ".unixnotis-toggle-section"
+            | ".unixnotis-toggle-grid"
+            | ".unixnotis-toggle"
+            | ".unixnotis-stat-section"
+            | ".unixnotis-stat-grid"
+            | ".unixnotis-stat-card"
+            | ".unixnotis-card-section"
+            | ".unixnotis-card-grid"
+            | ".unixnotis-info-card"
+            | ".unixnotis-media-container"
+            | ".unixnotis-media-stack"
+            | ".unixnotis-media-stack-carousel"
+            | ".unixnotis-media-stack-inline"
+            | ".unixnotis-media-stack-stacked"
+            | ".unixnotis-media-stack-showcase"
+            | ".unixnotis-media-row"
+            | ".unixnotis-media-row-carousel"
+            | ".unixnotis-media-row-inline"
+            | ".unixnotis-media-row-stacked"
+            | ".unixnotis-media-row-showcase"
+            | ".unixnotis-media-main"
+            | ".unixnotis-media-meta"
+            | ".unixnotis-media-nav"
+            | ".unixnotis-media-nav-strip"
+            | ".unixnotis-media-card"
+            | ".unixnotis-media-card-carousel"
+            | ".unixnotis-media-card-inline"
+            | ".unixnotis-media-card-stacked"
+            | ".unixnotis-media-card-showcase"
+            | ".unixnotis-media-art"
+            | ".unixnotis-media-art-frame"
+            | ".unixnotis-media-control-strip"
+            | ".unixnotis-media-action-rail"
+            | ".unixnotis-media-controls"
+            | ".unixnotis-media-button"
+    )
+}
+
+fn media_text_reserve_px(layout: MediaLayout) -> i32 {
+    // Keep these reserves in lockstep with ui/media_widget/layout.rs
+    match layout {
+        MediaLayout::Carousel => MEDIA_CAROUSEL_TEXT_RESERVE_PX,
+        MediaLayout::Inline => MEDIA_INLINE_TEXT_RESERVE_PX,
+        MediaLayout::Stacked => MEDIA_STACKED_TEXT_RESERVE_PX,
+        MediaLayout::Showcase => MEDIA_SHOWCASE_TEXT_RESERVE_PX,
     }
 }
 
