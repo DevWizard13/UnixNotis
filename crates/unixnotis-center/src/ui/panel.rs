@@ -1,5 +1,9 @@
 //! Panel layout and widget construction for the center window.
 
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+use std::time::Duration;
+
 use gtk::gdk;
 use gtk::gdk::prelude::*;
 use gtk::prelude::*;
@@ -33,6 +37,8 @@ pub struct PanelWidgets {
     pub dnd_toggle: gtk::ToggleButton,
     pub clear_button: gtk::Button,
     pub close_button: gtk::Button,
+    auto_height_lock: Rc<Cell<Option<i32>>>,
+    auto_height_lock_source: Rc<RefCell<Option<gtk::glib::SourceId>>>,
 }
 
 pub fn build_panel_widgets(app: &gtk::Application, config: &Config) -> PanelWidgets {
@@ -254,6 +260,8 @@ pub fn build_panel_widgets(app: &gtk::Application, config: &Config) -> PanelWidg
 
     window.set_child(Some(&root));
     window.set_visible(false);
+    let auto_height_lock = Rc::new(Cell::new(None));
+    let auto_height_lock_source = Rc::new(RefCell::new(None));
 
     PanelWidgets {
         window,
@@ -273,6 +281,8 @@ pub fn build_panel_widgets(app: &gtk::Application, config: &Config) -> PanelWidg
         dnd_toggle,
         clear_button,
         close_button,
+        auto_height_lock,
+        auto_height_lock_source,
     }
 }
 
@@ -429,6 +439,7 @@ fn apply_anchor(window: &impl IsA<gtk::Window>, anchor: Anchor, margin: Margins)
 }
 
 pub fn apply_panel_config(panel: &PanelWidgets, config: &Config, reserved: Option<Margins>) {
+    reset_auto_height_lock(panel);
     let monitor = if let Some(output) = config.panel.output.as_ref() {
         find_monitor(output).or_else(default_monitor)
     } else {
@@ -453,6 +464,73 @@ pub fn apply_panel_config(panel: &PanelWidgets, config: &Config, reserved: Optio
     panel.root.set_size_request(width, -1);
     panel.scroller.set_min_content_width(width);
     panel.scroller.set_max_content_width(width);
+}
+
+pub fn schedule_auto_height_lock(panel: &PanelWidgets, config: &Config) {
+    if config.panel.height > 0 {
+        return;
+    }
+    if panel.auto_height_lock.get().is_some() {
+        return;
+    }
+    if panel.auto_height_lock_source.borrow().is_some() {
+        return;
+    }
+
+    let window = panel.window.downgrade();
+    let root = panel.root.downgrade();
+    let auto_height_lock = panel.auto_height_lock.clone();
+    let auto_height_lock_source = panel.auto_height_lock_source.clone();
+    let attempts = Rc::new(Cell::new(0u8));
+    let attempts_tick = attempts.clone();
+    // Wait a few frames so GTK can settle the first natural allocation before locking it.
+    let source_id = gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
+        let Some(window) = window.upgrade() else {
+            auto_height_lock_source.borrow_mut().take();
+            return gtk::glib::ControlFlow::Break;
+        };
+        let Some(root) = root.upgrade() else {
+            auto_height_lock_source.borrow_mut().take();
+            return gtk::glib::ControlFlow::Break;
+        };
+        if !window.is_visible() {
+            auto_height_lock_source.borrow_mut().take();
+            return gtk::glib::ControlFlow::Break;
+        }
+
+        if let Some(height) =
+            auto_height_candidate(window.allocated_height(), root.allocated_height())
+        {
+            let width = root.width_request().max(1);
+            // Once an auto height is captured, keep it stable until config is reapplied.
+            auto_height_lock.set(Some(height));
+            window.set_default_size(width, height);
+            window.set_size_request(width, height);
+            auto_height_lock_source.borrow_mut().take();
+            return gtk::glib::ControlFlow::Break;
+        }
+
+        attempts_tick.set(attempts_tick.get().saturating_add(1));
+        if attempts_tick.get() >= 8 {
+            auto_height_lock_source.borrow_mut().take();
+            return gtk::glib::ControlFlow::Break;
+        }
+        gtk::glib::ControlFlow::Continue
+    });
+    *panel.auto_height_lock_source.borrow_mut() = Some(source_id);
+}
+
+fn reset_auto_height_lock(panel: &PanelWidgets) {
+    if let Some(source_id) = panel.auto_height_lock_source.borrow_mut().take() {
+        source_id.remove();
+    }
+    panel.auto_height_lock.set(None);
+}
+
+fn auto_height_candidate(window_height: i32, root_height: i32) -> Option<i32> {
+    let height = window_height.max(root_height);
+    // Tiny allocations happen before the first real GTK layout pass and should not be frozen.
+    (height > 1).then_some(height)
 }
 
 fn map_keyboard_mode(mode: PanelKeyboardInteractivity) -> KeyboardMode {
@@ -515,4 +593,22 @@ fn monitor_matches_output(monitor: &gdk::Monitor, output: &str) -> bool {
     };
 
     !joined.is_empty() && joined.eq_ignore_ascii_case(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_height_candidate;
+
+    #[test]
+    fn auto_height_candidate_ignores_placeholder_allocations() {
+        assert_eq!(auto_height_candidate(0, 0), None);
+        assert_eq!(auto_height_candidate(1, 1), None);
+        assert_eq!(auto_height_candidate(1, 0), None);
+    }
+
+    #[test]
+    fn auto_height_candidate_uses_larger_real_allocation() {
+        assert_eq!(auto_height_candidate(320, 280), Some(320));
+        assert_eq!(auto_height_candidate(240, 288), Some(288));
+    }
 }
