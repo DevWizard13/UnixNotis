@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 // Center runtime keeps side panels at or above this width
 pub const PANEL_RUNTIME_WIDTH_MIN: i32 = 260;
+// Panel height is configured as a percent of usable monitor height by default
+pub const PANEL_HEIGHT_PERCENT_DEFAULT: i32 = 84;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -43,7 +45,10 @@ pub struct PanelConfig {
     pub anchor: Anchor,
     pub margin: Margins,
     pub width: i32,
+    /// Vertical size as a percent of usable monitor height.
     pub height: i32,
+    /// Exact pixel height override for advanced layouts.
+    pub height_override: Option<i32>,
     pub keyboard_interactivity: PanelKeyboardInteractivity,
     pub output: Option<String>,
     /// Text shown when the notification list is empty.
@@ -71,7 +76,8 @@ impl Default for PanelConfig {
                 left: 10,
             },
             width: 420,
-            height: 0,
+            height: PANEL_HEIGHT_PERCENT_DEFAULT,
+            height_override: None,
             keyboard_interactivity: PanelKeyboardInteractivity::OnDemand,
             output: None,
             empty_text: "NO NOTIFICATIONS".to_string(),

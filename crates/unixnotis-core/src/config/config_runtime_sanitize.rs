@@ -1,6 +1,8 @@
 //! Runtime sanitization and validation for configuration values.
 
-use super::{Config, PanelConfig, PopupConfig, ThemeConfig, WidgetPluginConfig};
+use super::{
+    Config, PanelConfig, PopupConfig, ThemeConfig, WidgetPluginConfig, PANEL_HEIGHT_PERCENT_DEFAULT,
+};
 use crate::{program_in_path, util};
 use tracing::warn;
 
@@ -8,6 +10,7 @@ const MIN_REFRESH_MS: u64 = 100;
 const MAX_REFRESH_MS: u64 = 60_000;
 const MAX_REFRESH_SLOW_MS: u64 = 120_000;
 const MAX_PANEL_WIDTH: i32 = 4096;
+const MAX_PANEL_HEIGHT_PERCENT: i32 = 100;
 const MAX_PANEL_HEIGHT: i32 = 4096;
 const MAX_POPUP_WIDTH: i32 = 2048;
 const MAX_SPACING: i32 = 256;
@@ -45,16 +48,21 @@ pub(super) fn sanitize_config(config: &mut Config) {
     config.widgets.refresh_interval_ms = fast;
     config.widgets.refresh_interval_slow_ms = slow;
 
-    // Normalize panel sizing; keep height 0 as "auto".
+    // Normalize panel sizing
     if config.panel.width <= 0 {
         config.panel.width = PanelConfig::default().width;
     }
     config.panel.width = config.panel.width.clamp(1, MAX_PANEL_WIDTH);
-    if config.panel.height < 0 {
-        config.panel.height = 0;
+    if config.panel.height <= 0 {
+        config.panel.height = PANEL_HEIGHT_PERCENT_DEFAULT;
     }
-    if config.panel.height > 0 {
-        config.panel.height = config.panel.height.clamp(1, MAX_PANEL_HEIGHT);
+    config.panel.height = config.panel.height.clamp(1, MAX_PANEL_HEIGHT_PERCENT);
+    if let Some(height_override) = config.panel.height_override {
+        if height_override <= 0 {
+            config.panel.height_override = None;
+        } else {
+            config.panel.height_override = Some(height_override.clamp(1, MAX_PANEL_HEIGHT));
+        }
     }
 
     // Normalize popup sizing and spacing.

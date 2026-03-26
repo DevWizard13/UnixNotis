@@ -143,8 +143,6 @@ impl UiState {
             // Run the first widget pass after the window is visible
             // This avoids leaving plugin-backed stats on the n/a placeholder until a later tick
             self.refresh_widgets(true);
-            // Auto-height panels lock after the first settled allocation so later content churn cannot resize them.
-            super::panel::schedule_auto_height_lock(&self.panel, &self.config);
             self.start_refresh_timer();
             let width = self.panel.window.allocated_width();
             let height = self.panel.window.allocated_height();

@@ -71,27 +71,31 @@ fn sanitize_clamps_refresh_intervals_and_preserves_ordering() {
 
 #[test]
 fn sanitize_clamps_panel_and_popup_sizes() {
-    // Validate default sizing is restored when invalid or negative inputs are provided.
+    // Validate default sizing is restored when invalid or negative inputs are provided
     let mut config = Config::default();
     config.panel.width = 0;
     config.panel.height = -8;
+    config.panel.height_override = Some(-4);
     config.popups.width = -10;
     config.popups.spacing = -3;
     sanitize_config(&mut config);
     assert_eq!(config.panel.width, PanelConfig::default().width);
-    assert_eq!(config.panel.height, 0);
+    assert_eq!(config.panel.height, PanelConfig::default().height);
+    assert_eq!(config.panel.height_override, None);
     assert_eq!(config.popups.width, PopupConfig::default().width);
     assert_eq!(config.popups.spacing, 0);
 
-    // Validate size limits are enforced for oversized values.
+    // Validate size limits are enforced for oversized values
     let mut config = Config::default();
     config.panel.width = MAX_PANEL_WIDTH + 25;
-    config.panel.height = MAX_PANEL_HEIGHT + 40;
+    config.panel.height = MAX_PANEL_HEIGHT_PERCENT + 40;
+    config.panel.height_override = Some(MAX_PANEL_HEIGHT + 40);
     config.popups.width = MAX_POPUP_WIDTH + 30;
     config.popups.spacing = MAX_SPACING + 12;
     sanitize_config(&mut config);
     assert_eq!(config.panel.width, MAX_PANEL_WIDTH);
-    assert_eq!(config.panel.height, MAX_PANEL_HEIGHT);
+    assert_eq!(config.panel.height, MAX_PANEL_HEIGHT_PERCENT);
+    assert_eq!(config.panel.height_override, Some(MAX_PANEL_HEIGHT));
     assert_eq!(config.popups.width, MAX_POPUP_WIDTH);
     assert_eq!(config.popups.spacing, MAX_SPACING);
 }

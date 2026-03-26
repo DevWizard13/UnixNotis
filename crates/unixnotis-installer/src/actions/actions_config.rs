@@ -35,8 +35,7 @@ pub fn ensure_config(ctx: &mut ActionContext) -> Result<()> {
         );
     } else {
         // Write a default config.toml when missing so users have a base to edit.
-        let config_toml =
-            toml::to_string_pretty(&config).map_err(|err| anyhow!(err.to_string()))?;
+        let config_toml = render_default_config_toml(&config)?;
         write_atomic(&config_path, &config_toml).with_context(|| "failed to write config.toml")?;
         log_line(
             ctx,
@@ -98,7 +97,7 @@ pub fn reset_config(ctx: &mut ActionContext) -> Result<()> {
     // Preserve existing config before overwriting so customizations are recoverable.
     backup_existing_file(ctx, &config_path, "config.toml", backup_dir.as_deref())?;
 
-    let config_toml = toml::to_string_pretty(&config).map_err(|err| anyhow!(err.to_string()))?;
+    let config_toml = render_default_config_toml(&config)?;
     write_atomic(&config_path, &config_toml).with_context(|| "failed to write config.toml")?;
 
     log_line(
@@ -165,6 +164,27 @@ pub fn reset_config(ctx: &mut ActionContext) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn render_default_config_toml(config: &Config) -> Result<String> {
+    let mut config_toml = toml::to_string_pretty(config).map_err(|err| anyhow!(err.to_string()))?;
+    let panel_height_line = format!("height = {}\n", config.panel.height);
+    let panel_height_block = format!(
+        "# Vertical size as a percent of usable monitor height after margins\n\
+# and reserved work area\n\
+height = {}\n\
+\n\
+# Exact pixel height override for advanced users\n\
+# height_override = 1487\n",
+        config.panel.height
+    );
+
+    if !config_toml.contains(&panel_height_line) {
+        return Err(anyhow!("default config template missing panel height line"));
+    }
+
+    config_toml = config_toml.replacen(&panel_height_line, &panel_height_block, 1);
+    Ok(config_toml)
 }
 
 pub fn remove_state(ctx: &mut ActionContext) -> Result<()> {

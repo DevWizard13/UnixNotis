@@ -107,10 +107,6 @@ impl UiState {
     fn finish_reload_runtime(&mut self, config: &Config) {
         // Refresh timers may need new intervals even when widget structure is unchanged
         self.restart_refresh_timer();
-        if self.panel_visible {
-            // Live reload should settle to one new auto height and then stay fixed again.
-            panel::schedule_auto_height_lock(&self.panel, config);
-        }
         if config.panel.respect_work_area {
             self.work_area = None;
             // Work area is refreshed after reload so compositor margins can update one more time

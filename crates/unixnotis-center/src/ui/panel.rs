@@ -1,9 +1,5 @@
 //! Panel layout and widget construction for the center window.
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
-use std::time::Duration;
-
 use gtk::gdk;
 use gtk::gdk::prelude::*;
 use gtk::prelude::*;
@@ -37,8 +33,6 @@ pub struct PanelWidgets {
     pub dnd_toggle: gtk::ToggleButton,
     pub clear_button: gtk::Button,
     pub close_button: gtk::Button,
-    auto_height_lock: Rc<Cell<Option<i32>>>,
-    auto_height_lock_source: Rc<RefCell<Option<gtk::glib::SourceId>>>,
 }
 
 pub fn build_panel_widgets(app: &gtk::Application, config: &Config) -> PanelWidgets {
@@ -260,8 +254,6 @@ pub fn build_panel_widgets(app: &gtk::Application, config: &Config) -> PanelWidg
 
     window.set_child(Some(&root));
     window.set_visible(false);
-    let auto_height_lock = Rc::new(Cell::new(None));
-    let auto_height_lock_source = Rc::new(RefCell::new(None));
 
     PanelWidgets {
         window,
@@ -281,8 +273,6 @@ pub fn build_panel_widgets(app: &gtk::Application, config: &Config) -> PanelWidg
         dnd_toggle,
         clear_button,
         close_button,
-        auto_height_lock,
-        auto_height_lock_source,
     }
 }
 
@@ -291,18 +281,10 @@ fn resolve_panel_size(
     monitor: Option<&gdk::Monitor>,
     reserved: Option<Margins>,
 ) -> (i32, i32) {
-    // Width is constrained by monitor geometry so defaults stay usable on laptops.
+    // Width is constrained by monitor geometry so defaults stay usable on laptops
     let width = resolve_panel_width(config, monitor);
-    if config.panel.height > 0 {
-        return (width, config.panel.height);
-    }
-    if matches!(config.panel.anchor, Anchor::Left | Anchor::Right) {
-        if let Some(height) = compute_side_panel_height(config, monitor, reserved) {
-            return (width, height);
-        }
-    }
-    // Natural height keeps top or bottom anchored panels compact when no explicit size is set.
-    (width, -1)
+    let height = resolve_panel_height(config, monitor, reserved).unwrap_or(-1);
+    (width, height)
 }
 
 fn resolve_panel_width(config: &Config, monitor: Option<&gdk::Monitor>) -> i32 {
@@ -323,39 +305,46 @@ fn resolve_panel_width(config: &Config, monitor: Option<&gdk::Monitor>) -> i32 {
     requested.min(bounded_cap).max(1)
 }
 
-fn compute_side_panel_height(
+fn resolve_panel_height(
     config: &Config,
     monitor: Option<&gdk::Monitor>,
     reserved: Option<Margins>,
 ) -> Option<i32> {
-    if !matches!(config.panel.anchor, Anchor::Left | Anchor::Right) {
-        return None;
+    let usable_height = usable_panel_height(config, monitor, reserved);
+    if let Some(height_override) = config.panel.height_override {
+        // Pixel override is still bounded by the current monitor work area
+        return Some(
+            usable_height
+                .map(|usable| height_override.min(usable))
+                .unwrap_or(height_override)
+                .max(1),
+        );
     }
-
-    let monitor = monitor?;
-    let geometry = monitor.geometry();
-    let mut work_area = geometry.height() - (config.panel.margin.top + config.panel.margin.bottom);
-    if config.panel.respect_work_area {
-        if let Some(reserved) = reserved {
-            work_area -= reserved.top + reserved.bottom;
-        }
-    }
-    if work_area <= 0 {
-        return None;
-    }
-
-    let bottom_pad = dynamic_bottom_pad(work_area);
-    let max_height = (work_area - bottom_pad).max(1);
-
-    // Use the available work area minus a proportional bottom gap.
-    Some(max_height)
+    let usable_height = usable_height?;
+    Some(height_from_percent(usable_height, config.panel.height))
 }
 
-fn dynamic_bottom_pad(work_area: i32) -> i32 {
-    // Reserve a larger proportional gap so side panels do not feel full-height on laptops.
-    let scaled = ((work_area as f32) * 0.16).round() as i32;
-    // Clamp provides guard rails so extreme screen sizes still keep a reasonable gap.
-    scaled.clamp(48, 220)
+fn usable_panel_height(
+    config: &Config,
+    monitor: Option<&gdk::Monitor>,
+    reserved: Option<Margins>,
+) -> Option<i32> {
+    let monitor = monitor?;
+    let geometry = monitor.geometry();
+    let mut usable = geometry.height() - (config.panel.margin.top + config.panel.margin.bottom);
+    if config.panel.respect_work_area {
+        if let Some(reserved) = reserved {
+            usable -= reserved.top + reserved.bottom;
+        }
+    }
+    (usable > 0).then_some(usable)
+}
+
+fn height_from_percent(usable_height: i32, percent: i32) -> i32 {
+    let usable_height = usable_height.max(1);
+    let percent = percent.clamp(1, 100);
+    let scaled = (i64::from(usable_height) * i64::from(percent) + 50) / 100;
+    i32::try_from(scaled).unwrap_or(i32::MAX).max(1)
 }
 
 fn default_monitor() -> Option<gdk::Monitor> {
@@ -439,7 +428,6 @@ fn apply_anchor(window: &impl IsA<gtk::Window>, anchor: Anchor, margin: Margins)
 }
 
 pub fn apply_panel_config(panel: &PanelWidgets, config: &Config, reserved: Option<Margins>) {
-    reset_auto_height_lock(panel);
     let monitor = if let Some(output) = config.panel.output.as_ref() {
         find_monitor(output).or_else(default_monitor)
     } else {
@@ -464,73 +452,6 @@ pub fn apply_panel_config(panel: &PanelWidgets, config: &Config, reserved: Optio
     panel.root.set_size_request(width, -1);
     panel.scroller.set_min_content_width(width);
     panel.scroller.set_max_content_width(width);
-}
-
-pub fn schedule_auto_height_lock(panel: &PanelWidgets, config: &Config) {
-    if config.panel.height > 0 {
-        return;
-    }
-    if panel.auto_height_lock.get().is_some() {
-        return;
-    }
-    if panel.auto_height_lock_source.borrow().is_some() {
-        return;
-    }
-
-    let window = panel.window.downgrade();
-    let root = panel.root.downgrade();
-    let auto_height_lock = panel.auto_height_lock.clone();
-    let auto_height_lock_source = panel.auto_height_lock_source.clone();
-    let attempts = Rc::new(Cell::new(0u8));
-    let attempts_tick = attempts.clone();
-    // Wait a few frames so GTK can settle the first natural allocation before locking it.
-    let source_id = gtk::glib::timeout_add_local(Duration::from_millis(16), move || {
-        let Some(window) = window.upgrade() else {
-            auto_height_lock_source.borrow_mut().take();
-            return gtk::glib::ControlFlow::Break;
-        };
-        let Some(root) = root.upgrade() else {
-            auto_height_lock_source.borrow_mut().take();
-            return gtk::glib::ControlFlow::Break;
-        };
-        if !window.is_visible() {
-            auto_height_lock_source.borrow_mut().take();
-            return gtk::glib::ControlFlow::Break;
-        }
-
-        if let Some(height) =
-            auto_height_candidate(window.allocated_height(), root.allocated_height())
-        {
-            let width = root.width_request().max(1);
-            // Once an auto height is captured, keep it stable until config is reapplied.
-            auto_height_lock.set(Some(height));
-            window.set_default_size(width, height);
-            window.set_size_request(width, height);
-            auto_height_lock_source.borrow_mut().take();
-            return gtk::glib::ControlFlow::Break;
-        }
-
-        attempts_tick.set(attempts_tick.get().saturating_add(1));
-        if attempts_tick.get() >= 8 {
-            auto_height_lock_source.borrow_mut().take();
-            return gtk::glib::ControlFlow::Break;
-        }
-        gtk::glib::ControlFlow::Continue
-    });
-    *panel.auto_height_lock_source.borrow_mut() = Some(source_id);
-}
-
-fn reset_auto_height_lock(panel: &PanelWidgets) {
-    if let Some(source_id) = panel.auto_height_lock_source.borrow_mut().take() {
-        source_id.remove();
-    }
-    panel.auto_height_lock.set(None);
-}
-
-fn auto_height_candidate(window_height: i32, root_height: i32) -> Option<i32> {
-    let height = window_height.max(root_height);
-    // Tiny allocations happen before the first real GTK layout pass and should not be frozen.
-    (height > 1).then_some(height)
 }
 
 fn map_keyboard_mode(mode: PanelKeyboardInteractivity) -> KeyboardMode {
@@ -597,18 +518,17 @@ fn monitor_matches_output(monitor: &gdk::Monitor, output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::auto_height_candidate;
+    use super::height_from_percent;
 
     #[test]
-    fn auto_height_candidate_ignores_placeholder_allocations() {
-        assert_eq!(auto_height_candidate(0, 0), None);
-        assert_eq!(auto_height_candidate(1, 1), None);
-        assert_eq!(auto_height_candidate(1, 0), None);
+    fn height_from_percent_scales_usable_height() {
+        assert_eq!(height_from_percent(1000, 84), 840);
+        assert_eq!(height_from_percent(701, 84), 589);
     }
 
     #[test]
-    fn auto_height_candidate_uses_larger_real_allocation() {
-        assert_eq!(auto_height_candidate(320, 280), Some(320));
-        assert_eq!(auto_height_candidate(240, 288), Some(288));
+    fn height_from_percent_keeps_a_positive_floor() {
+        assert_eq!(height_from_percent(1, 1), 1);
+        assert_eq!(height_from_percent(40, 1), 1);
     }
 }

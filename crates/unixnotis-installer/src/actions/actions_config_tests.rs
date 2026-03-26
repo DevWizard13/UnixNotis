@@ -1,7 +1,8 @@
-use super::{format_with_state_env, remove_state_file, DND_STATE_FILE};
+use super::{format_with_state_env, remove_state_file, render_default_config_toml, DND_STATE_FILE};
 use std::fs;
 use std::path::PathBuf;
 use unixnotis_core::util;
+use unixnotis_core::Config;
 
 #[test]
 fn resolve_state_dir_prefers_xdg_state_home() {
@@ -90,4 +91,15 @@ fn format_with_state_env_uses_xdg_state_home_prefix() {
         Some(value) => std::env::set_var(key, value),
         None => std::env::remove_var(key),
     }
+}
+
+#[test]
+fn default_config_template_documents_panel_height_modes() {
+    let config_toml = render_default_config_toml(&Config::default()).expect("render config");
+    assert!(config_toml.contains("# Vertical size as a percent of usable monitor height"));
+    assert!(config_toml.contains("height = 84"));
+    assert!(config_toml.contains("# height_override = 1487"));
+    assert!(!config_toml
+        .lines()
+        .any(|line| line.trim() == "height_override = 1487"));
 }
