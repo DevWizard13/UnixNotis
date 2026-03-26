@@ -1,6 +1,9 @@
 use unixnotis_core::MediaLayout;
 
 const MEDIA_TEXT_WIDTH_FLOOR_PX: i32 = 140;
+// Panel width is measured on the outer surface, but media lives inside the panel body
+// Default panel padding plus a little border slack needs to be removed first
+const PANEL_SURFACE_HORIZONTAL_CHROME_PX: i32 = 36;
 // Carousel keeps the widest fixed chrome because nav lives outside the card
 const CAROUSEL_TEXT_RESERVE_PX: i32 = 240;
 // Inline pulls nav into the card and frees some title space
@@ -40,6 +43,13 @@ pub(super) fn card_layout_class(layout: MediaLayout) -> &'static str {
     }
 }
 
+pub(super) fn media_content_width(panel_width: i32) -> i32 {
+    panel_width
+        .saturating_sub(PANEL_SURFACE_HORIZONTAL_CHROME_PX)
+        // Tiny or invalid widths still need a positive allocation target
+        .max(1)
+}
+
 pub(super) fn marquee_width_for_layout(layout: MediaLayout, panel_width: i32) -> i32 {
     // Each preset spends panel width differently, so keep one reserve budget per layout
     let reserve_px = match layout {
@@ -48,7 +58,7 @@ pub(super) fn marquee_width_for_layout(layout: MediaLayout, panel_width: i32) ->
         MediaLayout::Stacked => STACKED_TEXT_RESERVE_PX,
         MediaLayout::Showcase => SHOWCASE_TEXT_RESERVE_PX,
     };
-    panel_width
+    media_content_width(panel_width)
         .saturating_sub(reserve_px)
         // Tiny panel widths still keep a minimum readable title lane
         .max(MEDIA_TEXT_WIDTH_FLOOR_PX)

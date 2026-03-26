@@ -1,6 +1,6 @@
 use unixnotis_core::MediaLayout;
 
-use super::{card_height_for_layout, marquee_width_for_layout};
+use super::{card_height_for_layout, marquee_width_for_layout, media_content_width};
 
 #[test]
 fn media_layout_reserve_budgets_stay_ordered() {
@@ -35,4 +35,18 @@ fn marquee_width_never_drops_below_floor() {
     ] {
         assert_eq!(marquee_width_for_layout(layout, 80), 140);
     }
+}
+
+#[test]
+fn media_content_width_reserves_panel_surface_chrome() {
+    assert_eq!(media_content_width(420), 384);
+    assert_eq!(media_content_width(20), 1);
+}
+
+#[test]
+fn marquee_width_uses_inner_panel_width_budget() {
+    assert_eq!(marquee_width_for_layout(MediaLayout::Carousel, 420), 144);
+    assert_eq!(marquee_width_for_layout(MediaLayout::Inline, 420), 188);
+    assert_eq!(marquee_width_for_layout(MediaLayout::Stacked, 420), 268);
+    assert_eq!(marquee_width_for_layout(MediaLayout::Showcase, 420), 160);
 }

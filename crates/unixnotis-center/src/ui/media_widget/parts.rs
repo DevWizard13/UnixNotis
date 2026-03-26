@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::Align;
+use gtk::{Align, Overflow};
 
 use crate::media::MediaHandle;
 
@@ -115,6 +115,7 @@ fn build_art_picture() -> gtk::Picture {
     art.set_vexpand(false);
     art.set_halign(Align::Center);
     art.set_valign(Align::Center);
+    art.set_overflow(Overflow::Hidden);
     art.set_visible(false);
     art
 }
@@ -128,6 +129,7 @@ fn build_art_frame(art: &gtk::Picture) -> gtk::Box {
     art_frame.set_vexpand(false);
     art_frame.set_halign(Align::Center);
     art_frame.set_valign(Align::Center);
+    art_frame.set_overflow(Overflow::Hidden);
     art_frame.append(art);
     art_frame
 }

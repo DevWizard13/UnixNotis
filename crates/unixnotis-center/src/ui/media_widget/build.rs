@@ -2,15 +2,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk::prelude::*;
-use gtk::Align;
+use gtk::{Align, Overflow};
 use unixnotis_core::{MediaConfig, MediaLayout};
 
 use crate::media::MediaHandle;
 
 use super::card::MediaCardWidgets;
 use super::layout::{
-    card_height_for_layout, card_layout_class, marquee_width_for_layout, row_layout_class,
-    stack_layout_class,
+    card_height_for_layout, card_layout_class, marquee_width_for_layout, media_content_width,
+    row_layout_class, stack_layout_class,
 };
 use super::parts::{build_media_card_parts, MediaCardLayoutParts};
 use super::selection::MediaSelection;
@@ -28,17 +28,24 @@ pub(super) fn build_media_widget(
     panel_width: i32,
     config: &MediaConfig,
 ) -> MediaWidgetParts {
+    let content_width = media_content_width(panel_width);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
     root.add_css_class("unixnotis-media-stack");
     root.add_css_class(stack_layout_class(config.layout));
+    root.set_size_request(content_width, -1);
+    root.set_hexpand(true);
+    root.set_halign(Align::Fill);
+    root.set_overflow(Overflow::Hidden);
     root.set_visible(false);
 
     let row = gtk::Box::new(row_orientation(config.layout), 6);
     row.add_css_class("unixnotis-media-row");
     row.add_css_class(row_layout_class(config.layout));
+    row.set_size_request(content_width, -1);
     row.set_hexpand(true);
     row.set_halign(Align::Fill);
     row.set_valign(Align::Center);
+    row.set_overflow(Overflow::Hidden);
 
     let nav_prev = build_navigation_button("<");
     let nav_next = build_navigation_button(">");

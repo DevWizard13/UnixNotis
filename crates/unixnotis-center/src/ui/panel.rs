@@ -199,6 +199,8 @@ pub fn build_panel_widgets(app: &gtk::Application, config: &Config) -> PanelWidg
 
     let media_container = gtk::Box::new(gtk::Orientation::Vertical, 8);
     media_container.add_css_class("unixnotis-media-container");
+    media_container.set_hexpand(true);
+    media_container.set_halign(Align::Fill);
 
     let quick_controls = gtk::Box::new(gtk::Orientation::Vertical, 10);
     quick_controls.add_css_class("unixnotis-quick-controls");
