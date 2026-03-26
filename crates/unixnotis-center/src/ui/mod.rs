@@ -17,6 +17,7 @@ use crate::dbus::{UiCommand, UiEvent};
 use unixnotis_ui::css::CssManager;
 
 mod config;
+mod config_media;
 mod events;
 mod hyprland;
 mod icons;

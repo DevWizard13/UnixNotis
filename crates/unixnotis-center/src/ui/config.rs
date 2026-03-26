@@ -3,61 +3,96 @@
 //! Keeps dynamic configuration changes isolated from event handling and
 //! visibility logic.
 
-use gtk::prelude::*;
 use tracing::debug;
-use unixnotis_core::{Config, PanelDebugLevel};
+use unixnotis_core::{Config, PanelDebugLevel, ThemePaths};
 
 use super::list;
 use super::widget_builders::{build_extra_widgets, build_quick_controls, clear_container};
-use super::{media_widget, panel, UiState};
+use super::{panel, UiState};
+
+struct ReloadInputs {
+    config: Config,
+    theme_paths: ThemePaths,
+}
 
 impl UiState {
     pub(super) fn reload_config(&mut self) {
-        let widgets_before = self.config.widgets.clone();
+        let Some(reload) = self.load_reload_inputs() else {
+            return;
+        };
+        let widgets_changed = self.config.widgets != reload.config.widgets;
+
+        // Store the new config early so shared helpers see one consistent state
+        self.config = reload.config.clone();
+        debug!("config reloaded");
+
+        self.apply_reloaded_theme(&reload);
+        self.apply_reloaded_panel(&reload.config);
+        // Media depends on panel geometry, so it needs the new width before widgets rebuild
+        self.apply_media_config(&reload.config);
+        self.apply_widget_sections_after_reload(&reload.config, widgets_changed);
+        self.apply_list_config_after_reload(&reload.config);
+        self.finish_reload_runtime(&reload.config);
+    }
+
+    fn load_reload_inputs(&self) -> Option<ReloadInputs> {
         let config = match Config::load_from_path(&self.config_path) {
             Ok(config) => config,
             Err(err) => {
-                // Failed reload keeps the previous config to avoid half-applied state.
+                // Reload failures keep the old state so the live panel stays usable
                 tracing::warn!(?err, "failed to reload config");
-                return;
+                return None;
             }
         };
         let theme_base = match Config::config_dir_for_path(&self.config_path) {
             Ok(path) => path,
             Err(err) => {
+                // Theme lookup needs a stable base dir before any CSS path work starts
                 tracing::warn!(?err, "failed to resolve config dir");
-                return;
+                return None;
             }
         };
         let theme_paths = match config.resolve_theme_paths_from(&theme_base) {
             Ok(paths) => paths,
             Err(err) => {
-                // Theme path errors should not discard the current config.
+                // Theme path errors should not partially swap the running config
                 tracing::warn!(?err, "failed to resolve theme paths");
-                return;
+                return None;
             }
         };
 
-        self.config = config.clone();
-        debug!("config reloaded");
-        self.css.update_theme(theme_paths, config.theme.clone());
+        Some(ReloadInputs {
+            config,
+            theme_paths,
+        })
+    }
+
+    fn apply_reloaded_theme(&mut self, reload: &ReloadInputs) {
+        self.css
+            .update_theme(reload.theme_paths.clone(), reload.config.theme.clone());
         self.css.reload(unixnotis_ui::css::DEFAULT_CSS);
-        // Theme changes can introduce icons that were previously missing.
-        // Clearing the miss cache ensures new theme assets are discovered
-        // without waiting for cache TTL expiry.
+        // New theme assets may replace old cache misses, so clear the miss cache now
         self.icon_resolver.clear_missing_cache();
-        panel::apply_panel_config(&self.panel, &config, self.work_area);
+    }
+
+    fn apply_reloaded_panel(&mut self, config: &Config) {
+        // Geometry goes first so later sections can size themselves from the final panel width
+        panel::apply_panel_config(&self.panel, config, self.work_area);
         self.log_debug(PanelDebugLevel::Info, || {
             "panel config applied after reload".to_string()
         });
-        // Media widgets depend on panel geometry, so update them before widgets rebuild.
-        self.apply_media_config(&config);
-        if config.widgets != widgets_before {
-            // Only rebuild widgets when config structure changes to reduce churn.
-            self.apply_widget_config(&config);
+    }
+
+    fn apply_widget_sections_after_reload(&mut self, config: &Config, widgets_changed: bool) {
+        if widgets_changed {
+            // Widget rebuilds are the expensive part, so skip them when structure is unchanged
+            self.apply_widget_config(config);
         } else {
             debug!("widget config unchanged; skipping rebuild");
         }
+    }
+
+    fn apply_list_config_after_reload(&mut self, config: &Config) {
         let list_config = list::NotificationListConfig {
             max_active: config.history.max_active,
             max_entries: config.history.max_entries,
@@ -67,10 +102,18 @@ impl UiState {
         let has_widgets = !self.widgets_collapsed && self.has_any_widgets();
         self.list.apply_config(&list_config, has_widgets);
         self.set_widgets_collapsed(self.widgets_collapsed);
+    }
+
+    fn finish_reload_runtime(&mut self, config: &Config) {
+        // Refresh timers may need new intervals even when widget structure is unchanged
         self.restart_refresh_timer();
+        if self.panel_visible {
+            // Live reload should settle to one new auto height and then stay fixed again.
+            panel::schedule_auto_height_lock(&self.panel, config);
+        }
         if config.panel.respect_work_area {
             self.work_area = None;
-            // Refreshing work area ensures the panel snaps to the latest compositor state.
+            // Work area is refreshed after reload so compositor margins can update one more time
             super::hyprland::refresh_reserved_work_area(
                 config.panel.output.clone(),
                 self.event_tx.clone(),
@@ -78,74 +121,8 @@ impl UiState {
         }
     }
 
-    fn apply_media_config(&mut self, config: &Config) {
-        if !config.media.enabled {
-            self.panel.media_container.set_visible(false);
-            self.clear_media_container();
-            self.media = None;
-            debug!("media disabled");
-            return;
-        }
-
-        self.panel.media_container.set_visible(true);
-        // Use the live panel width so media layout stays aligned after adaptive sizing.
-        let panel_width = self.panel.root.width_request().max(1);
-        if self
-            .media
-            .as_ref()
-            .is_some_and(|media| !media.matches_layout(&config.media))
-        {
-            // Shell changes need a rebuild because GTK structure really changes here
-            let snapshot = self
-                .media
-                .as_ref()
-                .map(media_widget::MediaWidget::snapshot)
-                .unwrap_or_default();
-            // Drop the old shell first so the container never briefly shows two cards
-            self.clear_media_container();
-            self.media = None;
-            if let Some(handle) = self.media_handle.as_ref() {
-                debug!("media widget rebuilt for layout change");
-                let mut media = media_widget::MediaWidget::new(
-                    &self.panel.media_container,
-                    handle.clone(),
-                    panel_width,
-                    &config.media,
-                );
-                if !snapshot.is_empty() {
-                    // Re-apply the live snapshot so config reload does not blank the card
-                    media.restore_snapshot(&snapshot);
-                }
-                // Store the rebuilt shell so later refreshes reuse it
-                self.media = Some(media);
-                return;
-            }
-        }
-        match (self.media.as_mut(), self.media_handle.as_ref()) {
-            (Some(media), _) => {
-                // Reuse existing widget to avoid extra allocations during reloads.
-                debug!("media layout updated");
-                media.apply_layout(panel_width, &config.media);
-            }
-            (None, Some(handle)) => {
-                debug!("media widget created");
-                let media = media_widget::MediaWidget::new(
-                    &self.panel.media_container,
-                    handle.clone(),
-                    panel_width,
-                    &config.media,
-                );
-                self.media = Some(media);
-            }
-            (None, None) => {
-                // Media handle comes from the shared runtime; missing handle needs restart.
-                tracing::warn!("media runtime not available; restart required to enable media");
-            }
-        }
-    }
-
     fn apply_widget_config(&mut self, config: &Config) {
-        // Clear containers before rebuilding to avoid stale widgets and duplicated rows.
+        // Old children are cleared first so the rebuild can treat each section as fresh state
         clear_container(&self.panel.quick_controls);
         let (volume, brightness) = build_quick_controls(&self.panel, config);
         self.volume = volume;
@@ -157,11 +134,5 @@ impl UiState {
         self.toggles = toggles;
         self.stats = stats;
         self.cards = cards;
-    }
-
-    fn clear_media_container(&self) {
-        while let Some(child) = self.panel.media_container.first_child() {
-            self.panel.media_container.remove(&child);
-        }
     }
 }
