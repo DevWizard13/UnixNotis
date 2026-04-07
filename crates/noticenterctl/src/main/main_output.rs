@@ -86,9 +86,7 @@ mod tests {
                 label: "Open".to_string(),
             }],
             urgency: 1,
-            is_transient: false,
-            is_resident: false,
-            received_at_unix_ms: 0,
+            // CLI formatting only needs the lightweight transport fields
             image: NotificationImage::default(),
         }
     }

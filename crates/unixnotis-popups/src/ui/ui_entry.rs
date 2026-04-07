@@ -20,8 +20,25 @@ use super::UiState;
 pub(super) struct PopupEntry {
     // Keep the last payload so seed reconcile can detect real content changes
     pub(super) notification: NotificationView,
-    pub(super) revealer: gtk::Revealer,
-    pub(super) root: gtk::Box,
+    // Hidden backlog rows stay lightweight until they enter the visible slice
+    pub(super) revealer: Option<gtk::Revealer>,
+    pub(super) root: Option<gtk::Box>,
+}
+
+impl PopupEntry {
+    pub(super) fn queued(notification: NotificationView) -> Self {
+        // Backlog rows start as plain data and only grow GTK nodes when they become visible
+        Self {
+            notification,
+            revealer: None,
+            root: None,
+        }
+    }
+
+    pub(super) fn is_materialized(&self) -> bool {
+        // Both widgets must exist before stack operations can touch this row safely
+        self.revealer.is_some() && self.root.is_some()
+    }
 }
 
 const MAX_POPUP_ACTIONS: usize = 3;
@@ -49,6 +66,8 @@ impl UiState {
         root.set_size_request(popup_width, -1);
         root.set_halign(Align::Fill);
         root.set_hexpand(false);
+        // Entries start hidden so overflow rows do not animate in and out needlessly
+        root.set_visible(false);
         if notification.urgency == Urgency::Critical as u8 {
             root.add_css_class("critical");
         }
@@ -163,13 +182,14 @@ impl UiState {
         }
 
         revealer.set_child(Some(&root));
-        revealer.set_reveal_child(true);
+        // Visibility is driven centrally so only rows inside max_visible animate in
+        revealer.set_reveal_child(false);
 
         PopupEntry {
             // Store the payload used to build this row so later seeds can compare safely
             notification: notification.clone(),
-            revealer,
-            root,
+            revealer: Some(revealer),
+            root: Some(root),
         }
     }
 }

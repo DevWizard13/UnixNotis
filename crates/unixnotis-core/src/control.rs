@@ -19,7 +19,7 @@ pub const INHIBIT_SCOPE_ALL: u32 = 0;
 pub const INHIBIT_SCOPE_POPUPS: u32 = 1;
 
 /// Control-plane state broadcast to the UI.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
 pub struct ControlState {
     pub dnd_enabled: bool,
     pub history_count: u32,
@@ -27,6 +27,13 @@ pub struct ControlState {
     pub inhibited: bool,
     /// Total number of active inhibitors (all scopes).
     pub inhibitor_count: u32,
+}
+
+/// Popup gating fields that actually affect toast visibility.
+#[derive(Debug, Clone, Serialize, Deserialize, Type, Default, PartialEq, Eq)]
+pub struct PopupGateState {
+    pub dnd_enabled: bool,
+    pub inhibited: bool,
 }
 
 /// Shared popup gate used by the daemon and popup UI.
@@ -230,6 +237,10 @@ trait Control {
 
     #[zbus(signal)]
     fn state_changed(&self, state: ControlState) -> zbus::Result<()>;
+
+    /// Emitted only when popup gating changes, so popup UIs can avoid panel-only churn.
+    #[zbus(signal)]
+    fn popup_gate_changed(&self, gate: PopupGateState) -> zbus::Result<()>;
 
     /// Emitted when local notification snapshots must be refreshed from the daemon.
     #[zbus(signal)]

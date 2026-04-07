@@ -4,12 +4,13 @@
 //! responsibilities clear and files smaller.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use tokio::sync::Mutex;
 use tracing::info;
-use unixnotis_core::{CloseReason, Config, CONTROL_BUS_NAME, CONTROL_OBJECT_PATH};
+use unixnotis_core::{
+    CloseReason, Config, ControlState, PopupGateState, CONTROL_BUS_NAME, CONTROL_OBJECT_PATH,
+};
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::{Connection, SignalContext};
 
@@ -39,6 +40,10 @@ pub struct DaemonState {
     popups_running: AtomicBool,
     // Scheduler is installed after state startup so close paths can cancel timers
     scheduler: OnceLock<ExpirationScheduler>,
+    // Cache the last control-state snapshot so no-op signals can be skipped
+    last_emitted_state: StdMutex<Option<ControlState>>,
+    // Popup UIs only care about the gate, not panel history counters
+    last_emitted_popup_gate: StdMutex<Option<PopupGateState>>,
 }
 
 impl DaemonState {
@@ -51,6 +56,8 @@ impl DaemonState {
             panel_ready: AtomicBool::new(false),
             popups_running: AtomicBool::new(false),
             scheduler: OnceLock::new(),
+            last_emitted_state: StdMutex::new(None),
+            last_emitted_popup_gate: StdMutex::new(None),
         })
     }
 
@@ -137,15 +144,33 @@ impl DaemonState {
         let state = {
             let store = self.store.lock().await;
             let history_count = store.history_len() as u32;
-            unixnotis_core::ControlState {
+            // Panel consumers still need history and inhibitor counters in one snapshot
+            ControlState {
                 dnd_enabled: store.dnd_enabled(),
                 history_count,
                 inhibited: store.inhibited(),
                 inhibitor_count: store.inhibitor_count(),
             }
         };
+        // Popup policy only depends on the gate, so history churn should not wake it up
+        let popup_gate = PopupGateState {
+            dnd_enabled: state.dnd_enabled,
+            inhibited: state.inhibited,
+        };
+        // Duplicate broadcasts add D-Bus churn without changing UI behavior
+        let should_emit_state = should_emit_cached(&self.last_emitted_state, &state);
+        let should_emit_popup_gate = should_emit_cached(&self.last_emitted_popup_gate, &popup_gate);
+        if !should_emit_state && !should_emit_popup_gate {
+            return Ok(());
+        }
         let control_ctx = SignalContext::new(&self.connection, CONTROL_OBJECT_PATH)?;
-        ControlServer::state_changed(&control_ctx, state).await
+        if should_emit_state {
+            ControlServer::state_changed(&control_ctx, state).await?;
+        }
+        if should_emit_popup_gate {
+            ControlServer::popup_gate_changed(&control_ctx, popup_gate).await?;
+        }
+        Ok(())
     }
 
     pub async fn emit_snapshot_invalidated(&self) -> zbus::Result<()> {
@@ -214,4 +239,22 @@ pub fn log_name_reply(reply: &RequestNameReply) {
 
 pub(crate) fn to_fdo_error(err: zbus::Error) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(err.to_string())
+}
+
+fn should_emit_cached<T: Clone + PartialEq>(cache: &StdMutex<Option<T>>, value: &T) -> bool {
+    // Sync mutex is enough here because this cache is tiny and never held across await points
+    let mut last_value = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if last_value
+        .as_ref()
+        .is_some_and(|previous| previous == value)
+    {
+        // Identical state would only burn CPU in zbus and the listeners
+        return false;
+    }
+    // Clone once on change so later comparisons stay allocation-free for equal values
+    *last_value = Some(value.clone());
+    true
 }

@@ -9,7 +9,7 @@ use tracing::debug;
 use unixnotis_core::{popup_allowed_by_state, ControlState, NotificationView};
 
 use super::ui_window::{popup_stack_has_active_transitions, refresh_popup_input_region};
-use super::UiState;
+use super::{PopupEntry, UiState};
 
 struct ReconcilePlan {
     // Local rows missing from the daemon snapshot
@@ -75,10 +75,8 @@ impl UiState {
             return;
         }
 
-        // Build widgets first so ordering updates remain consistent.
-        let entry = self.build_popup_entry(&notification);
-        self.popup_stack.prepend(&entry.revealer);
-        self.popups.insert(id, entry);
+        // Hidden overflow rows stay as plain data until they can actually be shown
+        self.popups.insert(id, PopupEntry::queued(notification));
         self.popup_order.push_front(id);
         self.update_popup_visibility();
         debug!(id, total = self.popup_order.len(), "popup inserted");
@@ -95,14 +93,13 @@ impl UiState {
 
     pub(super) fn remove_popup(&mut self, id: u32) {
         if let Some(entry) = self.popups.remove(&id) {
-            // Revealers animate out before removing from the stack.
-            entry.revealer.set_reveal_child(false);
-            let stack = self.popup_stack.clone();
-            let popup_window = self.popup_window.clone();
-            let popup_input_region = self.popup_input_region.clone();
-            entry
-                .revealer
-                .connect_notify_local(Some("child-revealed"), move |revealer, _| {
+            if let Some(revealer) = entry.revealer {
+                // Visible rows animate out before leaving the stack
+                revealer.set_reveal_child(false);
+                let stack = self.popup_stack.clone();
+                let popup_window = self.popup_window.clone();
+                let popup_input_region = self.popup_input_region.clone();
+                revealer.connect_notify_local(Some("child-revealed"), move |revealer, _| {
                     // Remove only after transition completes to avoid visual pop
                     if !revealer.is_child_revealed() && revealer.parent().is_some() {
                         stack.remove(revealer);
@@ -116,22 +113,20 @@ impl UiState {
                         has_active_transitions,
                     );
                 });
+            }
         }
         self.popup_order.retain(|item| *item != id);
         self.update_popup_visibility();
         debug!(id, total = self.popup_order.len(), "popup removed");
     }
 
-    pub(super) fn update_popup_visibility(&self) {
+    pub(super) fn update_popup_visibility(&mut self) {
         // Visibility contract is driven strictly by configured max_visible count
         let max_visible = self.config.popups.max_visible;
 
         // Max-visible of zero disables popups entirely.
         if max_visible == 0 {
-            for entry in self.popups.values() {
-                entry.root.set_visible(false);
-                entry.revealer.set_reveal_child(false);
-            }
+            self.apply_visible_popups(Vec::new());
             self.popup_window.set_visible(false);
             // Keep input region empty when popups are disabled
             refresh_popup_input_region(
@@ -151,24 +146,14 @@ impl UiState {
             self.popup_window.set_visible(true);
         }
 
-        for (index, id) in self.popup_order.iter().enumerate() {
-            if let Some(entry) = self.popups.get(id) {
-                // Clean up previous state classes.
-                entry.root.remove_css_class("unixnotis-popup-visible");
-
-                if index < max_visible {
-                    // Fully visible notification.
-                    entry.root.set_visible(true);
-                    entry.revealer.set_reveal_child(true);
-                    entry.root.add_css_class("unixnotis-popup-visible");
-                } else {
-                    // Keep overflow notifications hidden to avoid visual layering artifacts.
-                    // Hidden entries still stay in memory so close/update events stay coherent
-                    entry.root.set_visible(false);
-                    entry.revealer.set_reveal_child(false);
-                }
-            }
-        }
+        // Only the leading visible slice should pay GTK visibility churn on every update
+        let desired_visible = self
+            .popup_order
+            .iter()
+            .take(max_visible)
+            .copied()
+            .collect::<Vec<u32>>();
+        self.apply_visible_popups(desired_visible);
         // Tick while transitions run so interactive area tracks animation frames
         let has_active_transitions = popup_stack_has_active_transitions(&self.popup_stack);
         refresh_popup_input_region(
@@ -178,10 +163,88 @@ impl UiState {
             has_active_transitions,
         );
         debug!(
-            visible = self.popup_order.len().min(max_visible),
+            visible = self.visible_popups.len(),
             total = self.popup_order.len(),
             "popup visibility updated"
         );
+    }
+
+    fn apply_visible_popups(&mut self, desired_visible: Vec<u32>) {
+        // Leaving the visible slice drops widget trees so overflow stays lightweight
+        let previous_visible = self.visible_popups.clone();
+        for id in &previous_visible {
+            if desired_visible.contains(id) {
+                continue;
+            }
+            self.dematerialize_popup(*id);
+        }
+
+        // Rebuild the on-screen stack from the small visible slice only
+        for id in desired_visible.iter().rev() {
+            self.materialize_popup(*id);
+            let Some(entry) = self.popups.get(id) else {
+                continue;
+            };
+            let Some(revealer) = entry.revealer.as_ref() else {
+                continue;
+            };
+            if revealer.parent().is_some() {
+                self.popup_stack.remove(revealer);
+            }
+            self.popup_stack.prepend(revealer);
+        }
+
+        // Visible rows get their final reveal state after the stack order is correct
+        for id in &desired_visible {
+            let Some(entry) = self.popups.get(id) else {
+                continue;
+            };
+            let (Some(root), Some(revealer)) = (entry.root.as_ref(), entry.revealer.as_ref())
+            else {
+                continue;
+            };
+            root.set_visible(true);
+            revealer.set_reveal_child(true);
+            root.add_css_class("unixnotis-popup-visible");
+        }
+
+        self.visible_popups = desired_visible;
+    }
+
+    fn materialize_popup(&mut self, id: u32) {
+        // Visible rows get rebuilt from the stored payload only when they are actually needed
+        let notification = match self.popups.get(&id) {
+            Some(entry) if !entry.is_materialized() => entry.notification.clone(),
+            _ => return,
+        };
+        let built = self.build_popup_entry(&notification);
+        let Some(entry) = self.popups.get_mut(&id) else {
+            return;
+        };
+        // Swap in the fresh GTK nodes while keeping the cached payload untouched
+        entry.revealer = built.revealer;
+        entry.root = built.root;
+    }
+
+    fn dematerialize_popup(&mut self, id: u32) {
+        // Hidden rows keep only plain Rust data so backlog size does not scale GTK memory
+        let Some(entry) = self.popups.get_mut(&id) else {
+            return;
+        };
+        let Some(root) = entry.root.take() else {
+            entry.revealer = None;
+            return;
+        };
+        let Some(revealer) = entry.revealer.take() else {
+            return;
+        };
+        // Hidden overflow rows should not retain GTK trees or CSS state
+        root.remove_css_class("unixnotis-popup-visible");
+        root.set_visible(false);
+        revealer.set_reveal_child(false);
+        if revealer.parent().is_some() {
+            self.popup_stack.remove(&revealer);
+        }
     }
 }
 
@@ -230,6 +293,7 @@ fn desired_seed_popups(
     state: &ControlState,
 ) -> Vec<NotificationView> {
     // Seed filtering uses the same gate as runtime state changes
+    // This keeps reconnect snapshots and live signals on the same visibility rules
     active
         .into_iter()
         .filter(|notification| popup_allowed_by_state(notification.urgency, state))

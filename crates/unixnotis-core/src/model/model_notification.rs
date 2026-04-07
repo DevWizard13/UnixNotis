@@ -55,11 +55,9 @@ impl Notification {
             body: self.body.clone(),
             actions: self.actions.clone(),
             urgency: self.urgency.as_u8(),
-            is_transient: self.is_transient,
-            is_resident: self.is_resident,
-            received_at_unix_ms: self.received_at.timestamp_millis(),
+            // UIs only need the text, actions, and image payload used for rendering
             image: self.image.clone(),
-            // Sender metadata is intentionally excluded from public views.
+            // Protocol flags and sender metadata stay daemon-side to keep D-Bus payloads small
         }
     }
 
@@ -72,11 +70,9 @@ impl Notification {
             body: self.body.clone(),
             actions: self.actions.clone(),
             urgency: self.urgency.as_u8(),
-            is_transient: self.is_transient,
-            is_resident: self.is_resident,
-            received_at_unix_ms: self.received_at.timestamp_millis(),
+            // List rows should avoid carrying raw image buffers across D-Bus
             image: self.image.for_listing(),
-            // Sender metadata is intentionally excluded from public views.
+            // Protocol flags and sender metadata stay daemon-side to keep D-Bus payloads small
         }
     }
 
@@ -118,15 +114,12 @@ pub struct NotificationView {
     // Identifier matches Notification::id.
     pub id: u32,
     // Lightweight fields used for UI display and filtering.
+    // Intentionally omits daemon-only protocol flags and timestamps
     pub app_name: String,
     pub summary: String,
     pub body: String,
     pub actions: Vec<Action>,
     pub urgency: u8,
-    pub is_transient: bool,
-    pub is_resident: bool,
-    // Epoch milliseconds for stable sorting and relative time formatting.
-    pub received_at_unix_ms: i64,
     // Image metadata intended for UI usage.
     pub image: NotificationImage,
 }

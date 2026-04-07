@@ -8,7 +8,7 @@ use futures_util::stream::{self, StreamExt};
 use tracing::warn;
 use unixnotis_core::{
     CloseReason, ControlState, InhibitorInfo, NotificationView, PanelDebugLevel, PanelRequest,
-    CONTROL_OBJECT_PATH,
+    PopupGateState, CONTROL_OBJECT_PATH,
 };
 use zbus::message::Header;
 use zbus::{interface, SignalContext};
@@ -427,6 +427,12 @@ impl ControlServer {
     pub(crate) async fn state_changed(
         ctx: &SignalContext<'_>,
         state: ControlState,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    pub(crate) async fn popup_gate_changed(
+        ctx: &SignalContext<'_>,
+        gate: PopupGateState,
     ) -> zbus::Result<()>;
 
     #[zbus(signal)]

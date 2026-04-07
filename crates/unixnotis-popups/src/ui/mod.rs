@@ -38,6 +38,8 @@ pub struct UiState {
     popup_input_region: PopupInputRegionState,
     popups: HashMap<u32, PopupEntry>,
     popup_order: VecDeque<u32>,
+    // Only visible ids need repeated GTK updates during backlog churn
+    visible_popups: Vec<u32>,
     // Latest daemon gate state used to keep visible popups in policy
     control_state: ControlState,
     // Desktop icon index caches resolved icon themes for known applications.
@@ -71,6 +73,7 @@ impl UiState {
             popup_input_region,
             popups: HashMap::new(),
             popup_order: VecDeque::new(),
+            visible_popups: Vec::new(),
             // Start permissive until the first seed arrives from the daemon
             control_state: ControlState::default(),
             desktop_icons: DesktopIconIndex::new(),
@@ -110,10 +113,10 @@ impl UiState {
                 debug!(id, "popup closed");
                 self.remove_popup(id);
             }
-            UiEvent::StateChanged(state) => {
-                // State transitions only remove now-invalid popups
-                // Old popups are not resurrected here because popup history stays ephemeral
-                self.control_state = state;
+            UiEvent::PopupGateChanged(gate) => {
+                // Popup policy only depends on DND and inhibit state
+                self.control_state.dnd_enabled = gate.dnd_enabled;
+                self.control_state.inhibited = gate.inhibited;
                 self.retain_allowed_popups();
             }
             UiEvent::CssReload => {
