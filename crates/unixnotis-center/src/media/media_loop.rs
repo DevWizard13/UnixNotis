@@ -13,19 +13,21 @@ use super::media_bus::{
     build_player_state, handle_command, is_allowed_player, refresh_players,
     spawn_properties_listener, PlayerState,
 };
-use super::media_cache::{refresh_cache, refresh_player_cache, send_snapshot};
+use super::media_cache::{refresh_cache, refresh_player_cache, send_snapshot_if_changed};
 use super::media_runtime::MEDIA_SIGNAL_CAPACITY;
 use super::media_schedule::{
     cancel_delayed_refresh, prune_delayed_refreshes, schedule_command_refresh,
     schedule_metadata_fallback, schedule_metadata_fallbacks, DelayedRefreshTasks,
 };
-use super::{MediaCommand, MediaInfo, MediaSignal, MPRIS_PREFIX};
+use super::{MediaCommand, MediaInfo, MediaRefreshOrigin, MediaSignal, MPRIS_PREFIX};
 
 struct MediaRuntimeState {
     // Live player proxies keyed by bus name
     players: HashMap<String, PlayerState>,
     // Last known media snapshot per player
     cache: HashMap<String, MediaInfo>,
+    // Last emitted snapshot lets the loop drop duplicate UI updates cheaply
+    last_snapshot: Vec<MediaInfo>,
     // One delayed retry plan per player
     delayed_refreshes: DelayedRefreshTasks,
 }
@@ -36,6 +38,7 @@ impl MediaRuntimeState {
         Self {
             players: HashMap::new(),
             cache: HashMap::new(),
+            last_snapshot: Vec::new(),
             delayed_refreshes: HashMap::new(),
         }
     }
@@ -171,7 +174,7 @@ async fn refresh_all_players(
     prune_player_refreshes(&mut state.delayed_refreshes, &state.players);
     // Cache rebuild happens after player discovery so the snapshot stays aligned
     refresh_cache(&state.players, &mut state.cache).await;
-    send_snapshot(sender, &state.cache).await;
+    send_snapshot_if_changed(sender, &state.cache, &mut state.last_snapshot).await;
     schedule_metadata_fallbacks(
         &mut state.delayed_refreshes,
         &state.cache,
@@ -188,7 +191,7 @@ async fn handle_runtime_command(
     if let Ok(Some(name)) = handle_command(&state.players, command).await {
         // After a transport command, refresh the touched player right away
         refresh_player_cache(&state.players, &mut state.cache, &name).await;
-        send_snapshot(sender, &state.cache).await;
+        send_snapshot_if_changed(sender, &state.cache, &mut state.last_snapshot).await;
         schedule_command_refresh(
             &mut state.delayed_refreshes,
             &state.cache,
@@ -204,16 +207,19 @@ async fn handle_runtime_signal(
     sender: &async_channel::Sender<UiEvent>,
     signal: MediaSignal,
 ) {
-    let MediaSignal::PropertiesChanged(name) = signal;
+    let MediaSignal::PropertiesChanged { bus_name, origin } = signal;
     // Property changes refresh one player only, which keeps updates cheap
-    refresh_player_cache(&state.players, &mut state.cache, &name).await;
-    send_snapshot(sender, &state.cache).await;
-    schedule_metadata_fallback(
-        &mut state.delayed_refreshes,
-        &state.cache,
-        signal_tx.clone(),
-        &name,
-    );
+    refresh_player_cache(&state.players, &mut state.cache, &bus_name).await;
+    send_snapshot_if_changed(sender, &state.cache, &mut state.last_snapshot).await;
+    if should_schedule_metadata_fallback(origin) {
+        // Bus-driven changes can need one bounded late-art sweep
+        schedule_metadata_fallback(
+            &mut state.delayed_refreshes,
+            &state.cache,
+            signal_tx.clone(),
+            &bus_name,
+        );
+    }
 }
 
 async fn apply_owner_change(
@@ -258,7 +264,7 @@ async fn apply_owner_change(
         state.players.insert(name.to_string(), player_state);
         // A late-joining player still needs one snapshot pass through the cache
         refresh_player_cache(&state.players, &mut state.cache, name).await;
-        send_snapshot(sender, &state.cache).await;
+        send_snapshot_if_changed(sender, &state.cache, &mut state.last_snapshot).await;
         schedule_metadata_fallback(
             &mut state.delayed_refreshes,
             &state.cache,
@@ -283,7 +289,7 @@ async fn remove_player(
     // Retry work for the removed player is no longer useful
     cancel_delayed_refresh(&mut state.delayed_refreshes, name);
     state.cache.remove(name);
-    send_snapshot(sender, &state.cache).await;
+    send_snapshot_if_changed(sender, &state.cache, &mut state.last_snapshot).await;
 }
 
 fn prune_player_refreshes(
@@ -300,4 +306,28 @@ fn prune_player_refreshes(
         task.abort();
         false
     });
+}
+
+fn should_schedule_metadata_fallback(origin: MediaRefreshOrigin) -> bool {
+    // Synthetic retries already represent the bounded fallback plan
+    // Re-arming here would collapse into a permanent 250 ms self-refresh loop
+    origin == MediaRefreshOrigin::Bus
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_schedule_metadata_fallback;
+    use crate::media::MediaRefreshOrigin;
+
+    #[test]
+    fn fallback_generated_refreshes_do_not_rearm_followup_sweeps() {
+        assert!(!should_schedule_metadata_fallback(
+            MediaRefreshOrigin::Fallback
+        ));
+    }
+
+    #[test]
+    fn bus_generated_refreshes_still_allow_one_bounded_followup_sweep() {
+        assert!(should_schedule_metadata_fallback(MediaRefreshOrigin::Bus));
+    }
 }

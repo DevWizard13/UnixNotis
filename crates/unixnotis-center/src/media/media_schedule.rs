@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
-use super::{MediaInfo, MediaSignal};
+use super::{MediaInfo, MediaRefreshOrigin, MediaSignal};
 
 pub(super) type DelayedRefreshTasks = HashMap<String, JoinHandle<()>>;
 
@@ -98,7 +98,10 @@ fn schedule_refresh_sequence(
                 tokio::time::sleep(step).await;
             }
             if signal_tx
-                .send(MediaSignal::PropertiesChanged(target_name.clone()))
+                .send(MediaSignal::PropertiesChanged {
+                    bus_name: target_name.clone(),
+                    origin: MediaRefreshOrigin::Fallback,
+                })
                 .await
                 .is_err()
             {

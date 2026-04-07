@@ -21,7 +21,7 @@ pub(super) const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 pub(super) const MPRIS_PLAYER: &str = "org.mpris.MediaPlayer2.Player";
 pub(super) const MPRIS_APP: &str = "org.mpris.MediaPlayer2";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaInfo {
     pub bus_name: String,
     pub identity: String,
@@ -62,9 +62,20 @@ pub enum MediaCommand {
     Previous { bus_name: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaRefreshOrigin {
+    // Native player/property traffic can justify one bounded fallback sweep
+    Bus,
+    // Synthetic retries must never re-arm themselves or they become a poll loop
+    Fallback,
+}
+
 #[derive(Debug)]
 enum MediaSignal {
-    PropertiesChanged(String),
+    PropertiesChanged {
+        bus_name: String,
+        origin: MediaRefreshOrigin,
+    },
 }
 
 #[derive(Clone)]

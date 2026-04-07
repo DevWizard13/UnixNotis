@@ -8,7 +8,10 @@ use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::{Connection, Proxy, ProxyBuilder};
 
 use super::media_policy::{detect_browser_family, remote_art_allowed};
-use super::{MediaCommand, MediaSignal, MPRIS_APP, MPRIS_PATH, MPRIS_PLAYER, MPRIS_PREFIX};
+use super::{
+    MediaCommand, MediaRefreshOrigin, MediaSignal, MPRIS_APP, MPRIS_PATH, MPRIS_PLAYER,
+    MPRIS_PREFIX,
+};
 use crate::debug;
 
 #[derive(Clone)]
@@ -130,7 +133,10 @@ pub(super) fn spawn_properties_listener(
                         format!("media properties changed: {bus_name}")
                     });
                     if signal_tx
-                        .send(MediaSignal::PropertiesChanged(bus_name.clone()))
+                        .send(MediaSignal::PropertiesChanged {
+                            bus_name: bus_name.clone(),
+                            origin: MediaRefreshOrigin::Bus,
+                        })
                         .await
                         .is_err()
                     {

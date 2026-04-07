@@ -38,9 +38,18 @@ pub(super) async fn refresh_player_cache(
     }
 }
 
-pub(super) async fn send_snapshot(sender: &Sender<UiEvent>, cache: &HashMap<String, MediaInfo>) {
+pub(super) async fn send_snapshot_if_changed(
+    sender: &Sender<UiEvent>,
+    cache: &HashMap<String, MediaInfo>,
+    last_snapshot: &mut Vec<MediaInfo>,
+) {
     // Snapshot keeps UI updates atomic and ordered.
     let snapshot = build_snapshot(cache);
+    if *last_snapshot == snapshot {
+        // Identical snapshots do not need another UI event or list rebuild path
+        return;
+    }
+    *last_snapshot = snapshot.clone();
     if snapshot.is_empty() {
         let _ = sender.send(UiEvent::MediaCleared).await;
     } else {
@@ -154,7 +163,9 @@ fn normalize_token(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dbus::UiEvent;
     use crate::media::MediaInfo;
+    use tokio::runtime::Builder;
 
     fn make_info(
         bus_name: &str,
@@ -235,5 +246,59 @@ mod tests {
         let token = normalize_token("  Foo--Bar\tBaz  ");
         // Hyphens are treated as punctuation; only whitespace yields word boundaries.
         assert_eq!(token, "foobar baz");
+    }
+
+    #[test]
+    fn unchanged_snapshot_is_not_resent() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (tx, rx) = async_channel::bounded(4);
+            let mut cache = HashMap::new();
+            let mut last_snapshot = Vec::new();
+            cache.insert(
+                "org.mpris.MediaPlayer2.a".to_string(),
+                make_info("org.mpris.MediaPlayer2.a", "Alpha", "Playing", true, None),
+            );
+
+            send_snapshot_if_changed(&tx, &cache, &mut last_snapshot).await;
+            match rx.recv().await.expect("first snapshot event") {
+                UiEvent::MediaUpdated(snapshot) => assert_eq!(snapshot.len(), 1),
+                other => panic!("unexpected first event: {other:?}"),
+            }
+
+            send_snapshot_if_changed(&tx, &cache, &mut last_snapshot).await;
+            assert!(rx.is_empty());
+        });
+    }
+
+    #[test]
+    fn clearing_snapshot_only_emits_once_for_same_empty_state() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (tx, rx) = async_channel::bounded(4);
+            let cache = HashMap::new();
+            let mut last_snapshot = vec![make_info(
+                "org.mpris.MediaPlayer2.a",
+                "Alpha",
+                "Playing",
+                true,
+                None,
+            )];
+
+            send_snapshot_if_changed(&tx, &cache, &mut last_snapshot).await;
+            assert!(matches!(
+                rx.recv().await.expect("clear event"),
+                UiEvent::MediaCleared
+            ));
+
+            send_snapshot_if_changed(&tx, &cache, &mut last_snapshot).await;
+            assert!(rx.is_empty());
+        });
     }
 }
