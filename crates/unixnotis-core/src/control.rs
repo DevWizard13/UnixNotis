@@ -205,6 +205,12 @@ trait Control {
     /// Clear all notifications from history and popups.
     fn clear_all(&self) -> zbus::Result<()>;
 
+    /// Mark the panel UI ready after signal subscriptions are active.
+    fn mark_panel_ready(&self) -> zbus::Result<()>;
+
+    /// Clear panel readiness when the UI is reconnecting or shutting down.
+    fn mark_panel_not_ready(&self) -> zbus::Result<()>;
+
     #[zbus(signal)]
     fn notification_added(
         &self,

@@ -54,6 +54,16 @@ impl ControlServer {
         // One auth path
         auth::authorize_control_call(&self.state, header, method).await
     }
+
+    fn ensure_panel_available(&self) -> zbus::fdo::Result<()> {
+        // Rejecting here makes panel outages visible instead of silent
+        if self.state.panel_ready() {
+            return Ok(());
+        }
+        Err(zbus::fdo::Error::Failed(
+            "unixnotis-center is unavailable".to_string(),
+        ))
+    }
 }
 
 #[interface(name = "com.unixnotis.Control")]
@@ -99,6 +109,7 @@ impl ControlServer {
 
     async fn open_panel(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "OpenPanel").await?;
+        self.ensure_panel_available()?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Use a signal to keep UI and daemon loosely coupled.
@@ -114,6 +125,7 @@ impl ControlServer {
     ) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "OpenPanelDebug")
             .await?;
+        self.ensure_panel_available()?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Debug open keeps the same panel request path with extra verbosity metadata.
@@ -124,6 +136,7 @@ impl ControlServer {
 
     async fn close_panel(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "ClosePanel").await?;
+        self.ensure_panel_available()?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Close is a signal so the UI can apply its own visibility rules.
@@ -134,6 +147,7 @@ impl ControlServer {
 
     async fn toggle_panel(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "TogglePanel").await?;
+        self.ensure_panel_available()?;
         let ctx = SignalContext::new(self.state.connection(), CONTROL_OBJECT_PATH)
             .map_err(to_fdo_error)?;
         // Toggle is emitted as a request to avoid tight coupling to UI state.
@@ -366,6 +380,25 @@ impl ControlServer {
             // State was updated locally even if listeners missed this broadcast
             warn!(?err, "failed to emit state_changed after clear_all");
         }
+        Ok(())
+    }
+
+    async fn mark_panel_ready(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "MarkPanelReady")
+            .await?;
+        // Center calls this only after it is subscribed to panel_requested
+        self.state.set_panel_ready(true);
+        Ok(())
+    }
+
+    async fn mark_panel_not_ready(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+    ) -> zbus::fdo::Result<()> {
+        self.authorize_control_call(&header, "MarkPanelNotReady")
+            .await?;
+        // Clearing readiness avoids stale success during reconnect windows
+        self.state.set_panel_ready(false);
         Ok(())
     }
 

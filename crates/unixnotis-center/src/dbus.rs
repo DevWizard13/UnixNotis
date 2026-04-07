@@ -120,6 +120,11 @@ async fn run_dbus_loop(
         seed_state_with_retry(&proxy, &sender).await;
         drop_stale_offline_commands(&mut offline_commands);
         flush_offline_commands(&proxy, &sender, &mut offline_commands).await;
+        if let Err(err) = proxy.mark_panel_ready().await {
+            subscribe_log.warn_or_debug(&err, "failed to mark panel ready");
+            tokio::time::sleep(subscribe_backoff.next_sleep()).await;
+            continue;
+        }
 
         loop {
             tokio::select! {
@@ -202,6 +207,8 @@ async fn run_dbus_loop(
                 }
             }
         }
+        // Best-effort clear avoids stale readiness while the center reconnects
+        let _ = proxy.mark_panel_not_ready().await;
         stash_offline_commands(&mut command_rx, &mut offline_commands);
         tokio::time::sleep(subscribe_backoff.next_sleep()).await;
     }

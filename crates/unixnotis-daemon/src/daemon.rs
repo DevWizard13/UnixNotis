@@ -3,6 +3,7 @@
 //! The notification and control interfaces are split into submodules to keep
 //! responsibilities clear and files smaller.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -32,6 +33,10 @@ pub struct DaemonState {
     /// Immutable sound settings resolved at startup.
     pub sound: SoundSettings,
     connection: Connection,
+    // Panel control should only succeed once the center has subscribed
+    // This avoids accepting requests that no live listener can receive
+    panel_ready: AtomicBool,
+    popups_running: AtomicBool,
     // Scheduler is installed after state startup so close paths can cancel timers
     scheduler: OnceLock<ExpirationScheduler>,
 }
@@ -43,6 +48,8 @@ impl DaemonState {
             store: Mutex::new(store),
             sound,
             connection,
+            panel_ready: AtomicBool::new(false),
+            popups_running: AtomicBool::new(false),
             scheduler: OnceLock::new(),
         })
     }
@@ -149,6 +156,20 @@ impl DaemonState {
 
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    pub(crate) fn set_panel_ready(&self, ready: bool) {
+        // SeqCst keeps state changes easy to follow during crash recovery
+        self.panel_ready.store(ready, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_popups_running(&self, running: bool) {
+        // Popup health is tracked for supervision and diagnostics
+        self.popups_running.store(running, Ordering::SeqCst);
+    }
+
+    pub(crate) fn panel_ready(&self) -> bool {
+        self.panel_ready.load(Ordering::SeqCst)
     }
 }
 

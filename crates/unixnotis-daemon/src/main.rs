@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, ValueEnum};
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 use zbus::fdo::DBusProxy;
 use zbus::Connection;
@@ -23,9 +24,7 @@ mod sound;
 mod store;
 mod trial_mode;
 
-use crate::child_process::{
-    start_center_process, start_popups_process, stop_center_process, stop_popups_process,
-};
+use crate::child_process::{spawn_center_supervisor, spawn_popups_supervisor};
 use crate::daemon::{
     log_name_reply, request_control_name, request_well_known_name, spawn_inhibitor_owner_watch,
     ControlServer, DaemonState, NotificationServer,
@@ -40,7 +39,7 @@ use unixnotis_core::{Config, CONTROL_BUS_NAME, CONTROL_OBJECT_PATH};
 
 const NOTIFICATIONS_OBJECT_PATH: &str = "/org/freedesktop/Notifications";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about)]
 struct Args {
     /// Path to config.toml
@@ -187,8 +186,11 @@ async fn main() -> Result<()> {
         warn!(?err, "failed to start inhibitor owner watcher");
     }
 
-    let mut popups_process = start_popups_process(&args)?;
-    let mut center_process = start_center_process(&args)?;
+    // Each UI child runs under a small supervisor loop
+    // This keeps Wayland disconnects from leaving dead zombies behind
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let popups_task = spawn_popups_supervisor(args.clone(), state.clone(), shutdown_rx.clone());
+    let center_task = spawn_center_supervisor(args.clone(), state.clone(), shutdown_rx);
 
     info!("unixnotis-daemon running");
     match args.run_seconds {
@@ -206,11 +208,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    if let Some(mut child) = popups_process.take() {
-        stop_popups_process(&mut child).await;
+    // A shared flag lets both supervisors stop and reap their current child cleanly
+    let _ = shutdown_tx.send(true);
+    if let Err(err) = popups_task.await {
+        warn!(?err, "popups supervisor task failed");
     }
-    if let Some(mut child) = center_process.take() {
-        stop_center_process(&mut child).await;
+    if let Err(err) = center_task.await {
+        warn!(?err, "center supervisor task failed");
     }
 
     if args.trial {

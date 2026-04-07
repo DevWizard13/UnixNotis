@@ -1,62 +1,259 @@
 //! Child process management for UI components.
 //!
-//! Keeps spawn/termination logic for popups and center processes in one place.
+//! Keeps spawn, restart, and shutdown logic for popups and center processes in one place.
 
 use std::env;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use tokio::process::{Child, Command};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::Args;
+use crate::daemon::DaemonState;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
-pub(super) fn start_popups_process(args: &Args) -> Result<Option<Child>> {
-    let Some(mut command) = build_popups_command(args)? else {
-        return Ok(None);
-    };
-    // Spawn the popup UI as a child process so resource usage is attributed correctly.
-    let child = command.spawn().map_err(|err| {
-        anyhow!(
-            "failed to start unixnotis-popups ({}); build it or install it on PATH",
-            err
-        )
-    })?;
-    Ok(Some(child))
+// A short loop should not hammer respawns forever
+// A long healthy run should restart right away
+const RESTART_BASE_MS: u64 = 250;
+const RESTART_MAX_MS: u64 = 5000;
+const HEALTHY_RUNTIME_SECS: u64 = 30;
+
+#[derive(Clone, Copy, Debug)]
+enum UiProcessKind {
+    Popups,
+    Center,
 }
 
-pub(super) async fn stop_popups_process(child: &mut Child) {
-    terminate_child(child, "unixnotis-popups").await;
+impl UiProcessKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Popups => "unixnotis-popups",
+            Self::Center => "unixnotis-center",
+        }
+    }
+
+    fn mark_running(self, state: &DaemonState, _running: bool) {
+        match self {
+            Self::Popups => state.set_popups_running(_running),
+            Self::Center => {
+                // Spawned is not the same as subscribed and ready
+                // The center flips this to true once its control streams are active
+                state.set_panel_ready(false);
+            }
+        }
+    }
+
+    fn build_command(self, args: &Args) -> Command {
+        let mut command = match self {
+            Self::Popups => {
+                if let Some(path) = resolve_popups_path() {
+                    Command::new(path)
+                } else {
+                    Command::new("unixnotis-popups")
+                }
+            }
+            Self::Center => {
+                if let Some(path) = resolve_center_path() {
+                    Command::new(path)
+                } else {
+                    Command::new("unixnotis-center")
+                }
+            }
+        };
+
+        // Journal should keep child logs tied to the daemon service
+        // Inherited output makes crash lines easier to trace later
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+
+        apply_parent_death_signal(&mut command);
+
+        if let Some(config) = args.config.as_ref() {
+            command.arg("--config").arg(config);
+        }
+
+        command
+    }
+
+    fn start(self, args: &Args) -> Result<Child> {
+        let mut command = self.build_command(args);
+        let label = self.label();
+        command.spawn().map_err(|err| {
+            anyhow!("failed to start {label} ({err}); build it or install it on PATH")
+        })
+    }
 }
 
-pub(super) fn start_center_process(args: &Args) -> Result<Option<Child>> {
-    let Some(mut command) = build_center_command(args)? else {
-        return Ok(None);
-    };
-    // Spawn the panel UI as a child process so resource usage is attributed correctly.
-    match command.spawn() {
-        Ok(child) => Ok(Some(child)),
-        Err(err) => {
-            warn!(
-                ?err,
-                "failed to start unixnotis-center; build it or install it on PATH"
-            );
-            Ok(None)
+#[derive(Debug)]
+struct RestartBackoff {
+    current: Duration,
+}
+
+impl RestartBackoff {
+    fn new() -> Self {
+        Self {
+            current: Duration::ZERO,
+        }
+    }
+
+    fn next_delay(&mut self, runtime: Duration) -> Duration {
+        // A healthy long run should come back fast
+        if runtime >= Duration::from_secs(HEALTHY_RUNTIME_SECS) {
+            self.current = Duration::ZERO;
+            return Duration::ZERO;
+        }
+
+        let base = Duration::from_millis(RESTART_BASE_MS);
+        let max = Duration::from_millis(RESTART_MAX_MS);
+        let delay = if self.current.is_zero() {
+            base
+        } else {
+            self.current
+        };
+
+        self.current = delay.checked_mul(2).unwrap_or(max).min(max);
+        delay
+    }
+}
+
+pub(super) fn spawn_popups_supervisor(
+    args: Args,
+    state: std::sync::Arc<DaemonState>,
+    shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        supervise_process(UiProcessKind::Popups, args, state, shutdown).await;
+    })
+}
+
+pub(super) fn spawn_center_supervisor(
+    args: Args,
+    state: std::sync::Arc<DaemonState>,
+    shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        supervise_process(UiProcessKind::Center, args, state, shutdown).await;
+    })
+}
+
+async fn supervise_process(
+    kind: UiProcessKind,
+    args: Args,
+    state: std::sync::Arc<DaemonState>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let label = kind.label();
+    let mut backoff = RestartBackoff::new();
+
+    loop {
+        if *shutdown.borrow() {
+            kind.mark_running(&state, false);
+            return;
+        }
+
+        let mut child = match kind.start(&args) {
+            Ok(child) => child,
+            Err(err) => {
+                kind.mark_running(&state, false);
+                let delay = backoff.next_delay(Duration::ZERO);
+                warn!(
+                    ?err,
+                    delay_ms = delay.as_millis() as u64,
+                    process = label,
+                    "ui process failed to start"
+                );
+                if wait_for_retry_or_shutdown(delay, &mut shutdown).await {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        let pid = child.id().unwrap_or_default();
+        let started_at = Instant::now();
+        kind.mark_running(&state, true);
+        info!(pid, process = label, "ui process started");
+
+        tokio::select! {
+            status = child.wait() => {
+                kind.mark_running(&state, false);
+                let runtime = started_at.elapsed();
+                log_exit(label, pid, runtime, status);
+                let delay = backoff.next_delay(runtime);
+                warn!(
+                    delay_ms = delay.as_millis() as u64,
+                    process = label,
+                    "ui process will be restarted"
+                );
+                if wait_for_retry_or_shutdown(delay, &mut shutdown).await {
+                    return;
+                }
+            }
+            changed = shutdown.changed() => {
+                let _ = changed;
+                kind.mark_running(&state, false);
+                if *shutdown.borrow() {
+                    terminate_child(&mut child, label).await;
+                    return;
+                }
+            }
         }
     }
 }
 
-pub(super) async fn stop_center_process(child: &mut Child) {
-    terminate_child(child, "unixnotis-center").await;
+fn log_exit(label: &str, pid: u32, runtime: Duration, status: std::io::Result<ExitStatus>) {
+    match status {
+        Ok(status) => {
+            warn!(
+                pid,
+                process = label,
+                runtime_ms = runtime.as_millis() as u64,
+                status = %status,
+                "ui process exited"
+            );
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                pid,
+                process = label,
+                runtime_ms = runtime.as_millis() as u64,
+                "ui process wait failed"
+            );
+        }
+    }
+}
+
+async fn wait_for_retry_or_shutdown(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+    // Zero-delay restarts recover fast after a long healthy run
+    if delay.is_zero() {
+        return *shutdown.borrow();
+    }
+
+    tokio::select! {
+        _ = sleep(delay) => false,
+        changed = shutdown.changed() => {
+            let _ = changed;
+            *shutdown.borrow()
+        }
+    }
 }
 
 async fn terminate_child(child: &mut Child, label: &str) {
-    let pid = child.id();
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
+
+    let pid = child.id().unwrap_or_default();
     #[cfg(unix)]
     unsafe {
         let pid = match i32::try_from(pid) {
@@ -68,34 +265,30 @@ async fn terminate_child(child: &mut Child, label: &str) {
         };
         libc::kill(pid, libc::SIGTERM);
     }
+
     let start = Instant::now();
     let timeout = Duration::from_millis(600);
     while start.elapsed() < timeout {
-        if let Ok(Some(_)) = child.try_wait() {
-            return;
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    ?err,
+                    label, pid, "failed to poll child state during shutdown"
+                );
+                break;
+            }
         }
-        // Async sleep avoids blocking the runtime during shutdown.
+        // Small async waits keep shutdown responsive
         sleep(Duration::from_millis(50)).await;
     }
+
     warn!(label, pid, "force killing unresponsive child process");
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn build_popups_command(args: &Args) -> Result<Option<Command>> {
-    let mut command = if let Some(path) = resolve_popups_path() {
-        Command::new(path)
-    } else {
-        Command::new("unixnotis-popups")
-    };
-
-    apply_parent_death_signal(&mut command);
-
-    if let Some(config) = args.config.as_ref() {
-        command.arg("--config").arg(config);
+    if let Err(err) = child.kill().await {
+        warn!(?err, label, pid, "failed to kill child process");
     }
-
-    Ok(Some(command))
+    let _ = child.wait().await;
 }
 
 fn resolve_popups_path() -> Option<PathBuf> {
@@ -112,38 +305,6 @@ fn resolve_popups_path() -> Option<PathBuf> {
     None
 }
 
-fn build_center_command(args: &Args) -> Result<Option<Command>> {
-    let mut command = if let Some(path) = resolve_center_path() {
-        Command::new(path)
-    } else {
-        Command::new("unixnotis-center")
-    };
-
-    apply_parent_death_signal(&mut command);
-
-    if let Some(config) = args.config.as_ref() {
-        command.arg("--config").arg(config);
-    }
-
-    Ok(Some(command))
-}
-
-#[cfg(target_os = "linux")]
-fn apply_parent_death_signal(command: &mut Command) {
-    // Ensure UI subprocesses exit if the daemon dies unexpectedly.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn apply_parent_death_signal(_command: &mut Command) {}
-
 fn resolve_center_path() -> Option<PathBuf> {
     let exe = env::current_exe().ok()?;
     let dir = exe.parent()?;
@@ -156,4 +317,53 @@ fn resolve_center_path() -> Option<PathBuf> {
         return Some(candidate);
     }
     None
+}
+
+#[cfg(target_os = "linux")]
+fn apply_parent_death_signal(command: &mut Command) {
+    // If the daemon dies, the UI child should not linger alone
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_parent_death_signal(_command: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_loop_backoff_starts_at_base() {
+        let mut backoff = RestartBackoff::new();
+        assert_eq!(
+            backoff.next_delay(Duration::from_secs(0)),
+            Duration::from_millis(RESTART_BASE_MS)
+        );
+    }
+
+    #[test]
+    fn crash_loop_backoff_caps_at_max() {
+        let mut backoff = RestartBackoff::new();
+        for _ in 0..8 {
+            let _ = backoff.next_delay(Duration::from_secs(0));
+        }
+        assert_eq!(backoff.current, Duration::from_millis(RESTART_MAX_MS));
+    }
+
+    #[test]
+    fn healthy_runtime_restarts_immediately() {
+        let mut backoff = RestartBackoff::new();
+        let _ = backoff.next_delay(Duration::from_secs(0));
+        assert_eq!(
+            backoff.next_delay(Duration::from_secs(HEALTHY_RUNTIME_SECS)),
+            Duration::ZERO
+        );
+    }
 }
