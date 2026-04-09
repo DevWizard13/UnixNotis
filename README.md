@@ -53,6 +53,12 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
+## Contributing
+
+Want to help improve UnixNotis?
+
+Please View Our [CONTRIBUTING.md](CONTRIBUTING.md) For Contribution Guidelines and Expectations.
+
 ## License
 
 MIT. See `LICENSE`.
