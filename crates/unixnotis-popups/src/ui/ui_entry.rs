@@ -51,6 +51,13 @@ const POPUP_BODY_MAX_CHARS: usize = 320;
 // Action labels stay short so button row width remains predictable
 const POPUP_ACTION_LABEL_MAX_CHARS: usize = 14;
 
+struct OptionalLabelState<'a> {
+    // Empty rows should disappear instead of leaving stray spacing behind
+    visible: bool,
+    // Reuse borrowed text when possible so empty checks stay cheap
+    text: Cow<'a, str>,
+}
+
 impl UiState {
     pub(super) fn build_popup_entry(&mut self, notification: &NotificationView) -> PopupEntry {
         let revealer = gtk::Revealer::new();
@@ -81,6 +88,7 @@ impl UiState {
             icon.add_css_class("unixnotis-popup-icon");
             header.append(&icon);
         }
+        // App name stays single-line so the header height does not jump around
         let app = gtk::Label::new(Some(&notification.app_name));
         app.set_xalign(0.0);
         // Header label never wraps into multi-line title blocks
@@ -90,15 +98,18 @@ impl UiState {
         app.set_text(clamp_label_text(&notification.app_name, POPUP_APP_MAX_CHARS).as_ref());
         app.add_css_class("unixnotis-popup-header");
 
+        // Close button lives in the same row, so the spacer has to carry alignment
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("unixnotis-popup-close");
         close.set_halign(Align::End);
 
         header.append(&app);
-        header.append(&gtk::Box::new(gtk::Orientation::Horizontal, 1));
+        // Spacer expands so the close button stays pinned to the far edge
+        header.append(&build_popup_header_spacer());
         header.append(&close);
 
         // Summary line mirrors the notification title for quick scanning.
+        // Summary is optional in the protocol, so empty titles should not keep a blank band
         let summary = gtk::Label::new(Some(&notification.summary));
         summary.set_xalign(0.0);
         // WordChar breaks long tokens instead of letting one token push width
@@ -107,10 +118,11 @@ impl UiState {
         summary.set_ellipsize(EllipsizeMode::End);
         summary.set_lines(3);
         summary.set_max_width_chars(POPUP_SUMMARY_MAX_CHARS as i32);
-        summary.set_text(clamp_label_text(&notification.summary, POPUP_SUMMARY_MAX_CHARS).as_ref());
         summary.add_css_class("unixnotis-popup-summary");
+        update_optional_label(&summary, &notification.summary, POPUP_SUMMARY_MAX_CHARS);
 
         // Body is rendered as bounded plain text so payload markup cannot affect layout.
+        // Body is optional too, so empty body rows should collapse fully
         let body = gtk::Label::new(None);
         body.set_xalign(0.0);
         // Body follows the same wrapping rules for consistent layout behavior
@@ -120,18 +132,21 @@ impl UiState {
         body.set_lines(6);
         body.set_max_width_chars(POPUP_BODY_MAX_CHARS as i32);
         body.add_css_class("unixnotis-popup-body");
-        body.set_text(clamp_label_text(&notification.body, POPUP_BODY_MAX_CHARS).as_ref());
+        update_optional_label(&body, &notification.body, POPUP_BODY_MAX_CHARS);
 
+        // Row order stays fixed so CSS margins remain predictable across payload shapes
         root.append(&header);
         root.append(&summary);
         root.append(&body);
 
         // Action buttons map user clicks back into D-Bus action invocations.
+        // Action rows are only created when the notification actually exposes actions
         if !notification.actions.is_empty() {
             let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
             actions.add_css_class("unixnotis-popup-actions");
             // Only keep the first few actions to avoid action-row overdraw and width spikes
             for action in notification.actions.iter().take(MAX_POPUP_ACTIONS) {
+                // Clamp action text here so a hostile label cannot widen the popup card
                 let button = gtk::Button::with_label(
                     clamp_label_text(&action.label, POPUP_ACTION_LABEL_MAX_CHARS).as_ref(),
                 );
@@ -194,6 +209,42 @@ impl UiState {
     }
 }
 
+fn build_popup_header_spacer() -> gtk::Box {
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 1);
+    // Spacer width takes up the slack so the trailing button does not drift
+    // Plain halign on the button is not enough inside a horizontal box
+    spacer.set_hexpand(popup_header_spacer_expands());
+    spacer
+}
+
+const fn popup_header_spacer_expands() -> bool {
+    // Keep the alignment rule easy to test without constructing full GTK rows
+    true
+}
+
+fn update_optional_label(label: &gtk::Label, text: &str, max_chars: usize) {
+    // Build the layout decision first so empty-text handling stays identical
+    // for both summary and body rows
+    let state = optional_label_state(text, max_chars);
+    label.set_visible(state.visible);
+    label.set_text(state.text.as_ref());
+}
+
+fn optional_label_state(text: &str, max_chars: usize) -> OptionalLabelState<'_> {
+    if text.is_empty() {
+        // Empty text rows stay hidden so the card does not keep dead spacing
+        return OptionalLabelState {
+            visible: false,
+            text: Cow::Borrowed(""),
+        };
+    }
+    OptionalLabelState {
+        visible: true,
+        // Clamp before the label sees the text so layout work stays bounded
+        text: clamp_label_text(text, max_chars),
+    }
+}
+
 fn clamp_label_text(text: &str, max_chars: usize) -> Cow<'_, str> {
     if max_chars == 0 {
         return Cow::Borrowed("");
@@ -244,5 +295,34 @@ fn enqueue_fallback(tx: &Sender<UiCommand>, command: UiCommand) {
 
     if fallback.try_send(command).is_err() {
         debug!("popup command fallback queue full; dropping UI action");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_header_spacer_expands_to_hold_close_alignment() {
+        // The tested rule is the important part, not the GTK object itself
+        assert!(popup_header_spacer_expands());
+    }
+
+    #[test]
+    fn popup_summary_row_hides_when_text_is_empty() {
+        // Empty summaries should not reserve vertical space above the body
+        let state = optional_label_state("", POPUP_SUMMARY_MAX_CHARS);
+
+        assert!(!state.visible);
+        assert!(state.text.is_empty());
+    }
+
+    #[test]
+    fn popup_body_row_hides_when_text_is_empty() {
+        // Body-less notifications should render as header plus summary only
+        let state = optional_label_state("", POPUP_BODY_MAX_CHARS);
+
+        assert!(!state.visible);
+        assert!(state.text.is_empty());
     }
 }

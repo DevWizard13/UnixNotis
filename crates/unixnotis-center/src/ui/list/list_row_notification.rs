@@ -38,6 +38,15 @@ pub(super) struct NotificationRowWidgets {
 // Hard caps keep very large payloads from blowing up row height
 const MAX_SUMMARY_LABEL_CHARS: usize = 160;
 const MAX_BODY_LABEL_CHARS: usize = 512;
+// Action labels stay bounded so one button cannot distort the whole row
+const MAX_ACTION_LABEL_CHARS: usize = 20;
+
+struct OptionalLabelState<'a> {
+    // Hidden rows should collapse instead of leaving dead card spacing
+    visible: bool,
+    // Borrow when possible so repeated row refreshes do not allocate
+    text: Cow<'a, str>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct IconSignature {
@@ -99,6 +108,7 @@ pub(super) fn build_notification_row(
     header.append(&spacer);
     header.append(&close_button);
 
+    // Summary is optional, so the update path decides later if the row should exist
     let summary_label = gtk::Label::new(None);
     summary_label.set_xalign(0.0);
     // Summary can wrap but stays bounded to three lines
@@ -109,6 +119,7 @@ pub(super) fn build_notification_row(
     summary_label.set_max_width_chars(88);
     summary_label.add_css_class("unixnotis-panel-summary");
 
+    // Body follows the same optional-row rule as summary text
     let body_label = gtk::Label::new(None);
     body_label.set_xalign(0.0);
     // Body gets more lines than summary but still has upper bounds
@@ -190,10 +201,10 @@ pub(super) fn update_notification_row(
         root.remove_css_class("stacked");
     }
 
+    // App name always renders, even when summary or body are missing
     row.app_label.set_text(&notification.app_name);
     // Clamp before GTK rendering to avoid giant layout passes
-    let summary = clamp_label_text(&notification.summary, MAX_SUMMARY_LABEL_CHARS);
-    row.summary_label.set_text(summary.as_ref());
+    update_summary_label(&row.summary_label, &notification.summary);
     update_body_label(&row.body_label, &notification.body);
     row.notify_id.set(notification.id);
 
@@ -214,17 +225,42 @@ pub(super) fn update_notification_row(
     }
 }
 
+fn update_summary_label(label: &gtk::Label, summary: &str) {
+    // Summary rows collapse fully when the sender leaves the title empty
+    update_optional_label(label, summary, MAX_SUMMARY_LABEL_CHARS);
+}
+
 fn update_body_label(label: &gtk::Label, body: &str) {
-    if body.is_empty() {
-        // Hide empty body to reduce visual noise
-        label.set_text("");
-        label.set_visible(false);
-        return;
+    // Body rows follow the same empty-text rule as summary rows
+    update_optional_label(label, body, MAX_BODY_LABEL_CHARS);
+}
+
+fn update_optional_label(label: &gtk::Label, text: &str, max_chars: usize) {
+    // Build the shared row state first so summary and body stay in sync
+    let state = optional_label_state(text, max_chars);
+    label.set_visible(state.visible);
+    label.set_text(state.text.as_ref());
+}
+
+fn optional_label_state(text: &str, max_chars: usize) -> OptionalLabelState<'_> {
+    if text.is_empty() {
+        // Empty text rows stay hidden so card spacing stays honest
+        return OptionalLabelState {
+            visible: false,
+            text: Cow::Borrowed(""),
+        };
     }
-    label.set_visible(true);
-    // Notification bodies are treated as plain text to avoid markup rendering surprises.
-    let body = clamp_label_text(body, MAX_BODY_LABEL_CHARS);
-    label.set_text(body.as_ref());
+    OptionalLabelState {
+        visible: true,
+        // Notification text stays plain so layout cannot be changed by markup
+        text: clamp_label_text(text, max_chars),
+    }
+}
+
+fn clamp_action_label_text(text: &str) -> Cow<'_, str> {
+    // Action text uses the same clamp rule every time so row width stays stable
+    // This keeps the panel from being stretched by one bad button label
+    clamp_label_text(text, MAX_ACTION_LABEL_CHARS)
 }
 
 fn clamp_label_text(text: &str, max_chars: usize) -> Cow<'_, str> {
@@ -283,7 +319,9 @@ fn update_actions(
     }
 
     for action in &notification.actions {
-        let button = gtk::Button::with_label(&action.label);
+        // Bound action text so one long label cannot stretch the whole row
+        // Clamp before button creation so GTK never measures the oversized string
+        let button = gtk::Button::with_label(clamp_action_label_text(&action.label).as_ref());
         button.add_css_class("unixnotis-panel-action");
         button.add_css_class("unixnotis-notification-action");
         let action_key = action.key.clone();
@@ -302,5 +340,29 @@ fn update_actions(
             );
         });
         actions_box.append(&button);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_summary_row_hides_when_text_is_empty() {
+        // Empty summaries should not leave a blank strip above the body
+        let state = optional_label_state("", MAX_SUMMARY_LABEL_CHARS);
+
+        assert!(!state.visible);
+        assert!(state.text.is_empty());
+    }
+
+    #[test]
+    fn panel_action_labels_are_clamped_before_button_build() {
+        // Long labels should be shortened before the action row sees them
+        let long_label = "This action label is much longer than the row should allow";
+        let rendered = clamp_action_label_text(long_label);
+
+        assert!(rendered.len() < long_label.len());
+        assert!(rendered.ends_with('…'));
     }
 }
