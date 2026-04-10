@@ -32,7 +32,6 @@ Please keep contributions in scope for the project.
 - Do not add background work, polling, or timers unless they are clearly necessary and bounded
 - Prefer event-driven behavior over periodic work when possible
 - Keep memory use predictable and avoid unbounded queues, caches, or retries
-- Avoid `unsafe` unless it has been discussed and there is a clear reason it cannot be avoided
 
 ## Performance expectations
 
@@ -42,7 +41,6 @@ Performance matters here.
 - Repeated work should be coalesced, cached, or bounded where appropriate
 - Long-running processes should not slowly accumulate memory or CPU overhead
 - Shell commands, subprocesses, watchers, and async tasks should have a clear lifecycle
-- If a change touches hot paths, measure it instead of guessing
 
 Good rules of thumb:
 
@@ -62,13 +60,13 @@ Good rules of thumb:
 
 ## Testing
 
-For code changes, at a minimum, run:
+At a minimum, all code changes should pass the following:
 
 ```sh
-cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
+If a full run is not practical, say what was tested and what was not.
 
 ## Pull requests
 
@@ -92,38 +90,48 @@ If fixing a bug:
 - Prefer fixes that address the cause instead of hiding the symptom
 - Add or update tests when practical
 
-## Security and safety
-
-- Treat all external input as untrusted
-- Prefer bounded parsing, bounded reads, and bounded queues
-- Avoid insecure defaults
-- Avoid remote or shell-expanding behavior unless it is clearly intended and validated
-
-If a change has security implications, call that out in the PR.
-
 ## AI-assisted contributions
 
-AI-assisted contributions are allowed.
+AI-assisted contributions are allowed, but only within clear limits.
 
-By submitting AI-assisted code, the contributor agrees to the following:
+We recognize the usefulness and technological progress of AI models for software development. However, it is important to set boundaries for how those tools may and may not be used in UnixNotis contributions.
 
-- The contributor accepts full responsibility for all code they submit
+This section should be treated as a whitelist. If a use is not clearly acceptable here, assume it is not acceptable.
+
+Acceptable uses include:
+
+- Using AI locally to help understand the codebase or documentation
+- Using AI locally to draft patches, tests, or documentation
+- Using AI locally to help review or explain code before submission
+
+Not acceptable:
+
+- Fully autonomous submissions with no real human review
+- AI-generated pull requests, issue reports, or review replies posted as-is
+- AI-written developer-facing communication submitted without being checked and rewritten by the contributor
+- Submitting code that is not understood by the person sending it
+
+If AI is used, the contributor accepts full responsibility for the result. This means:
+
 - The contributor has read, understood, and reviewed the generated code before submission
 - The contributor has verified that the code is correct, in scope, and maintainable
 - The contributor has checked for unnecessary complexity, regressions, and waste
 - The contributor is responsible for licensing, attribution, and policy compliance for submitted content
 
-AI output is not an excuse for low-quality, unreviewed, or unexplained changes.
+AI output is not an excuse for low-quality, unreviewed, or unexplained changes. Contributions that ignore these rules may be rejected or closed.
+
+Shout out to vaxerski on GitHub for the inspiration behind this section:
+[hyprwm/.github AI usage policy](https://github.com/hyprwm/.github/blob/main/policies/AI_USAGE.md)
 
 ## Ways to support the project
 
-> And if the project is useful, but there is no time to contribute code, that is fine too. There are other easy ways to support the project and show appreciation:
-> - Star the project
-> - Tweet or post about it
-> - Mention UnixNotis in another project's README
-> - Mention the project at local meetups
-> - Tell friends or coworkers who might find it useful
-> - Report bugs clearly and with enough detail to reproduce them
+if the project is useful, but there is no time to contribute code, that is fine too. There are other easy ways to support the project and show appreciation:
+- Star the project
+- Tweet or post about it
+- Mention UnixNotis in another project's README
+- Mention the project at local meetups
+- Tell friends or coworkers who might find it useful
+- Report bugs clearly and with enough detail to reproduce them
 
 ## Questions
 
