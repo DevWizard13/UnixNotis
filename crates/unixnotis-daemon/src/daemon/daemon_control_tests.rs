@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use unixnotis_core::{INHIBIT_SCOPE_ALL, INHIBIT_SCOPE_POPUPS};
 
 use super::auth::{build_trusted_control_snapshots, is_trusted_control_executable_path_in_dir};
+use super::clear_all_signal_plan;
 use super::sanitize::{normalize_inhibit_scope, sanitize_inhibit_reason};
 
 fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -114,4 +115,27 @@ fn normalize_inhibit_scope_accepts_supported_values() {
         INHIBIT_SCOPE_POPUPS
     );
     assert!(normalize_inhibit_scope(2).is_err());
+}
+
+#[test]
+fn clear_all_with_no_active_rows_still_invalidates_snapshot() {
+    let plan = clear_all_signal_plan(&[]);
+
+    // No live rows means there is nothing to close
+    assert!(!plan.emit_close_signals);
+    // Empty clear is still the escape hatch for stale client rows
+    assert!(plan.emit_snapshot_invalidated);
+    // State refresh still needs a chance to run
+    assert!(plan.emit_state_changed);
+}
+
+#[test]
+fn clear_all_with_active_rows_keeps_close_fanout_and_refresh() {
+    let plan = clear_all_signal_plan(&[11, 12]);
+
+    // Active rows still need the normal close signals
+    assert!(plan.emit_close_signals);
+    // Clients still need a full refresh after the clear
+    assert!(plan.emit_snapshot_invalidated);
+    assert!(plan.emit_state_changed);
 }

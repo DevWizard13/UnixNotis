@@ -40,6 +40,24 @@ const CLEAR_ALL_CONCURRENCY: usize = 64;
 // Cap inhibitor count so memory use stays bounded even under abusive clients
 const MAX_ACTIVE_INHIBITORS: u32 = 128;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClearAllSignalPlan {
+    emit_close_signals: bool,
+    emit_snapshot_invalidated: bool,
+    emit_state_changed: bool,
+}
+
+fn clear_all_signal_plan(ids: &[u32]) -> ClearAllSignalPlan {
+    ClearAllSignalPlan {
+        // Only active rows need close fanout
+        emit_close_signals: !ids.is_empty(),
+        // Even an empty clear can be the only thing that fixes a stale client list
+        emit_snapshot_invalidated: true,
+        // Counters still need a refresh chance after the clear path
+        emit_state_changed: true,
+    }
+}
+
 impl ControlServer {
     pub fn new(state: Arc<DaemonState>) -> Self {
         // Lightweight wrapper around the shared daemon state
@@ -311,21 +329,28 @@ impl ControlServer {
     async fn clear_all(&self, #[zbus(header)] header: Header<'_>) -> zbus::fdo::Result<()> {
         self.authorize_control_call(&header, "ClearAll").await?;
         // Drain active notifications in one lock to avoid quadratic scans.
-        let (ids, had_history) = {
+        let ids = {
             let mut store = self.state.store.lock().await;
             let ids = store.drain_active_ids();
-            // History-only clears still need a fresh snapshot on every client
-            let had_history = store.history_len() != 0;
             // Clear live and saved items
             store.clear_history();
-            (ids, had_history)
+            ids
         };
+        let signal_plan = clear_all_signal_plan(&ids);
         // Active timers no longer matter once the list has been wiped
         self.state.cancel_expirations(&ids).await;
 
-        if ids.is_empty() && !had_history {
-            if let Err(err) = self.state.emit_state_changed().await {
-                warn!(?err, "failed to emit state_changed after clear_all");
+        if !signal_plan.emit_close_signals {
+            if signal_plan.emit_snapshot_invalidated {
+                if let Err(err) = self.state.emit_snapshot_invalidated().await {
+                    // A stale client row still needs a hard refresh even when the daemon is empty
+                    warn!(?err, "failed to emit snapshot_invalidated after clear_all");
+                }
+            }
+            if signal_plan.emit_state_changed {
+                if let Err(err) = self.state.emit_state_changed().await {
+                    warn!(?err, "failed to emit state_changed after clear_all");
+                }
             }
             return Ok(());
         }
@@ -372,13 +397,17 @@ impl ControlServer {
                 }
             })
             .await;
-        if let Err(err) = self.state.emit_snapshot_invalidated().await {
-            // Clients can still fall back to later reconnect seeding if this broadcast is missed
-            warn!(?err, "failed to emit snapshot_invalidated after clear_all");
+        if signal_plan.emit_snapshot_invalidated {
+            if let Err(err) = self.state.emit_snapshot_invalidated().await {
+                // Clients can still fall back to later reconnect seeding if this broadcast is missed
+                warn!(?err, "failed to emit snapshot_invalidated after clear_all");
+            }
         }
-        if let Err(err) = self.state.emit_state_changed().await {
-            // State was updated locally even if listeners missed this broadcast
-            warn!(?err, "failed to emit state_changed after clear_all");
+        if signal_plan.emit_state_changed {
+            if let Err(err) = self.state.emit_state_changed().await {
+                // State was updated locally even if listeners missed this broadcast
+                warn!(?err, "failed to emit state_changed after clear_all");
+            }
         }
         Ok(())
     }
