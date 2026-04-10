@@ -93,7 +93,7 @@ impl DaemonState {
     pub async fn close_notification(&self, id: u32, reason: CloseReason) -> zbus::Result<()> {
         let removed = {
             let mut store = self.store.lock().await;
-            store.close(id)
+            store.close(id, reason)
         };
         if removed.is_none() {
             return Ok(());

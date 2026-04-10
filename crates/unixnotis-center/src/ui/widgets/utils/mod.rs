@@ -10,6 +10,8 @@ mod refresh_backoff;
 mod slider_icons;
 // Slider value parsing and muted-state helpers
 mod slider_parse;
+// Shared watch cleanup worker keeps teardown off the GTK thread
+mod watch_reaper;
 // Long-running command watch lifecycle helpers
 mod watch;
 

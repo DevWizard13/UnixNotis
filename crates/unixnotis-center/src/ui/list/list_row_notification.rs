@@ -243,7 +243,7 @@ fn update_optional_label(label: &gtk::Label, text: &str, max_chars: usize) {
 }
 
 fn optional_label_state(text: &str, max_chars: usize) -> OptionalLabelState<'_> {
-    if text.is_empty() {
+    if !has_visible_text(text) {
         // Empty text rows stay hidden so card spacing stays honest
         return OptionalLabelState {
             visible: false,
@@ -255,6 +255,11 @@ fn optional_label_state(text: &str, max_chars: usize) -> OptionalLabelState<'_> 
         // Notification text stays plain so layout cannot be changed by markup
         text: clamp_label_text(text, max_chars),
     }
+}
+
+fn has_visible_text(text: &str) -> bool {
+    // Layout only needs to know if the row has real visible content
+    text.chars().any(|ch| !ch.is_whitespace())
 }
 
 fn clamp_action_label_text(text: &str) -> Cow<'_, str> {
@@ -354,6 +359,24 @@ mod tests {
 
         assert!(!state.visible);
         assert!(state.text.is_empty());
+    }
+
+    #[test]
+    fn panel_summary_row_hides_when_text_is_only_whitespace() {
+        // Space-only payloads should collapse the same as truly empty payloads
+        let state = optional_label_state("\n\t ", MAX_SUMMARY_LABEL_CHARS);
+
+        assert!(!state.visible);
+        assert!(state.text.is_empty());
+    }
+
+    #[test]
+    fn panel_summary_row_shows_when_text_has_real_content() {
+        // Leading and trailing space should not hide actual notification text
+        let state = optional_label_state("  hello  ", MAX_SUMMARY_LABEL_CHARS);
+
+        assert!(state.visible);
+        assert_eq!(state.text.as_ref(), "  hello  ");
     }
 
     #[test]

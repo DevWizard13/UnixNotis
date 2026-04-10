@@ -231,7 +231,7 @@ fn update_optional_label(label: &gtk::Label, text: &str, max_chars: usize) {
 }
 
 fn optional_label_state(text: &str, max_chars: usize) -> OptionalLabelState<'_> {
-    if text.is_empty() {
+    if !has_visible_text(text) {
         // Empty text rows stay hidden so the card does not keep dead spacing
         return OptionalLabelState {
             visible: false,
@@ -243,6 +243,11 @@ fn optional_label_state(text: &str, max_chars: usize) -> OptionalLabelState<'_> 
         // Clamp before the label sees the text so layout work stays bounded
         text: clamp_label_text(text, max_chars),
     }
+}
+
+fn has_visible_text(text: &str) -> bool {
+    // Visibility depends on real content, not just raw string length
+    text.chars().any(|ch| !ch.is_whitespace())
 }
 
 fn clamp_label_text(text: &str, max_chars: usize) -> Cow<'_, str> {
@@ -324,5 +329,23 @@ mod tests {
 
         assert!(!state.visible);
         assert!(state.text.is_empty());
+    }
+
+    #[test]
+    fn popup_body_row_hides_when_text_is_only_whitespace() {
+        // Space-only bodies should not leave a blank band in the popup card
+        let state = optional_label_state("\n\t ", POPUP_BODY_MAX_CHARS);
+
+        assert!(!state.visible);
+        assert!(state.text.is_empty());
+    }
+
+    #[test]
+    fn popup_summary_row_shows_when_text_has_real_content() {
+        // Real text should stay intact even when it has leading whitespace
+        let state = optional_label_state("  hello  ", POPUP_SUMMARY_MAX_CHARS);
+
+        assert!(state.visible);
+        assert_eq!(state.text.as_ref(), "  hello  ");
     }
 }

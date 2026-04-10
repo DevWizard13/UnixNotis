@@ -96,6 +96,7 @@ impl UiState {
         let list_config = list::NotificationListConfig {
             max_active: config.history.max_active,
             max_entries: config.history.max_entries,
+            transient_to_history: config.history.transient_to_history,
             empty_text: config.panel.empty_text.clone(),
             empty_offset_top: config.panel.empty_offset_top,
         };

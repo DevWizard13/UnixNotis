@@ -49,9 +49,27 @@ pub fn popup_allowed_by_state(urgency: u8, state: &ControlState) -> bool {
     true
 }
 
+pub fn should_archive_closed_notification(
+    close_reason: CloseReason,
+    is_transient: bool,
+    transient_to_history: bool,
+) -> bool {
+    // User dismiss means the row should be gone, not archived
+    if matches!(close_reason, CloseReason::DismissedByUser) {
+        return false;
+    }
+    // Transient rows only belong in history when config explicitly allows it
+    if is_transient && !transient_to_history {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{popup_allowed_by_state, ControlState};
+    use super::{
+        popup_allowed_by_state, should_archive_closed_notification, CloseReason, ControlState,
+    };
     use crate::Urgency;
 
     #[test]
@@ -72,6 +90,48 @@ mod tests {
         };
         assert!(popup_allowed_by_state(Urgency::Critical as u8, &state));
         assert!(!popup_allowed_by_state(Urgency::Normal as u8, &state));
+    }
+
+    #[test]
+    fn user_dismiss_never_archives() {
+        assert!(!should_archive_closed_notification(
+            CloseReason::DismissedByUser,
+            false,
+            true
+        ));
+        assert!(!should_archive_closed_notification(
+            CloseReason::DismissedByUser,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn transient_archive_follows_config() {
+        assert!(!should_archive_closed_notification(
+            CloseReason::Expired,
+            true,
+            false
+        ));
+        assert!(should_archive_closed_notification(
+            CloseReason::Expired,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn non_transient_close_still_archives() {
+        assert!(should_archive_closed_notification(
+            CloseReason::Expired,
+            false,
+            false
+        ));
+        assert!(should_archive_closed_notification(
+            CloseReason::ClosedByCall,
+            false,
+            true
+        ));
     }
 }
 

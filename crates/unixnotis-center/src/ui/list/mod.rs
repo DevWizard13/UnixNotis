@@ -67,6 +67,8 @@ pub struct NotificationList {
     dirty_groups: HashSet<Rc<str>>,
     // Lowercased filter query for notification search in the panel header.
     filter_query: Option<String>,
+    // Local close handling needs the same transient history rule as the daemon
+    transient_to_history: bool,
     max_active: usize,
     max_entries: usize,
 }
@@ -75,6 +77,7 @@ pub struct NotificationList {
 pub struct NotificationListConfig {
     pub max_active: usize,
     pub max_entries: usize,
+    pub transient_to_history: bool,
     pub empty_text: String,
     pub empty_offset_top: i32,
 }
@@ -191,12 +194,15 @@ impl NotificationList {
             needs_rebuild: false,
             dirty_groups: HashSet::new(),
             filter_query: None,
+            transient_to_history: config.transient_to_history,
             max_active: config.max_active,
             max_entries: config.max_entries,
         }
     }
 
     pub fn apply_config(&mut self, config: &NotificationListConfig, has_widgets: bool) {
+        // Future close handling should use the latest runtime policy
+        self.transient_to_history = config.transient_to_history;
         if self.empty_text != config.empty_text {
             update_empty_row(&self.empty_overlay, &config.empty_text);
             self.empty_text = config.empty_text.clone();

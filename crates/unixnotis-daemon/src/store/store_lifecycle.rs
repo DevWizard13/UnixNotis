@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use unixnotis_core::{popup_allowed_by_state, ControlState, Notification, Urgency};
+use unixnotis_core::{
+    popup_allowed_by_state, should_archive_closed_notification, CloseReason, ControlState,
+    Notification, Urgency,
+};
 
 use super::{DismissOutcome, InsertOutcome, NotificationStore};
 
@@ -65,13 +68,13 @@ impl NotificationStore {
         }
     }
 
-    pub fn close(&mut self, id: u32) -> Option<Arc<Notification>> {
+    pub fn close(&mut self, id: u32, reason: CloseReason) -> Option<Arc<Notification>> {
         // Active removal and expiration cleanup always happen together
         let removed = self.active.shift_remove(&id);
         self.expirations.remove(&id);
         if let Some(notification) = removed.clone() {
-            // History entries are created only when a notification really leaves active state
-            self.push_history(notification.clone());
+            // Closed rows and panel rows should follow the same archive rule
+            self.push_history(notification.clone(), reason);
         }
         removed
     }
@@ -124,7 +127,8 @@ impl NotificationStore {
             while let Some((id, notification)) = self.active.shift_remove_index(0) {
                 // Evicted notifications should not retain pending expiration entries
                 self.expirations.remove(&id);
-                self.push_history(notification);
+                // Active-cap eviction behaves like a daemon-side close for history policy
+                self.push_history(notification, CloseReason::Undefined);
                 evicted.push(id);
             }
             return evicted;
@@ -136,7 +140,8 @@ impl NotificationStore {
             if let Some((id, notification)) = self.active.shift_remove_index(0) {
                 // Eviction path mirrors close path so state stays consistent
                 self.expirations.remove(&id);
-                self.push_history(notification);
+                // Evicted rows still need the same archive rule as any other close
+                self.push_history(notification, CloseReason::Undefined);
                 evicted.push(id);
             } else {
                 // Defensive break for impossible map/index mismatch cases
@@ -146,14 +151,18 @@ impl NotificationStore {
         evicted
     }
 
-    fn push_history(&mut self, notification: Arc<Notification>) {
+    fn push_history(&mut self, notification: Arc<Notification>, reason: CloseReason) {
         if self.config.history.max_entries == 0 {
             // Clear keeps memory bounded when history feature is disabled
             self.history.clear();
             return;
         }
-        // Transient notifications are optional in history by config policy
-        if notification.is_transient && !self.config.history.transient_to_history {
+        // One shared archive rule keeps daemon and center close handling aligned
+        if !should_archive_closed_notification(
+            reason,
+            notification.is_transient,
+            self.config.history.transient_to_history,
+        ) {
             return;
         }
         // to_history strips non-history-only fields and keeps stored payload compact

@@ -5,7 +5,7 @@ use super::{contains_ci, NotificationStore};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
-use unixnotis_core::{Config, InhibitMode, Notification, NotificationImage, Urgency};
+use unixnotis_core::{CloseReason, Config, InhibitMode, Notification, NotificationImage, Urgency};
 use zbus::zvariant::OwnedValue;
 
 #[test]
@@ -153,7 +153,7 @@ fn max_entries_zero_drops_history_on_close() {
     let mut store = make_store_with_limits(10, 0);
 
     let outcome = store.insert(make_notification("first"), 0);
-    store.close(outcome.notification.id);
+    store.close(outcome.notification.id, CloseReason::Expired);
 
     assert_eq!(store.history_len(), 0);
 }
@@ -163,7 +163,7 @@ fn replace_id_in_history_reuses_id_and_clears_entry() {
     let mut store = make_store_with_limits(2, 10);
 
     let first = store.insert(make_notification("first"), 0);
-    store.close(first.notification.id);
+    store.close(first.notification.id, CloseReason::Expired);
     assert_eq!(store.history_len(), 1);
 
     // Replacement should reuse the original ID and remove the history entry.
@@ -177,7 +177,7 @@ fn replace_id_in_history_reuses_id_and_clears_entry() {
     assert_eq!(active[0].summary, "replacement");
 
     // Closing the replacement should re-add a single history entry for the updated notification.
-    store.close(replaced.notification.id);
+    store.close(replaced.notification.id, CloseReason::Expired);
     let history = store.list_history();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].summary, "replacement");
@@ -191,7 +191,7 @@ fn replace_id_rejected_for_different_sender() {
         make_notification_with_sender("first", ":1.sender-a", 101, 1),
         0,
     );
-    store.close(first.notification.id);
+    store.close(first.notification.id, CloseReason::Expired);
     assert_eq!(store.history_len(), 1);
 
     // Cross-sender replacement must allocate a fresh id and keep prior history intact.
@@ -229,6 +229,36 @@ fn max_entries_zero_drops_history_on_insert() {
     assert_eq!(outcome.evicted.len(), 1);
     assert!(store.list_active().is_empty());
     assert_eq!(store.history_len(), 0);
+}
+
+#[test]
+fn transient_close_skips_history_when_config_disables_it() {
+    let mut config = Config::default();
+    // This case is the policy that the center must mirror exactly
+    config.history.transient_to_history = false;
+    let mut store = NotificationStore::new(config);
+
+    let mut notification = make_notification("transient");
+    notification.is_transient = true;
+    let outcome = store.insert(notification, 0);
+    store.close(outcome.notification.id, CloseReason::Expired);
+
+    assert_eq!(store.history_len(), 0);
+}
+
+#[test]
+fn transient_close_archives_when_config_allows_it() {
+    let mut config = Config::default();
+    // Explicit opt-in should keep the closed row in history
+    config.history.transient_to_history = true;
+    let mut store = NotificationStore::new(config);
+
+    let mut notification = make_notification("transient");
+    notification.is_transient = true;
+    let outcome = store.insert(notification, 0);
+    store.close(outcome.notification.id, CloseReason::Expired);
+
+    assert_eq!(store.history_len(), 1);
 }
 
 #[test]

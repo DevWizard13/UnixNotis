@@ -55,6 +55,8 @@ impl Notification {
             body: self.body.clone(),
             actions: self.actions.clone(),
             urgency: self.urgency.as_u8(),
+            // Center and popup policy both need the transient bit to stay in sync
+            is_transient: self.is_transient,
             // UIs only need the text, actions, and image payload used for rendering
             image: self.image.clone(),
             // Protocol flags and sender metadata stay daemon-side to keep D-Bus payloads small
@@ -70,6 +72,8 @@ impl Notification {
             body: self.body.clone(),
             actions: self.actions.clone(),
             urgency: self.urgency.as_u8(),
+            // History policy still depends on the transient bit in panel rows
+            is_transient: self.is_transient,
             // List rows should avoid carrying raw image buffers across D-Bus
             image: self.image.for_listing(),
             // Protocol flags and sender metadata stay daemon-side to keep D-Bus payloads small
@@ -120,6 +124,8 @@ pub struct NotificationView {
     pub body: String,
     pub actions: Vec<Action>,
     pub urgency: u8,
+    // Close handling needs this flag so history policy stays shared
+    pub is_transient: bool,
     // Image metadata intended for UI usage.
     pub image: NotificationImage,
 }

@@ -5,7 +5,7 @@
 use std::rc::Rc;
 
 use tracing::debug;
-use unixnotis_core::{CloseReason, NotificationView};
+use unixnotis_core::{should_archive_closed_notification, CloseReason, NotificationView};
 
 use super::list_item::{RowData, RowItem};
 use super::{NotificationEntry, NotificationList};
@@ -195,8 +195,16 @@ impl NotificationList {
 
     pub fn mark_closed(&mut self, id: u32, reason: CloseReason) {
         let group_key = self.entries.get(&id).map(|entry| entry.app_key.clone());
-        if matches!(reason, CloseReason::DismissedByUser) {
-            // User-dismissed notifications are removed entirely rather than archived.
+        let should_archive = self
+            .entries
+            .get(&id)
+            .map(|entry| {
+                should_archive_entry(entry.view.as_ref(), reason, self.transient_to_history)
+            })
+            .unwrap_or(false);
+
+        if !should_archive {
+            // Rows that do not belong in history should disappear fully from the list
             self.remove_entry(id);
             if let Some(key) = group_key {
                 self.dirty_groups.insert(key);
@@ -322,5 +330,65 @@ impl NotificationList {
         }
         self.active_order.retain(|entry| *entry != id);
         self.history_order.retain(|entry| *entry != id);
+    }
+}
+
+fn should_archive_entry(
+    notification: &NotificationView,
+    reason: CloseReason,
+    transient_to_history: bool,
+) -> bool {
+    // The center should follow the daemon archive rule instead of guessing locally
+    should_archive_closed_notification(reason, notification.is_transient, transient_to_history)
+}
+
+#[cfg(test)]
+mod tests {
+    use unixnotis_core::{Action, NotificationImage};
+
+    use super::*;
+
+    fn make_view(is_transient: bool) -> NotificationView {
+        NotificationView {
+            id: 7,
+            app_name: "Test".to_string(),
+            summary: "summary".to_string(),
+            body: "body".to_string(),
+            actions: vec![Action {
+                key: "default".to_string(),
+                label: "Open".to_string(),
+            }],
+            urgency: 1,
+            is_transient,
+            image: NotificationImage::default(),
+        }
+    }
+
+    #[test]
+    fn transient_rows_follow_config_when_closed() {
+        assert!(!should_archive_entry(
+            &make_view(true),
+            CloseReason::Expired,
+            false
+        ));
+        assert!(should_archive_entry(
+            &make_view(true),
+            CloseReason::Expired,
+            true
+        ));
+    }
+
+    #[test]
+    fn user_dismiss_never_archives_locally() {
+        assert!(!should_archive_entry(
+            &make_view(false),
+            CloseReason::DismissedByUser,
+            true
+        ));
+        assert!(!should_archive_entry(
+            &make_view(true),
+            CloseReason::DismissedByUser,
+            true
+        ));
     }
 }

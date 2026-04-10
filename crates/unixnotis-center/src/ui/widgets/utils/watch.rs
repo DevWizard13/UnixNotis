@@ -10,12 +10,12 @@ use std::time::Duration;
 use async_channel::{TryRecvError, TrySendError};
 use gtk::glib;
 use tracing::warn;
-use unixnotis_core::util;
-use unixnotis_core::PanelDebugLevel;
+use unixnotis_core::{util, PanelDebugLevel};
 
 use crate::debug;
 
-use super::command::{kill_process_group, resolve_command_plan, CommandKind};
+use super::command::{resolve_command_plan, CommandKind};
+use super::watch_reaper::enqueue_watch_cleanup;
 
 pub(in crate::ui::widgets) struct CommandWatch {
     // Command string retained for diagnostics during shutdown
@@ -44,22 +44,8 @@ impl Drop for CommandWatch {
             return;
         }
 
-        // Cleanup runs off the GTK thread to avoid UI stalls on process shutdown.
-        std::thread::spawn(move || {
-            if let Some(mut child) = child {
-                let pid = child.id() as i32;
-                kill_process_group(pid);
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            if let Some(handle) = thread {
-                let _ = handle.join();
-            }
-            debug::log(PanelDebugLevel::Info, || {
-                let snippet = util::log_snippet(&cmd);
-                format!("watch cleanup complete: {snippet}")
-            });
-        });
+        // Queue teardown onto the shared reaper so drop stays quick under churn
+        enqueue_watch_cleanup(cmd, child, thread);
     }
 }
 

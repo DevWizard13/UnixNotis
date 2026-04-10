@@ -15,6 +15,7 @@ fn make_view(id: u32, urgency: Urgency, summary: &str, body: &str) -> Notificati
             label: "Open".to_string(),
         }],
         urgency: urgency as u8,
+        is_transient: false,
         // Test rows only need the transport fields used by the popup UI
         image: NotificationImage::default(),
     }
