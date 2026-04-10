@@ -1,0 +1,97 @@
+name: Bug report
+description: Report a reproducible bug or regression in UnixNotis
+title: "[Bug]: "
+labels:
+  - bug
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug.
+
+        Please keep reports focused and reproducible.
+
+  - type: textarea
+    id: tested_versions
+    attributes:
+      label: Tested versions
+      description: |
+        Say what version, commit, branch, or release you tested.
+        If known, mention whether this looks like a regression.
+      placeholder: |
+        Reproducible in: master @ abc1234
+        Also tested: v0.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        Include the environment details that matter for the bug.
+      placeholder: |
+        - Distro:
+        - Wayland compositor (Hyprland, Sway, etc):
+        - Install method:
+        - Hardware details if relevant:
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue_description
+    attributes:
+      label: Issue description
+      description: |
+        Describe the bug clearly.
+        What is broken, and what did you expect to happen instead?
+        Paste logs and code as text, not only screenshots.
+      placeholder: The panel stops opening after long uptime, even though the click handler still runs
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps_to_reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Exact steps to trigger the problem.
+        Reproducible reports are much easier to fix.
+      placeholder: |
+        1. Start UnixNotis
+        2. Do the thing that triggers the issue
+        3. Do the next step needed to reproduce it
+        4. Observe the broken behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: What should happen
+      placeholder: The panel should open normally
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs_and_output
+    attributes:
+      label: Logs or terminal output
+      description: |
+        Paste relevant logs, warnings, journal output, or command output here.
+        If a screenshot helps explain the problem, include it here too.
+      placeholder: Paste logs here
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues before opening this report
+          required: true
+        - label: I included enough detail for someone else to try to reproduce the issue
+          required: true
+        - label: I tested this on the current `master` branch or the latest release available to me, or explained why I could not
+          required: true
