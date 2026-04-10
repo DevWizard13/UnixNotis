@@ -1,0 +1,84 @@
+name: Feature request
+description: Suggest a focused feature or improvement for UnixNotis
+title: "[Feature]: "
+labels:
+  - enhancement
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest an improvement.
+
+        Please keep requests focused, in scope, and specific enough to discuss clearly.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: |
+        Describe the pain point first.
+        What is missing, awkward, or harder than it should be?
+      placeholder: |
+        When using UnixNotis for ...
+        the current behavior makes it hard to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What should happen instead?
+      description: |
+        Describe the feature or behavior change being requested.
+        Keep it concrete.
+      placeholder: |
+        UnixNotis should ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Why does this belong in UnixNotis?
+      description: |
+        Explain why this fits the project instead of belonging in another tool,
+        a compositor config, or a separate helper script.
+      placeholder: |
+        This fits UnixNotis because ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds considered
+      description: |
+        Include any current workaround, config-based approach, or alternative design.
+        If none were considered, say so.
+      placeholder: |
+        Current workaround:
+        Alternative approach:
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: |
+        Add anything else that helps explain the request.
+        Mockups, screenshots, examples, or links are fine here.
+      placeholder: Optional
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues before opening this request
+          required: true
+        - label: I read the contributing guide and this request appears to stay within project scope
+          required: true
+        - label: I explained the problem and not only the solution I had in mind
+          required: true
