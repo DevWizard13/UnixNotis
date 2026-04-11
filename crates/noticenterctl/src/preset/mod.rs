@@ -5,10 +5,11 @@
 
 mod archive;
 mod export;
-mod files;
+mod filesystem;
 mod import;
 mod inspect;
 mod manifest;
+mod pathing;
 
 use anyhow::Result;
 use std::path::Path;

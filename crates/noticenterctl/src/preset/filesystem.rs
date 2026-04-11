@@ -1,7 +1,8 @@
-//! Path, walk, and write helpers for preset export and import
+//! Filesystem helpers for preset export and import
 //!
-//! This module owns path normalization, tree walking, backup directory naming,
-//! and safe file writes so export and import can stay focused on workflow
+//! This module owns the real disk work for presets:
+//! walking the config tree, checking live target paths,
+//! creating backup directories, and writing files safely
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Local;
@@ -10,11 +11,8 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub(super) const PRESET_EXTENSION: &str = "unixnotis";
-// Manifest lives at the root of the archive for easy manual inspection
-pub(super) const MANIFEST_ARCHIVE_PATH: &str = "manifest.toml";
-// Payload files live under one prefix so manifest and data never collide
-pub(super) const PAYLOAD_ARCHIVE_DIR: &str = "payload";
+use super::pathing::{normalize_relative_path, relative_path_matches_exclusion};
+
 const BACKUP_PREFIX: &str = "Backup-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,96 +33,6 @@ pub(super) struct CollectedConfigFiles {
     pub(super) skipped_symlinks: Vec<PathBuf>,
     // Sockets and special files are skipped for the same portability reason
     pub(super) skipped_non_regular: Vec<PathBuf>,
-}
-
-pub(super) fn validate_preset_bundle_path(path: &Path) -> Result<()> {
-    // Preset files use one dedicated extension so CLI intent stays obvious
-    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    if extension.eq_ignore_ascii_case(PRESET_EXTENSION) {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "preset file must use the .{} extension: {}",
-        PRESET_EXTENSION,
-        path.display()
-    ))
-}
-
-pub(super) fn parse_except_paths(values: &[String]) -> Result<Vec<PathBuf>> {
-    let mut parsed = Vec::new();
-    for value in values {
-        // Every exclusion is normalized once so matching stays predictable later
-        parsed.push(normalize_relative_path(Path::new(value))?);
-    }
-    Ok(parsed)
-}
-
-pub(super) fn normalize_relative_path(path: &Path) -> Result<PathBuf> {
-    // Empty or absolute paths would make import and exclusion rules ambiguous
-    if path.as_os_str().is_empty() {
-        return Err(anyhow!("empty relative path is not allowed"));
-    }
-    if path.is_absolute() {
-        return Err(anyhow!(
-            "path must be relative to the UnixNotis config root: {}",
-            path.display()
-        ));
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            // `.` adds no meaning, so it is stripped out during normalization
-            Component::CurDir => {}
-            // `..` would let a bundle or flag escape the config root
-            Component::ParentDir => {
-                return Err(anyhow!(
-                    "parent traversal is not allowed in preset paths: {}",
-                    path.display()
-                ));
-            }
-            // Absolute and prefix components are already rejected above
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(anyhow!(
-                    "absolute paths are not allowed in preset paths: {}",
-                    path.display()
-                ));
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-
-    if normalized.as_os_str().is_empty() {
-        return Err(anyhow!("path resolved to an empty relative path"));
-    }
-    Ok(normalized)
-}
-
-pub(super) fn relative_path_matches_exclusion(
-    relative_path: &Path,
-    exclusions: &[PathBuf],
-) -> bool {
-    // Directory exclusions match all descendants so one flag can keep a whole subtree local
-    exclusions
-        .iter()
-        .any(|excluded| relative_path == excluded || relative_path.starts_with(excluded))
-}
-
-pub(super) fn archive_payload_path(relative_path: &Path) -> PathBuf {
-    // Bundle payload is namespaced under one folder to avoid clashes with manifest files
-    Path::new(PAYLOAD_ARCHIVE_DIR).join(relative_path)
-}
-
-pub(super) fn archive_payload_relative(path: &Path) -> Result<Option<PathBuf>> {
-    if path == Path::new(MANIFEST_ARCHIVE_PATH) {
-        // Manifest is handled separately from payload files
-        return Ok(None);
-    }
-
-    let relative = path
-        .strip_prefix(PAYLOAD_ARCHIVE_DIR)
-        .with_context(|| format!("unexpected archive entry {}", path.display()))?;
-    Ok(Some(normalize_relative_path(relative)?))
 }
 
 pub(super) fn collect_config_files(
@@ -209,43 +117,6 @@ pub(super) fn collect_config_files(
     collected.skipped_symlinks.sort();
     collected.skipped_non_regular.sort();
     Ok(collected)
-}
-
-pub(super) fn validate_theme_paths_stay_in_root(
-    config_dir: &Path,
-    theme_paths: &[(&'static str, &Path)],
-) -> Result<()> {
-    // A shareable preset should not depend on files stored outside the config root
-    for (slot_name, path) in theme_paths {
-        if !path.starts_with(config_dir) {
-            return Err(anyhow!(
-                "preset export requires {} to live under the config root: {}",
-                slot_name,
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn bundle_name_from_path(path: &Path) -> Result<String> {
-    // The file stem is the human-facing bundle name shown by inspect
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .map(str::to_string)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("failed to derive preset name from {}", path.display()))
-}
-
-pub(super) fn format_relative_path(path: &Path) -> String {
-    // Slash-separated paths keep manifest output stable inside the archive
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(part) => Some(part.to_string_lossy().to_string()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 pub(super) fn ensure_safe_target_path(config_dir: &Path, relative_path: &Path) -> Result<PathBuf> {
@@ -355,12 +226,10 @@ fn is_backup_dir(relative_path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        collect_config_files, format_relative_path, normalize_relative_path, parse_except_paths,
-        write_atomic_bytes,
-    };
+    use super::{collect_config_files, write_atomic_bytes};
+    use crate::preset::pathing::format_relative_path;
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -378,7 +247,7 @@ mod tests {
                 .as_nanos();
             let serial = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "unixnotis-preset-files-{}-{}-{}",
+                "unixnotis-preset-filesystem-{}-{}-{}",
                 name, stamp, serial
             ));
             fs::create_dir_all(&path).expect("create temp dir");
@@ -398,13 +267,6 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
-    }
-
-    #[test]
-    fn parse_except_rejects_parent_traversal() {
-        // Traversal should be blocked before any filesystem work starts
-        let error = parse_except_paths(&["../escape".to_string()]).expect_err("reject traversal");
-        assert!(error.to_string().contains("parent traversal"));
     }
 
     #[test]
@@ -445,14 +307,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["linked.png"]
         );
-    }
-
-    #[test]
-    fn normalize_relative_path_strips_dot_segments() {
-        // Leading `./` should not change the stored path
-        let normalized =
-            normalize_relative_path(Path::new("./assets/../assets/bg.png")).expect_err("reject ..");
-        assert!(normalized.to_string().contains("parent traversal"));
     }
 
     #[test]

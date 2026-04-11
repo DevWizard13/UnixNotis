@@ -14,11 +14,11 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use tar::{Archive, Builder, Header};
 
-use super::files::{
-    archive_payload_path, archive_payload_relative, format_relative_path, CollectedConfigFiles,
-    MANIFEST_ARCHIVE_PATH,
-};
+use super::filesystem::CollectedConfigFiles;
 use super::manifest::{PresetManifest, PRESET_FORMAT_VERSION};
+use super::pathing::{
+    archive_payload_path, archive_payload_relative, format_relative_path, MANIFEST_ARCHIVE_PATH,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct BundleFile {
@@ -206,8 +206,8 @@ fn append_bytes(
 #[cfg(test)]
 mod tests {
     use super::{read_bundle, write_bundle};
-    use crate::preset::files::CollectedConfigFiles;
-    use crate::preset::files::PresetFileSource;
+    use crate::preset::filesystem::CollectedConfigFiles;
+    use crate::preset::filesystem::PresetFileSource;
     use crate::preset::manifest::{PresetManifest, PresetManifestFile};
     use std::fs;
     use std::path::PathBuf;

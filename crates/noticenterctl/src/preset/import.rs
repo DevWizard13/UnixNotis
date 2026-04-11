@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use unixnotis_core::Config;
 
 use super::archive::{read_bundle, BundleFile};
-use super::files::{
-    create_backup_dir, ensure_safe_target_path, parse_except_paths,
-    relative_path_matches_exclusion, validate_preset_bundle_path, write_atomic_bytes,
+use super::filesystem::{create_backup_dir, ensure_safe_target_path, write_atomic_bytes};
+use super::pathing::{
+    parse_except_paths, relative_path_matches_exclusion, validate_preset_bundle_path,
 };
 
 #[derive(Debug)]

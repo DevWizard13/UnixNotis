@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use unixnotis_core::Config;
 
 use super::archive::write_bundle;
-use super::files::{
-    bundle_name_from_path, collect_config_files, format_relative_path, parse_except_paths,
-    validate_preset_bundle_path, validate_theme_paths_stay_in_root,
-};
+use super::filesystem::collect_config_files;
 use super::manifest::{PresetManifest, PresetManifestFile};
+use super::pathing::{
+    bundle_name_from_path, format_relative_path, parse_except_paths, validate_preset_bundle_path,
+};
 
 #[derive(Debug)]
 pub(super) struct ExportSummary {
@@ -155,6 +155,23 @@ pub(super) fn export_preset_from(
         skipped_symlinks: collected.skipped_symlinks,
         skipped_non_regular: collected.skipped_non_regular,
     })
+}
+
+fn validate_theme_paths_stay_in_root(
+    config_dir: &Path,
+    theme_paths: &[(&'static str, &Path)],
+) -> Result<()> {
+    // A shareable preset should not depend on files stored outside the config root
+    for (slot_name, path) in theme_paths {
+        if !path.starts_with(config_dir) {
+            return Err(anyhow!(
+                "preset export requires {} to live under the config root: {}",
+                slot_name,
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

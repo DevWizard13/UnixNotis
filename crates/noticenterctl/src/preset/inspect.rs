@@ -8,7 +8,7 @@ use std::path::Path;
 use unixnotis_core::Config;
 
 use super::archive::read_bundle;
-use super::files::validate_preset_bundle_path;
+use super::pathing::validate_preset_bundle_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandReference {
