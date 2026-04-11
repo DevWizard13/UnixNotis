@@ -3,23 +3,28 @@
 //! Import validates the bundle first, builds a write plan, optionally reports it,
 //! then commits the final backup snapshot only after the staged import is ready to finish
 
+#[path = "import/apply.rs"]
+mod apply;
+#[path = "import/checks.rs"]
+mod checks;
+#[path = "import/plan.rs"]
+mod plan;
+
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use unixnotis_core::Config;
 
 use crate::main_css_check::run_css_check;
 
-use super::archive::read_bundle;
-use super::css_asset_refs::{collect_external_css_asset_refs_from_bundle, ExternalCssAssetRef};
-use super::filesystem_checks::ensure_no_symlink_ancestors;
-use super::import_apply::{
-    apply_import_plan, finalize_import_transaction, rollback_import_transaction,
-};
-use super::import_checks::{
+use self::apply::{apply_import_plan, finalize_import_transaction, rollback_import_transaction};
+use self::checks::{
     validate_config_command_paths_for_import, validate_config_theme_paths_stay_in_root,
     validate_imported_command_paths_stay_in_root, validate_imported_theme_paths_stay_in_root,
 };
-use super::import_plan::{build_import_plan, ImportPlan};
+use self::plan::{build_import_plan, ImportPlan};
+use super::archive::read_bundle;
+use super::css_asset_refs::{collect_external_css_asset_refs_from_bundle, ExternalCssAssetRef};
+use super::filesystem_checks::ensure_no_symlink_ancestors;
 use super::pathing::{
     confirm_continue_or_abort, parse_except_paths, relative_path_matches_exclusion,
     resolve_cli_bundle_path, validate_preset_bundle_path,
@@ -273,5 +278,5 @@ fn format_external_css_ref_lines(external_refs: &[ExternalCssAssetRef]) -> Vec<S
 }
 
 #[cfg(test)]
-#[path = "import_tests.rs"]
+#[path = "import/tests.rs"]
 mod tests;

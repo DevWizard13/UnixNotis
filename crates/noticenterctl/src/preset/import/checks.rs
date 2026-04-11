@@ -7,10 +7,10 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use unixnotis_core::{Config, ThemePaths};
 
-use super::command_paths::{
+use super::super::command_paths::{
     validate_command_paths_in_config_bytes, validate_config_command_paths_stay_in_root,
 };
-use super::pathing::normalize_lexical_path;
+use super::super::pathing::normalize_lexical_path;
 
 pub(super) fn validate_imported_theme_paths_stay_in_root(
     config_dir: &Path,

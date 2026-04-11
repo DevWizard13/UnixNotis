@@ -7,9 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::archive::BundleFile;
-use super::filesystem_checks::ensure_safe_target_path;
-use super::pathing::relative_path_matches_exclusion;
+use super::super::archive::BundleFile;
+use super::super::filesystem_checks::ensure_safe_target_path;
+use super::super::pathing::relative_path_matches_exclusion;
 
 #[derive(Debug)]
 pub(super) struct ImportPlan {
