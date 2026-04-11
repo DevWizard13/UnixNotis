@@ -6,6 +6,7 @@
 mod archive;
 mod export;
 mod filesystem;
+mod filesystem_checks;
 mod import;
 mod import_checks;
 mod inspect;

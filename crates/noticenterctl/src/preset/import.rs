@@ -12,8 +12,11 @@ use crate::main_css_check::run_css_check;
 
 use super::archive::{read_bundle, BundleFile};
 use super::filesystem::{
-    create_backup_dir, ensure_no_symlink_ancestors, ensure_safe_target_path, open_secure_dir_all,
-    read_relative_file_secure, write_relative_file_atomic_secure,
+    create_backup_dir, open_secure_dir_all, read_relative_file_secure, remove_relative_file_secure,
+    write_relative_file_atomic_secure,
+};
+use super::filesystem_checks::{
+    ensure_dir_fd_matches_live_path, ensure_no_symlink_ancestors, ensure_safe_target_path,
 };
 use super::import_checks::{
     validate_config_theme_paths_stay_in_root, validate_imported_theme_paths_stay_in_root,
@@ -47,6 +50,16 @@ struct ImportPlanItem {
     target_path: PathBuf,
     // Tracks whether a backup copy is needed before writing
     overwrite_existing: bool,
+}
+
+#[derive(Debug)]
+struct AppliedImportItem {
+    // Relative path written through the secure config-root fd
+    relative_path: PathBuf,
+    // Original file bytes are kept only for overwrite cases so rollback can restore them
+    previous_contents: Option<Vec<u8>>,
+    // Original mode is needed when rollback restores an overwritten file
+    previous_mode: Option<u32>,
 }
 
 pub(super) fn run_import(input_path: &Path, except: &[String], dry_run: bool) -> Result<()> {
@@ -193,16 +206,23 @@ pub(super) fn import_preset_into(
     } else {
         None
     };
-    let backup_root_fd = if let Some(backup_dir) = backup_dir.as_ref() {
-        Some(
-            open_secure_dir_all(backup_dir)
-                .with_context(|| format!("open secure backup directory {}", backup_dir.display()))?,
-        )
-    } else {
-        None
-    };
+    let backup_root_fd =
+        if let Some(backup_dir) = backup_dir.as_ref() {
+            Some(open_secure_dir_all(backup_dir).with_context(|| {
+                format!("open secure backup directory {}", backup_dir.display())
+            })?)
+        } else {
+            None
+        };
+    let mut applied_items = Vec::new();
 
     for item in &plan {
+        // Stop if the visible config root changed after the secure fd was opened
+        ensure_live_config_root_or_rollback(&config_root_fd, config_dir, &applied_items)?;
+
+        let mut previous_contents = None;
+        let mut previous_mode = None;
+
         if item.overwrite_existing {
             let Some(backup_dir) = backup_dir.as_ref() else {
                 return Err(anyhow!("internal error: missing backup directory"));
@@ -213,8 +233,15 @@ pub(super) fn import_preset_into(
             // Read and rewrite through secure dir fds so a late symlink swap cannot redirect backups
             let (existing_bytes, existing_mode) =
                 read_relative_file_secure(&config_root_fd, &item.file.relative_path).with_context(
-                    || format!("read existing imported file {}", item.file.relative_path.display()),
+                    || {
+                        format!(
+                            "read existing imported file {}",
+                            item.file.relative_path.display()
+                        )
+                    },
                 )?;
+            previous_contents = Some(existing_bytes.clone());
+            previous_mode = Some(existing_mode);
             let backup_path = backup_dir.join(&item.file.relative_path);
             write_relative_file_atomic_secure(
                 backup_root_fd,
@@ -232,8 +259,17 @@ pub(super) fn import_preset_into(
             &item.file.contents,
             item.file.mode,
         )
-            .with_context(|| format!("write imported file {}", item.target_path.display()))?;
+        .with_context(|| format!("write imported file {}", item.target_path.display()))?;
+
+        applied_items.push(AppliedImportItem {
+            relative_path: item.file.relative_path.clone(),
+            previous_contents,
+            previous_mode,
+        });
     }
+
+    // Catch a root-dir move that happened after the last write but before import returned
+    ensure_live_config_root_or_rollback(&config_root_fd, config_dir, &applied_items)?;
 
     Ok(ImportSummary {
         file_count: plan.len(),
@@ -243,6 +279,45 @@ pub(super) fn import_preset_into(
         backup_dir,
         dry_run: false,
     })
+}
+
+fn ensure_live_config_root_or_rollback(
+    config_root_fd: &std::os::fd::OwnedFd,
+    config_dir: &Path,
+    applied_items: &[AppliedImportItem],
+) -> Result<()> {
+    if let Err(err) = ensure_dir_fd_matches_live_path(config_root_fd, config_dir) {
+        rollback_applied_import_items(config_root_fd, applied_items)?;
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn rollback_applied_import_items(
+    config_root_fd: &std::os::fd::OwnedFd,
+    applied_items: &[AppliedImportItem],
+) -> Result<()> {
+    for item in applied_items.iter().rev() {
+        if let (Some(previous_contents), Some(previous_mode)) =
+            (item.previous_contents.as_ref(), item.previous_mode)
+        {
+            // Overwrites are restored byte-for-byte so a failed import does not leave drift behind
+            write_relative_file_atomic_secure(
+                config_root_fd,
+                &item.relative_path,
+                previous_contents,
+                previous_mode,
+            )
+            .with_context(|| format!("restore imported file {}", item.relative_path.display()))?;
+        } else {
+            // Newly created files are simply removed during rollback
+            remove_relative_file_secure(config_root_fd, &item.relative_path).with_context(
+                || format!("remove imported file {}", item.relative_path.display()),
+            )?;
+        }
+    }
+
+    Ok(())
 }
 #[cfg(test)]
 mod tests {

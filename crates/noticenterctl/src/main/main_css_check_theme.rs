@@ -140,6 +140,12 @@ fn collect_css_check_inputs_from(
         info_lines.push(format!(
             "css info: {outside_root} configured theme file(s) live outside {display_root} and were checked directly"
         ));
+        warnings.push(CssCheckWarning {
+            display_path: config_display.clone(),
+            message: format!(
+                "{outside_root} configured theme file(s) point outside {display_root}; that makes the setup less portable and means those files are loaded from outside the UnixNotis config directory"
+            ),
+        });
     }
     if non_css_targets > 0 {
         info_lines.push(format!(

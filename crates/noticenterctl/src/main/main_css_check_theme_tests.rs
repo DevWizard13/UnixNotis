@@ -98,6 +98,9 @@ fn includes_active_targets_outside_config_root_and_skips_unused_css() {
         .info_lines
         .iter()
         .any(|line| line.contains("live outside $XDG_CONFIG_HOME/unixnotis")));
+    assert!(inputs.warnings.iter().any(|warning| warning
+        .message
+        .contains("point outside $XDG_CONFIG_HOME/unixnotis")));
     assert!(inputs
         .info_lines
         .iter()
