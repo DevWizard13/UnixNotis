@@ -7,6 +7,7 @@ mod archive;
 mod export;
 mod filesystem;
 mod import;
+mod import_checks;
 mod inspect;
 mod manifest;
 mod pathing;
