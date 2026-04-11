@@ -10,17 +10,19 @@ use unixnotis_core::Config;
 use crate::main_css_check::run_css_check;
 
 use super::archive::read_bundle;
+use super::css_asset_refs::{collect_external_css_asset_refs_from_bundle, ExternalCssAssetRef};
 use super::filesystem_checks::ensure_no_symlink_ancestors;
 use super::import_apply::{
     apply_import_plan, finalize_import_transaction, rollback_import_transaction,
 };
 use super::import_checks::{
-    validate_config_theme_paths_stay_in_root, validate_imported_theme_paths_stay_in_root,
+    validate_config_command_paths_for_import, validate_config_theme_paths_stay_in_root,
+    validate_imported_command_paths_stay_in_root, validate_imported_theme_paths_stay_in_root,
 };
 use super::import_plan::{build_import_plan, ImportPlan};
 use super::pathing::{
-    parse_except_paths, relative_path_matches_exclusion, resolve_cli_bundle_path,
-    validate_preset_bundle_path,
+    confirm_continue_or_abort, parse_except_paths, relative_path_matches_exclusion,
+    resolve_cli_bundle_path, validate_preset_bundle_path,
 };
 
 #[derive(Debug)]
@@ -49,7 +51,12 @@ pub(super) fn run_import(input_path: &Path, except: &[String], dry_run: bool) ->
     let config_dir = Config::default_config_dir().context("resolve config directory")?;
     // CLI import accepts a missing extension and can append it after confirmation
     let input_path = resolve_cli_bundle_path(input_path)?;
-    let prepared = prepare_import(&config_dir, &input_path, except)?;
+    let prepared = prepare_import(
+        &config_dir,
+        &input_path,
+        except,
+        confirm_import_external_css_refs,
+    )?;
 
     if dry_run {
         let summary = build_summary(&prepared.plan, None, true);
@@ -73,6 +80,10 @@ pub(super) fn run_import(input_path: &Path, except: &[String], dry_run: bool) ->
     };
     // Recheck the live config so `--except config.toml` cannot reuse an unsafe local theme path
     if let Err(err) = validate_config_theme_paths_stay_in_root(&config_dir, &config) {
+        rollback_import_transaction(transaction)?;
+        return Err(err);
+    }
+    if let Err(err) = validate_config_command_paths_for_import(&config_dir, &config) {
         rollback_import_transaction(transaction)?;
         return Err(err);
     }
@@ -101,7 +112,29 @@ pub(super) fn import_preset_into(
     except: &[String],
     dry_run: bool,
 ) -> Result<ImportSummary> {
-    let prepared = prepare_import(config_dir, input_path, except)?;
+    // The shared helper keeps tests off stdin while the real CLI still uses the prompt path
+    import_preset_into_with_confirm(
+        config_dir,
+        input_path,
+        except,
+        dry_run,
+        confirm_import_external_css_refs,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn import_preset_into_with_confirm<F>(
+    config_dir: &Path,
+    input_path: &Path,
+    except: &[String],
+    dry_run: bool,
+    confirm_external_css_refs: F,
+) -> Result<ImportSummary>
+where
+    F: FnOnce(&[ExternalCssAssetRef]) -> Result<()>,
+{
+    // Tests inject a fixed answer here so the import plan can be checked without terminal prompts
+    let prepared = prepare_import(config_dir, input_path, except, confirm_external_css_refs)?;
 
     if dry_run {
         // Dry-run reports the exact write plan without creating backups or files
@@ -118,6 +151,7 @@ fn prepare_import(
     config_dir: &Path,
     input_path: &Path,
     except: &[String],
+    confirm_external_css_refs: impl FnOnce(&[ExternalCssAssetRef]) -> Result<()>,
 ) -> Result<PreparedImport> {
     validate_preset_bundle_path(input_path)?;
     // The whole config-root path must be free of symlink hops before any write plan is built
@@ -165,6 +199,11 @@ fn prepare_import(
 
     // This closes both bundled and kept-local config chains before any file is written
     validate_imported_theme_paths_stay_in_root(config_dir, &effective_config_bytes)?;
+    // Explicit path commands should stay inside the shared config root too
+    validate_imported_command_paths_stay_in_root(config_dir, &effective_config_bytes)?;
+    // CSS asset refs are warning-only, but the prompt still needs to happen before any write starts
+    let external_css_refs = collect_external_css_asset_refs_from_bundle(config_dir, &bundle.files);
+    confirm_external_css_refs(&external_css_refs)?;
     let plan = build_import_plan(config_dir, bundle.files, &exclusions)?;
     Ok(PreparedImport { plan })
 }
@@ -192,6 +231,45 @@ fn print_summary(summary: &ImportSummary) {
     if let Some(backup_dir) = summary.backup_dir.as_ref() {
         println!("preset import backup: {}", backup_dir.display());
     }
+}
+
+fn confirm_import_external_css_refs(external_refs: &[ExternalCssAssetRef]) -> Result<()> {
+    if external_refs.is_empty() {
+        return Ok(());
+    }
+
+    // The caller needs the concrete file and ref before deciding whether portability matters here
+    let details = format_external_css_ref_lines(external_refs);
+    eprintln!(
+        "preset import warning: found {} CSS asset reference(s) outside the UnixNotis config directory",
+        external_refs.len()
+    );
+    for line in &details {
+        eprintln!("{line}");
+    }
+
+    confirm_continue_or_abort(
+        "External CSS asset references were found; continue importing anyway?",
+        &format!(
+            "preset import found CSS asset references outside the UnixNotis config directory; rerun interactively to confirm anyway\n{}",
+            details.join("\n")
+        ),
+    )
+}
+
+fn format_external_css_ref_lines(external_refs: &[ExternalCssAssetRef]) -> Vec<String> {
+    external_refs
+        .iter()
+        .map(|asset_ref| {
+            // One-line rows make the warning easy to scan before the prompt is shown
+            format!(
+                "  - {} -> {} ({})",
+                asset_ref.css_file.display(),
+                asset_ref.asset_ref,
+                asset_ref.reason
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

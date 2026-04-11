@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use unixnotis_core::Config;
 
 use super::archive::write_bundle;
+use super::command_paths::validate_config_command_paths_stay_in_root;
 use super::config_root::collect_config_files;
+use super::css_asset_refs::{collect_external_css_asset_refs_from_sources, ExternalCssAssetRef};
 use super::manifest::{PresetManifest, PresetManifestFile};
 use super::pathing::{
-    bundle_name_from_path, format_relative_path, normalize_lexical_path, parse_except_paths,
-    resolve_cli_bundle_path, validate_preset_bundle_path,
+    bundle_name_from_path, confirm_continue_or_abort, format_relative_path, normalize_lexical_path,
+    parse_except_paths, resolve_cli_bundle_path, validate_preset_bundle_path,
 };
 
 #[derive(Debug)]
@@ -61,6 +63,27 @@ pub(super) fn export_preset_from(
     except: &[String],
     force: bool,
 ) -> Result<ExportSummary> {
+    // The shared helper keeps the real prompt path and the test path on the same export logic
+    export_preset_from_with_confirm(
+        config_dir,
+        output_path,
+        except,
+        force,
+        confirm_export_external_css_refs,
+    )
+}
+
+fn export_preset_from_with_confirm<F>(
+    config_dir: &Path,
+    output_path: &Path,
+    except: &[String],
+    force: bool,
+    confirm_external_css_refs: F,
+) -> Result<ExportSummary>
+where
+    F: FnOnce(&[ExternalCssAssetRef]) -> Result<()>,
+{
+    // Tests can inject a fixed answer here so they do not depend on terminal state
     // The user-facing preset extension is part of the public contract
     validate_preset_bundle_path(output_path)?;
     if !config_dir.exists() {
@@ -107,6 +130,12 @@ pub(super) fn export_preset_from(
             ("media_css", &theme_paths.media_css),
         ],
     )?;
+    // Shared presets should not ship explicit command paths that depend on outside host files
+    validate_config_command_paths_stay_in_root(
+        config_dir,
+        &config,
+        "preset export requires explicit command paths to stay under the config root",
+    )?;
 
     let exclusions = parse_except_paths(except)?;
     if exclusions
@@ -134,6 +163,11 @@ pub(super) fn export_preset_from(
         return Err(anyhow!("preset export found no files to bundle"));
     }
 
+    // Warn before writing the bundle when shared CSS depends on outside assets
+    let external_css_refs =
+        collect_external_css_asset_refs_from_sources(config_dir, &collected.files)?;
+    confirm_external_css_refs(&external_css_refs)?;
+
     let manifest_files = collected
         .files
         .iter()
@@ -160,6 +194,45 @@ pub(super) fn export_preset_from(
     })
 }
 
+fn confirm_export_external_css_refs(external_refs: &[ExternalCssAssetRef]) -> Result<()> {
+    if external_refs.is_empty() {
+        return Ok(());
+    }
+
+    // The warning prints first so the caller can see exactly which CSS file caused the prompt
+    let details = format_external_css_ref_lines(external_refs);
+    eprintln!(
+        "preset export warning: found {} CSS asset reference(s) outside the UnixNotis config directory",
+        external_refs.len()
+    );
+    for line in &details {
+        eprintln!("{line}");
+    }
+
+    confirm_continue_or_abort(
+        "External CSS asset references were found; continue exporting anyway?",
+        &format!(
+            "preset export found CSS asset references outside the UnixNotis config directory; rerun interactively to confirm anyway\n{}",
+            details.join("\n")
+        ),
+    )
+}
+
+fn format_external_css_ref_lines(external_refs: &[ExternalCssAssetRef]) -> Vec<String> {
+    external_refs
+        .iter()
+        .map(|asset_ref| {
+            // One line per asset keeps warning output readable when several files are involved
+            format!(
+                "  - {} -> {} ({})",
+                asset_ref.css_file.display(),
+                asset_ref.asset_ref,
+                asset_ref.reason
+            )
+        })
+        .collect()
+}
+
 fn validate_theme_paths_stay_in_root(
     config_dir: &Path,
     theme_paths: &[(&'static str, &Path)],
@@ -182,7 +255,8 @@ fn validate_theme_paths_stay_in_root(
 
 #[cfg(test)]
 mod tests {
-    use super::export_preset_from;
+    use super::{export_preset_from, export_preset_from_with_confirm};
+    use anyhow::anyhow;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -283,6 +357,26 @@ mod tests {
         assert!(!bundle_path.exists());
     }
 
+    #[test]
+    fn export_rejects_absolute_plugin_command_outside_root() {
+        // Shared presets should stay self-contained when commands point at local scripts
+        let root = TempDirGuard::new("outside-command");
+        root.write(
+            "config.toml",
+            "[theme]\nbase_css = \"base.css\"\n[[widgets.stats]]\nlabel = \"Probe\"\n[widgets.stats.plugin]\napi_version = 1\ncommand = \"/tmp/outside-plugin\"\n",
+        );
+        root.write("base.css", ".panel { color: red; }");
+
+        let bundle_path = root.path.join("demo.unixnotis");
+        let error = export_preset_from(&root.path, &bundle_path, &[], false)
+            .expect_err("reject outside plugin command");
+
+        assert!(error
+            .to_string()
+            .contains("explicit command paths to stay under the config root"));
+        assert!(!bundle_path.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn export_replaces_symlink_output_instead_of_following_it() {
@@ -308,5 +402,31 @@ mod tests {
             .expect("stat bundle path")
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn export_rejects_outside_css_asset_refs_in_noninteractive_runs() {
+        // Shared presets should pause when CSS reaches outside the config root for assets
+        let root = TempDirGuard::new("external-css-asset");
+        root.write("config.toml", "[theme]\nbase_css = \"base.css\"\n");
+        root.write(
+            "base.css",
+            ".panel { background-image: url(\"../outside.png\"); }\n",
+        );
+
+        let bundle_path = root.path.join("demo.unixnotis");
+        // The injected rejector makes this test stable even when cargo test has a tty
+        let error =
+            export_preset_from_with_confirm(&root.path, &bundle_path, &[], false, |_refs| {
+                Err(anyhow!(
+                "preset export found CSS asset references outside the UnixNotis config directory"
+            ))
+            })
+            .expect_err("reject outside css asset refs without confirmation");
+
+        assert!(error
+            .to_string()
+            .contains("CSS asset references outside the UnixNotis config directory"));
+        assert!(!bundle_path.exists());
     }
 }

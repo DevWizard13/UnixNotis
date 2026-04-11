@@ -7,6 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use unixnotis_core::{Config, ThemePaths};
 
+use super::command_paths::{
+    validate_command_paths_in_config_bytes, validate_config_command_paths_stay_in_root,
+};
 use super::pathing::normalize_lexical_path;
 
 pub(super) fn validate_imported_theme_paths_stay_in_root(
@@ -21,6 +24,14 @@ pub(super) fn validate_imported_theme_paths_stay_in_root(
     validate_config_theme_paths_stay_in_root(config_dir, &config)
 }
 
+pub(super) fn validate_imported_command_paths_stay_in_root(
+    config_dir: &Path,
+    config_bytes: &[u8],
+) -> Result<()> {
+    // Preset import should reject explicit command paths that escape the shared config root
+    validate_command_paths_in_config_bytes(config_dir, config_bytes, "preset import blocked")
+}
+
 pub(super) fn validate_config_theme_paths_stay_in_root(
     config_dir: &Path,
     config: &Config,
@@ -30,6 +41,14 @@ pub(super) fn validate_config_theme_paths_stay_in_root(
         .resolve_theme_paths_from(config_dir)
         .context("resolve bundled theme paths for import validation")?;
     validate_resolved_theme_paths_stay_in_root(config_dir, &theme_paths)
+}
+
+pub(super) fn validate_config_command_paths_for_import(
+    config_dir: &Path,
+    config: &Config,
+) -> Result<()> {
+    // Live config revalidation closes the kept-local config chain after import writes land
+    validate_config_command_paths_stay_in_root(config_dir, config, "preset import blocked")
 }
 
 fn validate_resolved_theme_paths_stay_in_root(
@@ -63,7 +82,9 @@ fn validate_resolved_theme_paths_stay_in_root(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_imported_theme_paths_stay_in_root;
+    use super::{
+        validate_imported_command_paths_stay_in_root, validate_imported_theme_paths_stay_in_root,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,5 +116,19 @@ mod tests {
         assert!(error
             .to_string()
             .contains("tries to leave the UnixNotis config directory"));
+    }
+
+    #[test]
+    fn imported_command_checks_reject_absolute_plugin_command() {
+        // Shared presets should not carry explicit command paths that leave the config root
+        let config_dir = temp_root("outside-command");
+        let config = b"[theme]\nbase_css = \"base.css\"\n[[widgets.stats]]\nlabel = \"Probe\"\n[widgets.stats.plugin]\napi_version = 1\ncommand = \"/tmp/outside-plugin\"\n";
+
+        let error = validate_imported_command_paths_stay_in_root(&config_dir, config)
+            .expect_err("reject outside command path");
+
+        assert!(error
+            .to_string()
+            .contains("points outside the UnixNotis config directory"));
     }
 }

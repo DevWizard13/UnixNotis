@@ -8,15 +8,8 @@ use std::path::Path;
 use unixnotis_core::Config;
 
 use super::archive::read_bundle;
+use super::command_paths::{collect_command_references_from_config, collect_outside_command_paths};
 use super::pathing::{resolve_cli_bundle_path, validate_preset_bundle_path};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CommandReference {
-    // Human-readable config slot name shown in inspect output
-    slot: String,
-    // Raw command string carried by the parsed config
-    command: String,
-}
 
 pub(super) fn run_inspect(input_path: &Path) -> Result<()> {
     // CLI inspect accepts a missing extension and can append it after confirmation
@@ -54,14 +47,32 @@ pub(super) fn inspect_preset_at(input_path: &Path) -> Result<String> {
     {
         // config.toml is parsed from the bundle bytes without touching the local config root
         match std::str::from_utf8(&config_file.contents) {
-            Ok(contents) => match collect_command_references(contents) {
-                Ok(commands) => {
+            Ok(contents) => match toml::from_str::<Config>(contents) {
+                Ok(config) => {
+                    let commands = collect_command_references_from_config(&config);
                     out.push_str(&format!("command refs: {}\n", commands.len()));
                     if commands.is_empty() {
                         out.push_str("  none\n");
                     } else {
                         for command in commands {
                             out.push_str(&format!("  - {} = {}\n", command.slot, command.command));
+                        }
+                    }
+
+                    // Inspect has no live config root, so this placeholder keeps the warning shape stable
+                    let outside_paths = collect_outside_command_paths(
+                        Path::new("$XDG_CONFIG_HOME/unixnotis"),
+                        &config,
+                    );
+                    out.push_str(&format!("command path warnings: {}\n", outside_paths.len()));
+                    if outside_paths.is_empty() {
+                        out.push_str("  none\n");
+                    } else {
+                        for warning in outside_paths {
+                            out.push_str(&format!(
+                                "  - {} points outside the config root: {}\n",
+                                warning.slot, warning.command
+                            ));
                         }
                     }
                 }
@@ -82,131 +93,6 @@ pub(super) fn inspect_preset_at(input_path: &Path) -> Result<String> {
         out.push_str(&format!("  - {}\n", file.path));
     }
     Ok(out)
-}
-
-fn collect_command_references(contents: &str) -> Result<Vec<CommandReference>> {
-    // Parsing through the real config type keeps inspect aligned with runtime fields
-    let config: Config =
-        toml::from_str(contents).context("parse config.toml from preset bundle")?;
-    let mut commands = Vec::new();
-
-    // Each widget family is collected separately so inspect stays easier to extend and review
-    collect_slider_commands(
-        &mut commands,
-        "widgets.volume",
-        config.widgets.volume.get_cmd,
-        config.widgets.volume.set_cmd,
-        config.widgets.volume.toggle_cmd,
-        config.widgets.volume.watch_cmd,
-    );
-    collect_slider_commands(
-        &mut commands,
-        "widgets.brightness",
-        config.widgets.brightness.get_cmd,
-        config.widgets.brightness.set_cmd,
-        config.widgets.brightness.toggle_cmd,
-        config.widgets.brightness.watch_cmd,
-    );
-    collect_indexed_commands(
-        &mut commands,
-        config.widgets.toggles,
-        |commands, index, toggle| {
-            push_optional_command(
-                commands,
-                &format!("widgets.toggles[{index}].state_cmd"),
-                toggle.state_cmd,
-            );
-            push_optional_command(
-                commands,
-                &format!("widgets.toggles[{index}].on_cmd"),
-                toggle.on_cmd,
-            );
-            push_optional_command(
-                commands,
-                &format!("widgets.toggles[{index}].off_cmd"),
-                toggle.off_cmd,
-            );
-            push_optional_command(
-                commands,
-                &format!("widgets.toggles[{index}].watch_cmd"),
-                toggle.watch_cmd,
-            );
-        },
-    );
-    collect_indexed_commands(
-        &mut commands,
-        config.widgets.stats,
-        |commands, index, stat| {
-            push_optional_command(commands, &format!("widgets.stats[{index}].cmd"), stat.cmd);
-            push_optional_command(
-                commands,
-                &format!("widgets.stats[{index}].plugin.command"),
-                stat.plugin.map(|plugin| plugin.command),
-            );
-        },
-    );
-    collect_indexed_commands(
-        &mut commands,
-        config.widgets.cards,
-        |commands, index, card| {
-            push_optional_command(commands, &format!("widgets.cards[{index}].cmd"), card.cmd);
-            push_optional_command(
-                commands,
-                &format!("widgets.cards[{index}].plugin.command"),
-                card.plugin.map(|plugin| plugin.command),
-            );
-        },
-    );
-
-    Ok(commands)
-}
-
-fn collect_slider_commands(
-    commands: &mut Vec<CommandReference>,
-    base_slot: &str,
-    get_cmd: String,
-    set_cmd: String,
-    toggle_cmd: Option<String>,
-    watch_cmd: Option<String>,
-) {
-    // Sliders always expose read and write commands, so those are always listed
-    commands.push(CommandReference {
-        slot: format!("{base_slot}.get_cmd"),
-        command: get_cmd,
-    });
-    commands.push(CommandReference {
-        slot: format!("{base_slot}.set_cmd"),
-        command: set_cmd,
-    });
-    push_optional_command(commands, &format!("{base_slot}.toggle_cmd"), toggle_cmd);
-    push_optional_command(commands, &format!("{base_slot}.watch_cmd"), watch_cmd);
-}
-
-fn collect_indexed_commands<T, I, F>(commands: &mut Vec<CommandReference>, items: I, mut collect: F)
-where
-    I: IntoIterator<Item = T>,
-    F: FnMut(&mut Vec<CommandReference>, usize, T),
-{
-    // Indexed helpers keep the per-widget loops small while preserving the real slot names
-    for (index, item) in items.into_iter().enumerate() {
-        collect(commands, index, item);
-    }
-}
-
-fn push_optional_command(commands: &mut Vec<CommandReference>, slot: &str, value: Option<String>) {
-    let Some(command) = value else {
-        return;
-    };
-    let trimmed = command.trim();
-    if trimmed.is_empty() {
-        // Blank values are treated the same as missing values in inspect output
-        return;
-    }
-
-    commands.push(CommandReference {
-        slot: slot.to_string(),
-        command: trimmed.to_string(),
-    });
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -281,6 +167,7 @@ mod tests {
 
         assert!(report.contains("preset: demo"));
         assert!(report.contains("widgets.volume.get_cmd"));
+        assert!(report.contains("command path warnings:"));
         assert!(report.contains("file list:"));
         assert!(report.contains("config.toml"));
     }

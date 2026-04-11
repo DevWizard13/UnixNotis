@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use unixnotis_core::{Config, ThemePaths};
 
+use crate::preset::command_paths::collect_outside_command_paths;
+use crate::preset::css_asset_refs::collect_external_css_asset_refs_from_paths;
+
 use super::main_css_check_files::{collect_css_files, format_display_path};
 
 pub(super) struct CssCheckInputs {
@@ -115,6 +118,30 @@ fn collect_css_check_inputs_from(
         }
     }
 
+    let outside_commands = collect_outside_command_paths(config_dir, config);
+    let outside_command_paths = outside_commands.len();
+    for command in outside_commands {
+        warnings.push(CssCheckWarning {
+            display_path: config_display.clone(),
+            message: format!(
+                "{} points outside {display_root}; shared presets should keep explicit command paths inside the UnixNotis config directory ({})",
+                command.slot, command.command
+            ),
+        });
+    }
+    // CSS files can stay inside the config root while still loading images from somewhere else
+    let external_css_refs = collect_external_css_asset_refs_from_paths(config_dir, &files)?;
+    let external_css_asset_refs = external_css_refs.len();
+    for asset_ref in external_css_refs {
+        warnings.push(CssCheckWarning {
+            display_path: format_display_path(config_dir, display_root, &asset_ref.css_file),
+            message: format!(
+                "css asset reference points outside {display_root}: {} ({})",
+                asset_ref.asset_ref, asset_ref.reason
+            ),
+        });
+    }
+
     for slots in duplicate_slots.values() {
         if slots.len() < 2 {
             continue;
@@ -146,6 +173,17 @@ fn collect_css_check_inputs_from(
                 "{outside_root} configured theme file(s) point outside {display_root}; that makes the setup less portable and means those files are loaded from outside the UnixNotis config directory"
             ),
         });
+    }
+    if outside_command_paths > 0 {
+        info_lines.push(format!(
+            "css info: {outside_command_paths} configured command path(s) point outside {display_root}"
+        ));
+    }
+    // This info line mirrors the preset prompt path so the live config tells the same story
+    if external_css_asset_refs > 0 {
+        info_lines.push(format!(
+            "css info: {external_css_asset_refs} css asset reference(s) point outside {display_root}"
+        ));
     }
     if non_css_targets > 0 {
         info_lines.push(format!(

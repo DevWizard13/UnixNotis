@@ -42,6 +42,18 @@ pub(super) fn resolve_cli_bundle_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+pub(super) fn confirm_continue_or_abort(prompt: &str, noninteractive_message: &str) -> Result<()> {
+    // Real shells get a yes/no prompt, while scripts fail with a clear message instead of hanging
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        if prompt_yes_no(prompt)? {
+            return Ok(());
+        }
+        return Err(anyhow!("preset command canceled"));
+    }
+
+    Err(anyhow!(noninteractive_message.to_string()))
+}
+
 pub(super) fn parse_except_paths(values: &[String]) -> Result<Vec<PathBuf>> {
     let mut parsed = Vec::new();
     for value in values {
@@ -200,12 +212,17 @@ fn suggested_preset_bundle_path(path: &Path) -> Option<PathBuf> {
 
 fn prompt_to_append_extension(original: &Path, suggested: &Path) -> Result<bool> {
     // Prompt only runs for interactive shells so scripts never hang on stdin
-    print!(
-        "Preset path '{}' is missing .{}; use '{}' instead? [y/N] ",
+    prompt_yes_no(&format!(
+        "Preset path '{}' is missing .{}; use '{}' instead?",
         original.display(),
         PRESET_EXTENSION,
         suggested.display()
-    );
+    ))
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    // Shared yes/no prompt keeps import and export warnings consistent
+    print!("{prompt} [y/N] ");
     io::stdout().flush().context("flush preset prompt")?;
 
     let mut reply = String::new();
