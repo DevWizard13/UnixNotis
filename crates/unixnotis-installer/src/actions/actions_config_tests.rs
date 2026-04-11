@@ -1,4 +1,7 @@
-use super::{format_with_state_env, remove_state_file, render_default_config_toml, DND_STATE_FILE};
+use super::{
+    cleanup_warning_message, format_with_state_env, remove_state_file, render_default_config_toml,
+    DirCleanupOutcome, DND_STATE_FILE,
+};
 use std::fs;
 use std::path::PathBuf;
 use unixnotis_core::util;
@@ -72,6 +75,32 @@ fn remove_state_file_keeps_directory_when_not_empty() {
     assert!(other_path.exists());
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cleanup_warning_message_flags_directory_inspection_failures() {
+    // This covers the path where state.json is gone but read_dir fails afterward
+    let root = PathBuf::from("target").join("unixnotis-installer-state-warning-test");
+    let warning = cleanup_warning_message(&root, DirCleanupOutcome::InspectFailed)
+        .expect("warning expected");
+
+    // The warning should explain which cleanup step failed
+    assert!(warning.contains("failed to inspect state directory"));
+    // Keep the file name in the message so the sequence is obvious in logs
+    assert!(warning.contains(DND_STATE_FILE));
+}
+
+#[test]
+fn cleanup_warning_message_flags_empty_directory_removal_failures() {
+    // This covers the path where the dir looked empty but remove_dir still failed
+    let root = PathBuf::from("target").join("unixnotis-installer-state-remove-warning-test");
+    let warning = cleanup_warning_message(&root, DirCleanupOutcome::RemoveFailed)
+        .expect("warning expected");
+
+    // The warning should make it clear that the leftover path is the empty state dir
+    assert!(warning.contains("failed to remove empty state directory"));
+    // Keep the file name in the message so the earlier successful delete is still visible
+    assert!(warning.contains(DND_STATE_FILE));
 }
 
 #[test]
