@@ -92,6 +92,34 @@ pub(super) fn normalize_relative_path(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
+pub(super) fn normalize_lexical_path(path: &Path) -> PathBuf {
+    // This stays purely lexical so callers can validate paths before the target exists on disk
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            // Keep any platform prefix intact before later segments are folded in
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            // Root anchors the normalized path before normal segments are added
+            Component::RootDir => normalized.push(Path::new("/")),
+            // `.` adds no meaning to the final path
+            Component::CurDir => {}
+            // Normal path segments are preserved in order
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => match normalized.components().next_back() {
+                // One `..` can fold away one earlier normal segment
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                // Parent segments at the filesystem root stay pinned there
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                // Relative paths may still carry leading `..` segments at this stage
+                _ => normalized.push(".."),
+            },
+        }
+    }
+    normalized
+}
+
 pub(super) fn relative_path_matches_exclusion(
     relative_path: &Path,
     exclusions: &[PathBuf],

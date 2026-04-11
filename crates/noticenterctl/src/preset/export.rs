@@ -12,8 +12,8 @@ use super::archive::write_bundle;
 use super::config_root::collect_config_files;
 use super::manifest::{PresetManifest, PresetManifestFile};
 use super::pathing::{
-    bundle_name_from_path, format_relative_path, parse_except_paths, resolve_cli_bundle_path,
-    validate_preset_bundle_path,
+    bundle_name_from_path, format_relative_path, normalize_lexical_path, parse_except_paths,
+    resolve_cli_bundle_path, validate_preset_bundle_path,
 };
 
 #[derive(Debug)]
@@ -164,9 +164,12 @@ fn validate_theme_paths_stay_in_root(
     config_dir: &Path,
     theme_paths: &[(&'static str, &Path)],
 ) -> Result<()> {
+    let normalized_root = normalize_lexical_path(config_dir);
+
     // A shareable preset should not depend on files stored outside the config root
     for (slot_name, path) in theme_paths {
-        if !path.starts_with(config_dir) {
+        let normalized_path = normalize_lexical_path(path);
+        if !normalized_path.starts_with(&normalized_root) {
             return Err(anyhow!(
                 "preset export requires {} to live under the config root: {}",
                 slot_name,
@@ -255,5 +258,55 @@ mod tests {
         .expect_err("reject config exclusion");
 
         assert!(error.to_string().contains("cannot exclude config.toml"));
+    }
+
+    #[test]
+    fn export_rejects_theme_paths_that_leave_root_through_parent_traversal() {
+        // Lexical `../` escapes should be blocked during export, not discovered later on import
+        let root = TempDirGuard::new("parent-theme-escape");
+        root.write(
+            "config.toml",
+            "[theme]\nbase_css = \"../outside.css\"\npanel_css = \"panel.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\nmedia_css = \"media.css\"\n",
+        );
+        root.write("panel.css", ".panel { color: red; }");
+        root.write("popup.css", ".popup { color: red; }");
+        root.write("widgets.css", ".widgets { color: red; }");
+        root.write("media.css", ".media { color: red; }");
+
+        let bundle_path = root.path.join("demo.unixnotis");
+        let error = export_preset_from(&root.path, &bundle_path, &[], false)
+            .expect_err("reject parent theme escape");
+
+        assert!(error
+            .to_string()
+            .contains("requires base_css to live under the config root"));
+        assert!(!bundle_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_replaces_symlink_output_instead_of_following_it() {
+        // Export should replace the symlink path itself, not overwrite the symlink target
+        let root = TempDirGuard::new("symlink-output");
+        root.write("config.toml", "[theme]\nbase_css = \"base.css\"\n");
+        root.write("base.css", ".panel { color: red; }");
+
+        let outside_target = root.path.with_file_name("outside-target.unixnotis");
+        fs::write(&outside_target, "ORIGINAL").expect("write outside target");
+        let bundle_path = root.path.join("bundle.unixnotis");
+        std::os::unix::fs::symlink(&outside_target, &bundle_path).expect("create output symlink");
+
+        let summary = export_preset_from(&root.path, &bundle_path, &[], true).expect("export");
+
+        assert_eq!(summary.file_count, 2);
+        assert_eq!(
+            fs::read_to_string(&outside_target).expect("read outside target"),
+            "ORIGINAL"
+        );
+        assert!(bundle_path.exists());
+        assert!(!fs::symlink_metadata(&bundle_path)
+            .expect("stat bundle path")
+            .file_type()
+            .is_symlink());
     }
 }

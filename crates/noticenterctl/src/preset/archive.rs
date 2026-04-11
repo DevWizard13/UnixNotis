@@ -9,7 +9,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use tar::{Archive, Builder, Header};
@@ -49,9 +49,10 @@ pub(super) fn write_bundle(
             .with_context(|| format!("create preset parent directory {}", parent.display()))?;
     }
 
-    // The file is written once through a compressed tar stream
-    let output = File::create(bundle_path)
-        .with_context(|| format!("create preset bundle {}", bundle_path.display()))?;
+    // Writing into a temp file first keeps partial bundles and symlink-follow writes off the target path
+    let temp_path = temp_bundle_path(bundle_path);
+    let output = File::create(&temp_path)
+        .with_context(|| format!("create temp preset bundle {}", temp_path.display()))?;
     let encoder = GzEncoder::new(output, Compression::default());
     let mut builder = Builder::new(encoder);
 
@@ -76,7 +77,18 @@ pub(super) fn write_bundle(
     let encoder = builder
         .into_inner()
         .context("flush preset archive writer")?;
-    encoder.finish().context("finalize preset bundle")?;
+    let output = encoder.finish().context("finalize preset bundle")?;
+    output
+        .sync_all()
+        .with_context(|| format!("flush temp preset bundle {}", temp_path.display()))?;
+
+    if let Err(err) = fs::rename(&temp_path, bundle_path)
+        .with_context(|| format!("replace preset bundle {}", bundle_path.display()))
+    {
+        // Temp bundle cleanup keeps failed exports from leaving large junk files behind
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -201,6 +213,23 @@ fn append_bytes(
         .append_data(&mut header, path, Cursor::new(contents))
         .with_context(|| format!("append {} to preset archive", path.display()))?;
     Ok(())
+}
+
+fn temp_bundle_path(bundle_path: &Path) -> PathBuf {
+    let parent = bundle_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file_name = bundle_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("preset.unixnotis");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock moved backwards")
+        .as_nanos();
+    parent.join(format!(".{file_name}.{stamp}.tmp"))
 }
 
 #[cfg(test)]

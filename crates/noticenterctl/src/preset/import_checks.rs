@@ -4,8 +4,10 @@
 //! crafted bundles fail early instead of escaping through later setup steps
 
 use anyhow::{anyhow, Context, Result};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use unixnotis_core::{Config, ThemePaths};
+
+use super::pathing::normalize_lexical_path;
 
 pub(super) fn validate_imported_theme_paths_stay_in_root(
     config_dir: &Path,
@@ -57,34 +59,6 @@ fn validate_resolved_theme_paths_stay_in_root(
     }
 
     Ok(())
-}
-
-fn normalize_lexical_path(path: &Path) -> PathBuf {
-    // This stays purely lexical so it works even when the target path does not exist yet
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            // Keep the platform prefix intact on paths that use one
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            // Root anchors the normalized path before later components are folded in
-            Component::RootDir => normalized.push(Path::new("/")),
-            // `.` adds no meaning to the final target
-            Component::CurDir => {}
-            // Normal segments are preserved in order
-            Component::Normal(part) => normalized.push(part),
-            Component::ParentDir => match normalized.components().next_back() {
-                // A normal tail can be folded away by one `..` segment
-                Some(Component::Normal(_)) => {
-                    normalized.pop();
-                }
-                // Extra parents at the filesystem root stay pinned to the root
-                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
-                // Relative paths may still carry leading `..` segments at this stage
-                _ => normalized.push(".."),
-            },
-        }
-    }
-    normalized
 }
 
 #[cfg(test)]
