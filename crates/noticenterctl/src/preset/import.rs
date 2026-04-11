@@ -8,6 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use unixnotis_core::Config;
 
+use crate::main_css_check::run_css_check;
+
 use super::archive::{read_bundle, BundleFile};
 use super::filesystem::{create_backup_dir, ensure_safe_target_path, write_atomic_bytes};
 use super::pathing::{
@@ -56,6 +58,29 @@ pub(super) fn run_import(input_path: &Path, except: &[String], dry_run: bool) ->
     if let Some(backup_dir) = summary.backup_dir {
         println!("preset import backup: {}", backup_dir.display());
     }
+
+    if !summary.dry_run {
+        // Mirror app startup so css-check sees the same theme file set the UI would use
+        let config_path = config_dir.join("config.toml");
+        let config = Config::load_from_path(&config_path)
+            .context("load imported config.toml before css-check")?;
+        let theme_paths = config
+            .resolve_theme_paths_from(&config_dir)
+            .context("resolve imported theme paths before css-check")?;
+        config
+            .ensure_theme_files(&theme_paths)
+            .context("materialize imported theme files before css-check")?;
+
+        // Imported presets should be checked right away so broken shared CSS is obvious
+        println!("preset import check: running css-check on imported theme files");
+        if let Err(err) = run_css_check() {
+            // Import already wrote files, so this reports post-apply validation failure instead of rollback
+            return Err(anyhow!(
+                "preset import completed, but css-check failed after import: {err}"
+            ));
+        }
+    }
+
     Ok(())
 }
 
