@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use unixnotis_core::Config;
 
 use super::archive::write_bundle;
-use super::filesystem::collect_config_files;
+use super::config_root::collect_config_files;
 use super::manifest::{PresetManifest, PresetManifestFile};
 use super::pathing::{
     bundle_name_from_path, format_relative_path, parse_except_paths, resolve_cli_bundle_path,

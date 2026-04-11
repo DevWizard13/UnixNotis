@@ -14,7 +14,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use tar::{Archive, Builder, Header};
 
-use super::filesystem::CollectedConfigFiles;
+use super::config_root::CollectedConfigFiles;
 use super::manifest::{PresetManifest, PRESET_FORMAT_VERSION};
 use super::pathing::{
     archive_payload_path, archive_payload_relative, format_relative_path, MANIFEST_ARCHIVE_PATH,
@@ -206,8 +206,8 @@ fn append_bytes(
 #[cfg(test)]
 mod tests {
     use super::{read_bundle, write_bundle};
-    use crate::preset::filesystem::CollectedConfigFiles;
-    use crate::preset::filesystem::PresetFileSource;
+    use crate::preset::config_root::CollectedConfigFiles;
+    use crate::preset::config_root::PresetFileSource;
     use crate::preset::manifest::{PresetManifest, PresetManifestFile};
     use std::fs;
     use std::path::PathBuf;

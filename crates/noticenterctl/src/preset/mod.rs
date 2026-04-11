@@ -4,11 +4,14 @@
 //! so the local-only share flow stays separate from the D-Bus control path
 
 mod archive;
+mod config_root;
 mod export;
-mod filesystem;
 mod filesystem_checks;
+mod filesystem_secure;
 mod import;
+mod import_apply;
 mod import_checks;
+mod import_plan;
 mod inspect;
 mod manifest;
 mod pathing;

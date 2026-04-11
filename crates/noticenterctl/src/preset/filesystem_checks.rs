@@ -111,7 +111,7 @@ mod tests {
     use super::ensure_dir_fd_matches_live_path;
     use super::{ensure_no_symlink_ancestors, ensure_safe_target_path};
     #[cfg(target_os = "linux")]
-    use crate::preset::filesystem::open_secure_dir_all;
+    use crate::preset::filesystem_secure::open_secure_dir_all;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
