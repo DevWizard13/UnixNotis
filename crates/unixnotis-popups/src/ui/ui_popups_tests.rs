@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 
-use super::{build_reconcile_plan, desired_seed_popups};
+use super::{build_reconcile_plan, desired_seed_popups, reload_refresh_plan, visible_popup_target};
 use unixnotis_core::{Action, ControlState, NotificationImage, NotificationView, Urgency};
 
 fn make_view(id: u32, urgency: Urgency, summary: &str, body: &str) -> NotificationView {
@@ -97,4 +97,35 @@ fn build_reconcile_plan_rebuilds_rows_when_payload_changes() {
     assert_eq!(plan.upserts[0].id, 5);
     assert_eq!(plan.upserts[0].summary, "new");
     assert_eq!(plan.upserts[0].body, "body changed");
+}
+
+#[test]
+fn visible_popup_target_clamps_to_runtime_limit() {
+    // Visible target should stop at max_visible even when more popups are queued
+    assert_eq!(visible_popup_target(5, 2), 2);
+}
+
+#[test]
+fn visible_popup_target_stays_within_available_popups() {
+    // Visible target should not claim more rows than actually exist
+    assert_eq!(visible_popup_target(2, 5), 2);
+    assert_eq!(visible_popup_target(0, 3), 0);
+}
+
+#[test]
+fn reload_refresh_plan_keeps_width_updates_to_materialized_rows() {
+    // Reload should resize only built rows while still respecting popup limits
+    let plan = reload_refresh_plan(5, 2, 3);
+
+    assert_eq!(plan.resized_roots, 2);
+    assert_eq!(plan.visible_target, 3);
+}
+
+#[test]
+fn reload_refresh_plan_handles_popup_disable_cleanly() {
+    // Disabling popups should still resize built rows before visibility drops to zero
+    let plan = reload_refresh_plan(4, 3, 0);
+
+    assert_eq!(plan.resized_roots, 3);
+    assert_eq!(plan.visible_target, 0);
 }

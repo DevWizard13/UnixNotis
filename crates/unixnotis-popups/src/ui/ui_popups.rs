@@ -11,6 +11,14 @@ use unixnotis_core::{popup_allowed_by_state, ControlState, NotificationView};
 use super::ui_window::{popup_stack_has_active_transitions, refresh_popup_input_region};
 use super::{PopupEntry, UiState};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReloadRefreshPlan {
+    // Number of already-built popup roots that should be resized in place
+    resized_roots: usize,
+    // Number of popups that should remain visible after limits are applied
+    visible_target: usize,
+}
+
 struct ReconcilePlan {
     // Local rows missing from the daemon snapshot
     stale_ids: Vec<u32>,
@@ -150,7 +158,7 @@ impl UiState {
         let desired_visible = self
             .popup_order
             .iter()
-            .take(max_visible)
+            .take(visible_popup_target(self.popup_order.len(), max_visible))
             .copied()
             .collect::<Vec<u32>>();
         self.apply_visible_popups(desired_visible);
@@ -170,6 +178,14 @@ impl UiState {
     }
 
     pub(super) fn refresh_after_config_reload(&mut self) {
+        let plan = reload_refresh_plan(
+            self.popups.len(),
+            self.popups
+                .values()
+                .filter(|entry| entry.root.is_some())
+                .count(),
+            self.config.popups.max_visible,
+        );
         // Materialized popup roots cache their width at build time
         // Refresh them after stack geometry changes so visible cards stay aligned
         let popup_width = self.popup_stack.width_request().max(1);
@@ -181,6 +197,12 @@ impl UiState {
         }
         // Re-run visibility so max_visible changes take effect right away
         self.update_popup_visibility();
+        debug!(
+            resized_roots = plan.resized_roots,
+            visible_target = plan.visible_target,
+            total = self.popups.len(),
+            "popup config reload refreshed"
+        );
     }
 
     fn apply_visible_popups(&mut self, desired_visible: Vec<u32>) {
@@ -259,6 +281,24 @@ impl UiState {
         if revealer.parent().is_some() {
             self.popup_stack.remove(&revealer);
         }
+    }
+}
+
+fn visible_popup_target(total_popups: usize, max_visible: usize) -> usize {
+    // Visible slice can never exceed the number of known popups
+    total_popups.min(max_visible)
+}
+
+fn reload_refresh_plan(
+    total_popups: usize,
+    materialized_popups: usize,
+    max_visible: usize,
+) -> ReloadRefreshPlan {
+    ReloadRefreshPlan {
+        // Only materialized rows have GTK roots that need width updates
+        resized_roots: materialized_popups,
+        // Visibility still respects the runtime popup budget after reload
+        visible_target: visible_popup_target(total_popups, max_visible),
     }
 }
 
