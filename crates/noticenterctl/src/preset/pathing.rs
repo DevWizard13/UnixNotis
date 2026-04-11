@@ -5,6 +5,7 @@
 //! can work with validated config-root-relative paths
 
 use anyhow::{anyhow, Context, Result};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 
 pub(super) const PRESET_EXTENSION: &str = "unixnotis";
@@ -24,6 +25,21 @@ pub(super) fn validate_preset_bundle_path(path: &Path) -> Result<()> {
         PRESET_EXTENSION,
         path.display()
     ))
+}
+
+pub(super) fn resolve_cli_bundle_path(path: &Path) -> Result<PathBuf> {
+    resolve_cli_bundle_path_with_prompt(path, |original, suggested| {
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            return prompt_to_append_extension(original, suggested);
+        }
+
+        Err(anyhow!(
+            "preset file is missing the .{} extension: {} (rerun with {})",
+            PRESET_EXTENSION,
+            original.display(),
+            suggested.display()
+        ))
+    })
 }
 
 pub(super) fn parse_except_paths(values: &[String]) -> Result<Vec<PathBuf>> {
@@ -123,9 +139,59 @@ pub(super) fn format_relative_path(path: &Path) -> String {
         .join("/")
 }
 
+fn resolve_cli_bundle_path_with_prompt<F>(path: &Path, mut prompt: F) -> Result<PathBuf>
+where
+    F: FnMut(&Path, &Path) -> Result<bool>,
+{
+    // Already-valid bundle paths should pass through unchanged
+    if validate_preset_bundle_path(path).is_ok() {
+        return Ok(path.to_path_buf());
+    }
+
+    let Some(suggested_path) = suggested_preset_bundle_path(path) else {
+        return validate_preset_bundle_path(path).map(|_| path.to_path_buf());
+    };
+
+    // Missing extension is a common CLI typo, so offer to fix it in interactive shells
+    if prompt(path, &suggested_path)? {
+        return Ok(suggested_path);
+    }
+
+    Err(anyhow!("preset command canceled"))
+}
+
+fn suggested_preset_bundle_path(path: &Path) -> Option<PathBuf> {
+    // Only bare names get the interactive extension assist
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    if extension.is_some() {
+        return None;
+    }
+
+    Some(path.with_extension(PRESET_EXTENSION))
+}
+
+fn prompt_to_append_extension(original: &Path, suggested: &Path) -> Result<bool> {
+    // Prompt only runs for interactive shells so scripts never hang on stdin
+    print!(
+        "Preset path '{}' is missing .{}; use '{}' instead? [y/N] ",
+        original.display(),
+        PRESET_EXTENSION,
+        suggested.display()
+    );
+    io::stdout().flush().context("flush preset prompt")?;
+
+    let mut reply = String::new();
+    io::stdin()
+        .read_line(&mut reply)
+        .context("read preset prompt response")?;
+
+    let reply = reply.trim();
+    Ok(reply.eq_ignore_ascii_case("y") || reply.eq_ignore_ascii_case("yes"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_relative_path, parse_except_paths};
+    use super::{normalize_relative_path, parse_except_paths, resolve_cli_bundle_path_with_prompt};
     use std::path::Path;
 
     #[test]
@@ -141,5 +207,25 @@ mod tests {
         let normalized =
             normalize_relative_path(Path::new("./assets/../assets/bg.png")).expect_err("reject ..");
         assert!(normalized.to_string().contains("parent traversal"));
+    }
+
+    #[test]
+    fn resolve_cli_bundle_path_appends_extension_after_confirmation() {
+        // Missing extension should be fixable through the shared CLI path helper
+        let resolved =
+            resolve_cli_bundle_path_with_prompt(Path::new("dog"), |_original, _suggested| Ok(true))
+                .expect("resolve preset path");
+        assert_eq!(resolved, Path::new("dog.unixnotis"));
+    }
+
+    #[test]
+    fn resolve_cli_bundle_path_cancels_when_prompt_is_declined() {
+        // Declining the prompt should cancel the command instead of guessing
+        let error =
+            resolve_cli_bundle_path_with_prompt(Path::new("dog"), |_original, _suggested| {
+                Ok(false)
+            })
+            .expect_err("cancel preset path");
+        assert!(error.to_string().contains("canceled"));
     }
 }

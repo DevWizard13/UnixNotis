@@ -12,7 +12,8 @@ use super::archive::write_bundle;
 use super::filesystem::collect_config_files;
 use super::manifest::{PresetManifest, PresetManifestFile};
 use super::pathing::{
-    bundle_name_from_path, format_relative_path, parse_except_paths, validate_preset_bundle_path,
+    bundle_name_from_path, format_relative_path, parse_except_paths, resolve_cli_bundle_path,
+    validate_preset_bundle_path,
 };
 
 #[derive(Debug)]
@@ -30,7 +31,9 @@ pub(super) struct ExportSummary {
 pub(super) fn run_export(output_path: &Path, except: &[String], force: bool) -> Result<()> {
     // Resolve the live config root exactly once for the CLI path
     let config_dir = Config::default_config_dir().context("resolve config directory")?;
-    let summary = export_preset_from(&config_dir, output_path, except, force)?;
+    // CLI export accepts a missing extension and can append it after confirmation
+    let output_path = resolve_cli_bundle_path(output_path)?;
+    let summary = export_preset_from(&config_dir, &output_path, except, force)?;
 
     println!(
         "preset export ok: {} file(s) -> {}",

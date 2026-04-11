@@ -8,7 +8,7 @@ use std::path::Path;
 use unixnotis_core::Config;
 
 use super::archive::read_bundle;
-use super::pathing::validate_preset_bundle_path;
+use super::pathing::{resolve_cli_bundle_path, validate_preset_bundle_path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CommandReference {
@@ -19,8 +19,10 @@ struct CommandReference {
 }
 
 pub(super) fn run_inspect(input_path: &Path) -> Result<()> {
+    // CLI inspect accepts a missing extension and can append it after confirmation
+    let input_path = resolve_cli_bundle_path(input_path)?;
     // CLI path just prints the already-formatted report
-    let report = inspect_preset_at(input_path)?;
+    let report = inspect_preset_at(&input_path)?;
     print!("{report}");
     Ok(())
 }

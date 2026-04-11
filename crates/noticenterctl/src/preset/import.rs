@@ -13,7 +13,8 @@ use crate::main_css_check::run_css_check;
 use super::archive::{read_bundle, BundleFile};
 use super::filesystem::{create_backup_dir, ensure_safe_target_path, write_atomic_bytes};
 use super::pathing::{
-    parse_except_paths, relative_path_matches_exclusion, validate_preset_bundle_path,
+    parse_except_paths, relative_path_matches_exclusion, resolve_cli_bundle_path,
+    validate_preset_bundle_path,
 };
 
 #[derive(Debug)]
@@ -45,7 +46,9 @@ struct ImportPlanItem {
 pub(super) fn run_import(input_path: &Path, except: &[String], dry_run: bool) -> Result<()> {
     // Resolve the live config root once for the CLI path
     let config_dir = Config::default_config_dir().context("resolve config directory")?;
-    let summary = import_preset_into(&config_dir, input_path, except, dry_run)?;
+    // CLI import accepts a missing extension and can append it after confirmation
+    let input_path = resolve_cli_bundle_path(input_path)?;
+    let summary = import_preset_into(&config_dir, &input_path, except, dry_run)?;
 
     println!(
         "preset import {}: {} file(s), {} created, {} overwritten, {} excluded",
