@@ -90,96 +90,107 @@ fn collect_command_references(contents: &str) -> Result<Vec<CommandReference>> {
         toml::from_str(contents).context("parse config.toml from preset bundle")?;
     let mut commands = Vec::new();
 
-    // Sliders always carry read and write commands in the config schema
-    commands.push(CommandReference {
-        slot: "widgets.volume.get_cmd".to_string(),
-        command: config.widgets.volume.get_cmd,
-    });
-    commands.push(CommandReference {
-        slot: "widgets.volume.set_cmd".to_string(),
-        command: config.widgets.volume.set_cmd,
-    });
-    push_optional_command(
+    // Each widget family is collected separately so inspect stays easier to extend and review
+    collect_slider_commands(
         &mut commands,
-        "widgets.volume.toggle_cmd",
+        "widgets.volume",
+        config.widgets.volume.get_cmd,
+        config.widgets.volume.set_cmd,
         config.widgets.volume.toggle_cmd,
-    );
-    push_optional_command(
-        &mut commands,
-        "widgets.volume.watch_cmd",
         config.widgets.volume.watch_cmd,
     );
-
-    commands.push(CommandReference {
-        slot: "widgets.brightness.get_cmd".to_string(),
-        command: config.widgets.brightness.get_cmd,
-    });
-    commands.push(CommandReference {
-        slot: "widgets.brightness.set_cmd".to_string(),
-        command: config.widgets.brightness.set_cmd,
-    });
-    push_optional_command(
+    collect_slider_commands(
         &mut commands,
-        "widgets.brightness.toggle_cmd",
+        "widgets.brightness",
+        config.widgets.brightness.get_cmd,
+        config.widgets.brightness.set_cmd,
         config.widgets.brightness.toggle_cmd,
-    );
-    push_optional_command(
-        &mut commands,
-        "widgets.brightness.watch_cmd",
         config.widgets.brightness.watch_cmd,
     );
-
-    // Toggles, stats, and cards expose optional command slots, so only live values are printed
-    for (index, toggle) in config.widgets.toggles.into_iter().enumerate() {
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.toggles[{index}].state_cmd"),
-            toggle.state_cmd,
-        );
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.toggles[{index}].on_cmd"),
-            toggle.on_cmd,
-        );
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.toggles[{index}].off_cmd"),
-            toggle.off_cmd,
-        );
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.toggles[{index}].watch_cmd"),
-            toggle.watch_cmd,
-        );
-    }
-
-    for (index, stat) in config.widgets.stats.into_iter().enumerate() {
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.stats[{index}].cmd"),
-            stat.cmd,
-        );
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.stats[{index}].plugin.command"),
-            stat.plugin.map(|plugin| plugin.command),
-        );
-    }
-
-    for (index, card) in config.widgets.cards.into_iter().enumerate() {
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.cards[{index}].cmd"),
-            card.cmd,
-        );
-        push_optional_command(
-            &mut commands,
-            &format!("widgets.cards[{index}].plugin.command"),
-            card.plugin.map(|plugin| plugin.command),
-        );
-    }
+    collect_indexed_commands(
+        &mut commands,
+        config.widgets.toggles,
+        |commands, index, toggle| {
+            push_optional_command(
+                commands,
+                &format!("widgets.toggles[{index}].state_cmd"),
+                toggle.state_cmd,
+            );
+            push_optional_command(
+                commands,
+                &format!("widgets.toggles[{index}].on_cmd"),
+                toggle.on_cmd,
+            );
+            push_optional_command(
+                commands,
+                &format!("widgets.toggles[{index}].off_cmd"),
+                toggle.off_cmd,
+            );
+            push_optional_command(
+                commands,
+                &format!("widgets.toggles[{index}].watch_cmd"),
+                toggle.watch_cmd,
+            );
+        },
+    );
+    collect_indexed_commands(
+        &mut commands,
+        config.widgets.stats,
+        |commands, index, stat| {
+            push_optional_command(commands, &format!("widgets.stats[{index}].cmd"), stat.cmd);
+            push_optional_command(
+                commands,
+                &format!("widgets.stats[{index}].plugin.command"),
+                stat.plugin.map(|plugin| plugin.command),
+            );
+        },
+    );
+    collect_indexed_commands(
+        &mut commands,
+        config.widgets.cards,
+        |commands, index, card| {
+            push_optional_command(commands, &format!("widgets.cards[{index}].cmd"), card.cmd);
+            push_optional_command(
+                commands,
+                &format!("widgets.cards[{index}].plugin.command"),
+                card.plugin.map(|plugin| plugin.command),
+            );
+        },
+    );
 
     Ok(commands)
+}
+
+fn collect_slider_commands(
+    commands: &mut Vec<CommandReference>,
+    base_slot: &str,
+    get_cmd: String,
+    set_cmd: String,
+    toggle_cmd: Option<String>,
+    watch_cmd: Option<String>,
+) {
+    // Sliders always expose read and write commands, so those are always listed
+    commands.push(CommandReference {
+        slot: format!("{base_slot}.get_cmd"),
+        command: get_cmd,
+    });
+    commands.push(CommandReference {
+        slot: format!("{base_slot}.set_cmd"),
+        command: set_cmd,
+    });
+    push_optional_command(commands, &format!("{base_slot}.toggle_cmd"), toggle_cmd);
+    push_optional_command(commands, &format!("{base_slot}.watch_cmd"), watch_cmd);
+}
+
+fn collect_indexed_commands<T, I, F>(commands: &mut Vec<CommandReference>, items: I, mut collect: F)
+where
+    I: IntoIterator<Item = T>,
+    F: FnMut(&mut Vec<CommandReference>, usize, T),
+{
+    // Indexed helpers keep the per-widget loops small while preserving the real slot names
+    for (index, item) in items.into_iter().enumerate() {
+        collect(commands, index, item);
+    }
 }
 
 fn push_optional_command(commands: &mut Vec<CommandReference>, slot: &str, value: Option<String>) {
