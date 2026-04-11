@@ -51,6 +51,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 ratatui = "0.30.0"
 crossterm = "0.28"
 unicode-width = "0.2.2"
+rustix = { version = "1.1", features = ["fs"] }
 
 [workspace.metadata.unixnotis.installer]
 # Installer-managed binaries live in workspace metadata to avoid duplication between build and install logic.

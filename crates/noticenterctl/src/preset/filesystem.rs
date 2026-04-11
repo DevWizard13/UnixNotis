@@ -6,8 +6,14 @@
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Local;
+#[cfg(target_os = "linux")]
+use rustix::fs::{mkdirat, openat2, renameat, unlinkat, AtFlags, Mode, OFlags, ResolveFlags, CWD};
 use std::env;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -140,7 +146,7 @@ pub(super) fn ensure_safe_target_path(config_dir: &Path, relative_path: &Path) -
             if metadata.file_type().is_symlink() {
                 // Reject the whole import target once a single segment can jump outside the root
                 return Err(anyhow!(
-                    "preset import refuses to write through symlinked paths: {}",
+                    "preset import blocked because this path leaves the UnixNotis config directory through a symlink: {}",
                     probe.display()
                 ));
             }
@@ -182,7 +188,7 @@ pub(super) fn ensure_no_symlink_ancestors(path: &Path) -> Result<()> {
         if metadata.file_type().is_symlink() {
             // Stop before import writes into a root that already points somewhere else
             return Err(anyhow!(
-                "preset import refuses to use a path with symlinked ancestors: {}",
+                "preset import blocked because the UnixNotis config directory path goes through a symlink: {}",
                 probe.display()
             ));
         }
@@ -206,43 +212,229 @@ pub(super) fn create_backup_dir(config_dir: &Path) -> Result<PathBuf> {
     Ok(candidate)
 }
 
-pub(super) fn write_atomic_bytes(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
-    // Parents are created first so imports can restore nested asset and script trees
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("target path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create parent directory {}", parent.display()))?;
+#[cfg(target_os = "linux")]
+pub(super) fn open_secure_dir_all(path: &Path) -> Result<OwnedFd> {
+    let mut current_fd = if path.is_absolute() {
+        // Start from the real filesystem root so each later segment is opened under a stable dir fd
+        openat2(
+            CWD,
+            "/",
+            OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            secure_anchor_resolve_flags(),
+        )
+        .context("open filesystem root for secure directory walk")?
+    } else {
+        // Relative paths are anchored to the current shell directory
+        openat2(
+            CWD,
+            ".",
+            OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+            secure_anchor_resolve_flags(),
+        )
+        .context("open current working directory for secure directory walk")?
+    };
 
-    // Temp file lives beside the target so rename stays atomic on one filesystem
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock moved backwards")
-        .as_nanos();
-    let temp_path = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("preset"),
-        stamp
-    ));
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(anyhow!(
+                    "secure directory walk does not allow parent traversal: {}",
+                    path.display()
+                ));
+            }
+            Component::Normal(part) => {
+                current_fd = open_or_create_child_dir(&current_fd, part)?;
+            }
+        }
+    }
 
-    fs::write(&temp_path, contents)
-        .with_context(|| format!("write temp file {}", temp_path.display()))?;
+    Ok(current_fd)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn read_relative_file_secure(
+    root_dir: &OwnedFd,
+    relative_path: &Path,
+) -> Result<(Vec<u8>, u32)> {
+    let relative_path = normalize_relative_path(relative_path)?;
+    let file_fd = openat2(
+        root_dir,
+        &relative_path,
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        secure_resolve_flags(),
+    )
+    .with_context(|| format!("open file under secure root {}", relative_path.display()))?;
+    let mut file = fs::File::from(file_fd);
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect file under secure root {}", relative_path.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!(
+            "secure file read expected a regular file under the UnixNotis config directory: {}",
+            relative_path.display()
+        ));
+    }
+
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
+        .with_context(|| format!("read file under secure root {}", relative_path.display()))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-
-        // Script bundles need the execute bit preserved on restore
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode))
-            .with_context(|| format!("set permissions on {}", temp_path.display()))?;
+        Ok((contents, metadata.permissions().mode()))
     }
 
-    // Rename replaces the old file in one step after the new bytes are fully written
-    fs::rename(&temp_path, path)
-        .with_context(|| format!("replace target file {}", path.display()))?;
+    #[cfg(not(unix))]
+    {
+        Ok((contents, 0o644))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn write_relative_file_atomic_secure(
+    root_dir: &OwnedFd,
+    relative_path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let relative_path = normalize_relative_path(relative_path)?;
+    let (parent_fd, file_name) = open_or_create_parent_dir(root_dir, &relative_path)?;
+
+    // Temp files stay in the final parent dir so the rename does not cross filesystems
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock moved backwards")
+        .as_nanos();
+    let temp_name = format!(".{}.{}.tmp", file_name, stamp);
+    let temp_fd = openat2(
+        &parent_fd,
+        temp_name.as_str(),
+        OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL,
+        mode_from_bits(mode),
+        secure_resolve_flags(),
+    )
+    .with_context(|| format!("create secure temp file for {}", relative_path.display()))?;
+    let mut temp_file = fs::File::from(temp_fd);
+
+    let write_result = (|| -> Result<()> {
+        temp_file
+            .write_all(contents)
+            .with_context(|| format!("write secure temp file for {}", relative_path.display()))?;
+        temp_file
+            .sync_all()
+            .with_context(|| format!("flush secure temp file for {}", relative_path.display()))?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_result {
+        let _ = unlinkat(&parent_fd, temp_name.as_str(), AtFlags::empty());
+        return Err(err);
+    }
+
+    renameat(
+        &parent_fd,
+        temp_name.as_str(),
+        &parent_fd,
+        file_name.as_str(),
+    )
+    .with_context(|| format!("replace secure target file {}", relative_path.display()))?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_or_create_parent_dir(
+    root_dir: &OwnedFd,
+    relative_path: &Path,
+) -> Result<(OwnedFd, String)> {
+    let file_name = relative_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "relative file path has no file name: {}",
+                relative_path.display()
+            )
+        })?
+        .to_string();
+
+    let mut current_fd = openat2(
+        root_dir,
+        ".",
+        OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        secure_resolve_flags(),
+    )
+    .context("open secure root directory handle")?;
+
+    if let Some(parent) = relative_path.parent() {
+        for component in parent.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!(
+                        "secure parent walk does not allow this path component: {}",
+                        relative_path.display()
+                    ));
+                }
+                Component::Normal(part) => {
+                    current_fd = open_or_create_child_dir(&current_fd, part)?;
+                }
+            }
+        }
+    }
+
+    Ok((current_fd, file_name))
+}
+
+#[cfg(target_os = "linux")]
+fn open_or_create_child_dir<Fd: AsFd>(parent_fd: Fd, name: &std::ffi::OsStr) -> Result<OwnedFd> {
+    match openat2(
+        parent_fd.as_fd(),
+        name,
+        OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        secure_resolve_flags(),
+    ) {
+        Ok(fd) => Ok(fd),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Create the next directory segment under the already verified parent dir fd
+            mkdirat(parent_fd.as_fd(), name, mode_from_bits(0o755)).with_context(|| {
+                format!("create secure directory {}", Path::new(name).display())
+            })?;
+            openat2(
+                parent_fd.as_fd(),
+                name,
+                OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                secure_resolve_flags(),
+            )
+            .with_context(|| format!("open secure directory {}", Path::new(name).display()))
+        }
+        Err(err) => {
+            Err(err).with_context(|| format!("open secure directory {}", Path::new(name).display()))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn secure_resolve_flags() -> ResolveFlags {
+    ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS
+}
+
+#[cfg(target_os = "linux")]
+fn secure_anchor_resolve_flags() -> ResolveFlags {
+    ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS
+}
+
+#[cfg(target_os = "linux")]
+fn mode_from_bits(mode: u32) -> Mode {
+    Mode::from_raw_mode(mode)
 }
 
 fn resolve_working_path(path: &Path) -> Result<PathBuf> {
@@ -271,10 +463,12 @@ fn is_backup_dir(relative_path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_config_files, ensure_no_symlink_ancestors, write_atomic_bytes};
+    use super::{collect_config_files, ensure_no_symlink_ancestors};
+    #[cfg(target_os = "linux")]
+    use super::{open_secure_dir_all, write_relative_file_atomic_secure};
     use crate::preset::pathing::format_relative_path;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -354,14 +548,17 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn write_atomic_bytes_replaces_existing_file() {
-        // Atomic writes should leave the final file in place with new contents
+    fn secure_atomic_write_replaces_existing_file() {
+        // Secure writes should keep the final file in place with new contents
         let root = TempDirGuard::new("atomic");
         let target = root.path.join("scripts/run.sh");
         root.write("scripts/run.sh", "old");
 
-        write_atomic_bytes(&target, b"new", 0o755).expect("write file");
+        let root_fd = open_secure_dir_all(&root.path).expect("open secure root");
+        write_relative_file_atomic_secure(&root_fd, Path::new("scripts/run.sh"), b"new", 0o755)
+            .expect("write file");
 
         assert_eq!(fs::read_to_string(&target).expect("read file"), "new");
     }
@@ -378,6 +575,8 @@ mod tests {
 
         let error =
             ensure_no_symlink_ancestors(&linked_xdg.join("unixnotis")).expect_err("reject symlink");
-        assert!(error.to_string().contains("symlinked ancestors"));
+        assert!(error
+            .to_string()
+            .contains("config directory path goes through a symlink"));
     }
 }

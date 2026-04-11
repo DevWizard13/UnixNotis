@@ -10,6 +10,7 @@ chrono.workspace = true
 clap.workspace = true
 flate2.workspace = true
 gtk.workspace = true
+rustix.workspace = true
 serde.workspace = true
 tar.workspace = true
 tokio.workspace = true

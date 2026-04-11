@@ -12,9 +12,12 @@ use crate::main_css_check::run_css_check;
 
 use super::archive::{read_bundle, BundleFile};
 use super::filesystem::{
-    create_backup_dir, ensure_no_symlink_ancestors, ensure_safe_target_path, write_atomic_bytes,
+    create_backup_dir, ensure_no_symlink_ancestors, ensure_safe_target_path, open_secure_dir_all,
+    read_relative_file_secure, write_relative_file_atomic_secure,
 };
-use super::import_checks::validate_imported_theme_paths_stay_in_root;
+use super::import_checks::{
+    validate_config_theme_paths_stay_in_root, validate_imported_theme_paths_stay_in_root,
+};
 use super::pathing::{
     parse_except_paths, relative_path_matches_exclusion, resolve_cli_bundle_path,
     validate_preset_bundle_path,
@@ -66,16 +69,12 @@ pub(super) fn run_import(input_path: &Path, except: &[String], dry_run: bool) ->
     }
 
     if !summary.dry_run {
-        // Mirror app startup so css-check sees the same theme file set the UI would use
+        // Reload the active config after import so css-check validates the setup that was just applied
         let config_path = config_dir.join("config.toml");
         let config = Config::load_from_path(&config_path)
             .context("load imported config.toml before css-check")?;
-        let theme_paths = config
-            .resolve_theme_paths_from(&config_dir)
-            .context("resolve imported theme paths before css-check")?;
-        config
-            .ensure_theme_files(&theme_paths)
-            .context("materialize imported theme files before css-check")?;
+        // Recheck the live config so `--except config.toml` cannot reuse an unsafe local theme path
+        validate_config_theme_paths_stay_in_root(&config_dir, &config)?;
 
         // Imported presets should be checked right away so broken shared CSS is obvious
         println!("preset import check: running css-check on imported theme files");
@@ -116,8 +115,8 @@ pub(super) fn import_preset_into(
             "preset bundle is missing config.toml and cannot be imported"
         ));
     }
-    if imports_config_toml {
-        // Parse the bundled config early so hostile theme paths fail before any file is written
+    // Import should validate the config that will actually drive post-import theme setup
+    let effective_config_bytes = if imports_config_toml {
         let bundled_config = bundle
             .files
             .iter()
@@ -126,9 +125,19 @@ pub(super) fn import_preset_into(
             .ok_or_else(|| {
                 anyhow!("preset bundle is missing config.toml and cannot be imported")
             })?;
-        // This closes the chain where a safe archive could still point theme files outside the root
-        validate_imported_theme_paths_stay_in_root(config_dir, &bundled_config.contents)?;
-    }
+        bundled_config.contents.clone()
+    } else {
+        let local_config_path = config_dir.join("config.toml");
+        // Keeping the local config means its theme paths still control the later css-check setup
+        fs::read(&local_config_path).with_context(|| {
+            format!(
+                "read existing config.toml kept by --except from {}",
+                local_config_path.display()
+            )
+        })?
+    };
+    // This closes both bundled and kept-local config chains before any file is written
+    validate_imported_theme_paths_stay_in_root(config_dir, &effective_config_bytes)?;
 
     let mut excluded = 0usize;
     let mut plan = Vec::new();
@@ -175,12 +184,20 @@ pub(super) fn import_preset_into(
         });
     }
 
-    // Real import creates the config root late so failed validation stays side-effect free
-    fs::create_dir_all(config_dir)
-        .with_context(|| format!("create config directory {}", config_dir.display()))?;
+    // Real import opens the config root through a directory fd so later writes stay inside it
+    let config_root_fd = open_secure_dir_all(config_dir)
+        .with_context(|| format!("open secure config directory {}", config_dir.display()))?;
     let backup_dir = if overwritten > 0 {
         // Backups are only created when there is something to preserve
         Some(create_backup_dir(config_dir)?)
+    } else {
+        None
+    };
+    let backup_root_fd = if let Some(backup_dir) = backup_dir.as_ref() {
+        Some(
+            open_secure_dir_all(backup_dir)
+                .with_context(|| format!("open secure backup directory {}", backup_dir.display()))?,
+        )
     } else {
         None
     };
@@ -190,24 +207,31 @@ pub(super) fn import_preset_into(
             let Some(backup_dir) = backup_dir.as_ref() else {
                 return Err(anyhow!("internal error: missing backup directory"));
             };
-            // Backup layout mirrors the config tree so manual restore stays straightforward
+            let Some(backup_root_fd) = backup_root_fd.as_ref() else {
+                return Err(anyhow!("internal error: missing secure backup directory"));
+            };
+            // Read and rewrite through secure dir fds so a late symlink swap cannot redirect backups
+            let (existing_bytes, existing_mode) =
+                read_relative_file_secure(&config_root_fd, &item.file.relative_path).with_context(
+                    || format!("read existing imported file {}", item.file.relative_path.display()),
+                )?;
             let backup_path = backup_dir.join(&item.file.relative_path);
-            if let Some(parent) = backup_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create backup parent {}", parent.display()))?;
-            }
-            // Copy the live file first so a later write failure still leaves a rollback path
-            fs::copy(&item.target_path, &backup_path).with_context(|| {
-                format!(
-                    "backup existing file {} -> {}",
-                    item.target_path.display(),
-                    backup_path.display()
-                )
-            })?;
+            write_relative_file_atomic_secure(
+                backup_root_fd,
+                &item.file.relative_path,
+                &existing_bytes,
+                existing_mode,
+            )
+            .with_context(|| format!("write backup file {}", backup_path.display()))?;
         }
 
-        // Final write is atomic so a half-written config file is not left behind
-        write_atomic_bytes(&item.target_path, &item.file.contents, item.file.mode)
+        // Final writes go through the secure root fd so a symlink planted mid-import cannot win the race
+        write_relative_file_atomic_secure(
+            &config_root_fd,
+            &item.file.relative_path,
+            &item.file.contents,
+            item.file.mode,
+        )
             .with_context(|| format!("write imported file {}", item.target_path.display()))?;
     }
 
@@ -382,8 +406,44 @@ mod tests {
         let error = import_preset_into(&import_root.path, &bundle_path, &[], false)
             .expect_err("reject absolute bundled theme path");
 
-        assert!(error.to_string().contains("stay under the config root"));
+        assert!(error
+            .to_string()
+            .contains("tries to leave the UnixNotis config directory"));
         assert!(!outside_theme.exists());
         assert!(!import_root.path.join("config.toml").exists());
+    }
+
+    #[test]
+    fn import_rejects_kept_local_config_that_points_outside_root() {
+        // Keeping the local config should not reopen the later theme-materialization escape path
+        let export_root = TempDirGuard::new("kept-local-config-export");
+        export_root.write("config.toml", "[theme]\nbase_css = \"base.css\"\n");
+        export_root.write("base.css", ".a { color: red; }");
+        let bundle_path = export_root.path.join("demo.unixnotis");
+        export_preset_from(&export_root.path, &bundle_path, &[], false).expect("export bundle");
+
+        let import_root = TempDirGuard::new("kept-local-config-import");
+        let outside_theme = import_root.path.with_file_name("outside-theme.css");
+        import_root.write(
+            "config.toml",
+            &format!(
+                "[theme]\nbase_css = {:?}\npanel_css = \"panel.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\nmedia_css = \"media.css\"\n",
+                outside_theme.display().to_string()
+            ),
+        );
+
+        let error = import_preset_into(
+            &import_root.path,
+            &bundle_path,
+            &["config.toml".to_string()],
+            false,
+        )
+        .expect_err("reject kept local config escape");
+
+        assert!(error
+            .to_string()
+            .contains("tries to leave the UnixNotis config directory"));
+        assert!(!outside_theme.exists());
+        assert!(!import_root.path.join("base.css").exists());
     }
 }
