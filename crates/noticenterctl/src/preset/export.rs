@@ -3,23 +3,34 @@
 //! Export reads the active config root, applies explicit exclusions,
 //! rejects host-specific escape paths, and writes one shareable bundle file
 
+#[path = "export/checks.rs"]
+mod checks;
+#[path = "export/prompts.rs"]
+mod prompts;
+#[cfg(test)]
+#[path = "export/tests.rs"]
+mod tests;
+
 use anyhow::{anyhow, Context, Result};
 use chrono::Local;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use unixnotis_core::Config;
 
+use self::checks::validate_theme_paths_stay_in_root;
+use self::prompts::{
+    confirm_export_external_css_refs, prompt_to_fix_host_specific_command_paths,
+    rewrite_host_specific_command_paths_if_requested,
+};
 use super::archive::write_bundle;
 use super::command_paths::{
-    rewrite_host_specific_command_paths, validate_config_command_paths_stay_in_root,
-    HostSpecificCommandPath,
+    validate_config_command_paths_stay_in_root, HostSpecificCommandPath,
 };
 use super::config_root::{collect_config_files, override_collected_file_contents};
 use super::css_asset_refs::{collect_external_css_asset_refs_from_sources, ExternalCssAssetRef};
 use super::manifest::{PresetManifest, PresetManifestFile};
 use super::pathing::{
-    bundle_name_from_path, confirm_continue_or_abort, format_relative_path, normalize_lexical_path,
-    parse_except_paths, resolve_cli_bundle_path, validate_preset_bundle_path,
+    bundle_name_from_path, format_relative_path, parse_except_paths, resolve_cli_bundle_path,
+    validate_preset_bundle_path,
 };
 
 #[derive(Debug)]
@@ -91,6 +102,7 @@ where
     G: FnOnce(&[HostSpecificCommandPath]) -> Result<bool>,
 {
     // Tests can inject a fixed answer here so they do not depend on terminal state
+    // The orchestrator stays narrow so export-specific checks and prompts can live beside it
     // The user-facing preset extension is part of the public contract
     validate_preset_bundle_path(output_path)?;
     if !config_dir.exists() {
@@ -217,389 +229,4 @@ where
         skipped_symlinks: collected.skipped_symlinks,
         skipped_non_regular: collected.skipped_non_regular,
     })
-}
-
-fn confirm_export_external_css_refs(external_refs: &[ExternalCssAssetRef]) -> Result<()> {
-    if external_refs.is_empty() {
-        return Ok(());
-    }
-
-    // The warning prints first so the caller can see exactly which CSS file caused the prompt
-    let details = format_external_css_ref_lines(external_refs);
-    eprintln!(
-        "preset export warning: found {} CSS asset reference(s) outside the UnixNotis config directory",
-        external_refs.len()
-    );
-    for line in &details {
-        eprintln!("{line}");
-    }
-
-    confirm_continue_or_abort(
-        "External CSS asset references were found; continue exporting anyway?",
-        &format!(
-            "preset export found CSS asset references outside the UnixNotis config directory; rerun interactively to confirm anyway\n{}",
-            details.join("\n")
-        ),
-    )
-}
-
-fn format_external_css_ref_lines(external_refs: &[ExternalCssAssetRef]) -> Vec<String> {
-    external_refs
-        .iter()
-        .map(|asset_ref| {
-            // One line per asset keeps warning output readable when several files are involved
-            format!(
-                "  - {} -> {} ({})",
-                asset_ref.css_file.display(),
-                asset_ref.asset_ref,
-                asset_ref.reason
-            )
-        })
-        .collect()
-}
-
-fn rewrite_host_specific_command_paths_if_requested<G>(
-    config_dir: &Path,
-    config: &mut Config,
-    prompt_fix_host_specific_command_paths: G,
-) -> Result<Vec<HostSpecificCommandPath>>
-where
-    G: FnOnce(&[HostSpecificCommandPath]) -> Result<bool>,
-{
-    let leaked_paths = super::command_paths::collect_host_specific_command_paths(config_dir, config);
-    if leaked_paths.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let details = format_host_specific_command_path_lines(&leaked_paths);
-    eprintln!(
-        "preset export warning: found {} host-specific command path(s) under the UnixNotis config directory",
-        leaked_paths.len()
-    );
-    for line in &details {
-        eprintln!("{line}");
-    }
-
-    // Declining the helper keeps the bundle valid, but the warning stays visible
-    if !prompt_fix_host_specific_command_paths(&leaked_paths)? {
-        eprintln!(
-            "preset export warning: leaving host-specific command paths unchanged in the bundle"
-        );
-        return Ok(Vec::new());
-    }
-
-    Ok(rewrite_host_specific_command_paths(config_dir, config))
-}
-
-fn prompt_to_fix_host_specific_command_paths(
-    _leaked_paths: &[HostSpecificCommandPath],
-) -> Result<bool> {
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return super::pathing::prompt_yes_no(
-            "Host-specific command paths were found; let noticenterctl rewrite them in the exported preset?",
-        );
-    }
-
-    // Non-interactive export should not silently decide whether to rewrite command paths
-    Err(anyhow!(
-        "preset export found host-specific command paths under the UnixNotis config directory; rerun interactively to let noticenterctl rewrite them"
-    ))
-}
-
-fn format_host_specific_command_path_lines(
-    leaked_paths: &[HostSpecificCommandPath],
-) -> Vec<String> {
-    leaked_paths
-        .iter()
-        .map(|leak| {
-            // These rows point straight at the leaking slot so the config can be rewritten to scripts/... form
-            format!(
-                "  - {} = {} (absolute path under the config root; let noticenterctl rewrite it to a config-root-relative command)",
-                leak.slot, leak.command
-            )
-        })
-        .collect()
-}
-
-fn validate_theme_paths_stay_in_root(
-    config_dir: &Path,
-    theme_paths: &[(&'static str, &Path)],
-) -> Result<()> {
-    let normalized_root = normalize_lexical_path(config_dir);
-
-    // A shareable preset should not depend on files stored outside the config root
-    for (slot_name, path) in theme_paths {
-        let normalized_path = normalize_lexical_path(path);
-        if !normalized_path.starts_with(&normalized_root) {
-            return Err(anyhow!(
-                "preset export requires {} to live under the config root: {}",
-                slot_name,
-                path.display()
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{export_preset_from, export_preset_from_with_confirm};
-    use anyhow::anyhow;
-    use crate::preset::archive::read_bundle;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static TEST_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-    struct TempDirGuard {
-        path: PathBuf,
-    }
-
-    impl TempDirGuard {
-        fn new(name: &str) -> Self {
-            // Unique temp roots keep preset tests isolated from each other
-            let stamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock moved backwards")
-                .as_nanos();
-            let serial = TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "unixnotis-preset-export-{}-{}-{}",
-                name, stamp, serial
-            ));
-            fs::create_dir_all(&path).expect("create temp dir");
-            Self { path }
-        }
-
-        fn write(&self, relative_path: &str, contents: &str) {
-            // Helper keeps test setup focused on intent instead of path plumbing
-            let path = self.path.join(relative_path);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).expect("create parent dirs");
-            }
-            fs::write(path, contents).expect("write file");
-        }
-    }
-
-    impl Drop for TempDirGuard {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    #[test]
-    fn export_builds_bundle_from_config_root() {
-        // Export should pack the live config tree into one bundle file
-        let root = TempDirGuard::new("bundle");
-        root.write("config.toml", "[theme]\nbase_css = \"base.css\"\n");
-        root.write("base.css", ".panel { color: red; }");
-        root.write("assets/bg.png", "png");
-
-        let bundle_path = root.path.join("demo.unixnotis");
-        let summary = export_preset_from(&root.path, &bundle_path, &[], false).expect("export");
-
-        assert_eq!(summary.file_count, 3);
-        assert!(bundle_path.exists());
-    }
-
-    #[test]
-    fn export_rejects_excluding_config_toml() {
-        // config.toml is required for a usable preset
-        let root = TempDirGuard::new("exclude-config");
-        root.write("config.toml", "[theme]\nbase_css = \"base.css\"\n");
-        root.write("base.css", ".panel { color: red; }");
-
-        let bundle_path = root.path.join("demo.unixnotis");
-        let error = export_preset_from(
-            &root.path,
-            &bundle_path,
-            &["config.toml".to_string()],
-            false,
-        )
-        .expect_err("reject config exclusion");
-
-        assert!(error.to_string().contains("cannot exclude config.toml"));
-    }
-
-    #[test]
-    fn export_rejects_theme_paths_that_leave_root_through_parent_traversal() {
-        // Lexical `../` escapes should be blocked during export, not discovered later on import
-        let root = TempDirGuard::new("parent-theme-escape");
-        root.write(
-            "config.toml",
-            "[theme]\nbase_css = \"../outside.css\"\npanel_css = \"panel.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\nmedia_css = \"media.css\"\n",
-        );
-        root.write("panel.css", ".panel { color: red; }");
-        root.write("popup.css", ".popup { color: red; }");
-        root.write("widgets.css", ".widgets { color: red; }");
-        root.write("media.css", ".media { color: red; }");
-
-        let bundle_path = root.path.join("demo.unixnotis");
-        let error = export_preset_from(&root.path, &bundle_path, &[], false)
-            .expect_err("reject parent theme escape");
-
-        assert!(error
-            .to_string()
-            .contains("requires base_css to live under the config root"));
-        assert!(!bundle_path.exists());
-    }
-
-    #[test]
-    fn export_rejects_absolute_plugin_command_outside_root() {
-        // Shared presets should stay self-contained when commands point at local scripts
-        let root = TempDirGuard::new("outside-command");
-        root.write(
-            "config.toml",
-            "[theme]\nbase_css = \"base.css\"\n[[widgets.stats]]\nlabel = \"Probe\"\n[widgets.stats.plugin]\napi_version = 1\ncommand = \"/tmp/outside-plugin\"\n",
-        );
-        root.write("base.css", ".panel { color: red; }");
-
-        let bundle_path = root.path.join("demo.unixnotis");
-        let error = export_preset_from(&root.path, &bundle_path, &[], false)
-            .expect_err("reject outside plugin command");
-
-        assert!(error
-            .to_string()
-            .contains("explicit command paths to stay under the config root"));
-        assert!(!bundle_path.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn export_replaces_symlink_output_instead_of_following_it() {
-        // Export should replace the symlink path itself, not overwrite the symlink target
-        let root = TempDirGuard::new("symlink-output");
-        root.write("config.toml", "[theme]\nbase_css = \"base.css\"\n");
-        root.write("base.css", ".panel { color: red; }");
-
-        let outside_target = root.path.with_file_name("outside-target.unixnotis");
-        fs::write(&outside_target, "ORIGINAL").expect("write outside target");
-        let bundle_path = root.path.join("bundle.unixnotis");
-        std::os::unix::fs::symlink(&outside_target, &bundle_path).expect("create output symlink");
-
-        let summary = export_preset_from(&root.path, &bundle_path, &[], true).expect("export");
-
-        assert_eq!(summary.file_count, 2);
-        assert_eq!(
-            fs::read_to_string(&outside_target).expect("read outside target"),
-            "ORIGINAL"
-        );
-        assert!(bundle_path.exists());
-        assert!(!fs::symlink_metadata(&bundle_path)
-            .expect("stat bundle path")
-            .file_type()
-            .is_symlink());
-    }
-
-    #[test]
-    fn export_rejects_outside_css_asset_refs_in_noninteractive_runs() {
-        // Shared presets should pause when CSS reaches outside the config root for assets
-        let root = TempDirGuard::new("external-css-asset");
-        root.write("config.toml", "[theme]\nbase_css = \"base.css\"\n");
-        root.write(
-            "base.css",
-            ".panel { background-image: url(\"../outside.png\"); }\n",
-        );
-
-        let bundle_path = root.path.join("demo.unixnotis");
-        // The injected rejector makes this test stable even when cargo test has a tty
-        let error =
-            export_preset_from_with_confirm(
-                &root.path,
-                &bundle_path,
-                &[],
-                false,
-                |_refs| {
-                    Err(anyhow!(
-                        "preset export found CSS asset references outside the UnixNotis config directory"
-                    ))
-                },
-                |_leaks| Ok(false),
-            )
-            .expect_err("reject outside css asset refs without confirmation");
-
-        assert!(error
-            .to_string()
-            .contains("CSS asset references outside the UnixNotis config directory"));
-        assert!(!bundle_path.exists());
-    }
-
-    #[test]
-    fn export_can_rewrite_host_specific_command_paths_in_bundle_config() {
-        // Shared presets can fix leaked home paths in the bundled config without touching the live tree
-        let root = TempDirGuard::new("host-specific-command-path");
-        let script_path = root.path.join("scripts/unixnotis-thermal-stat");
-        root.write(
-            "config.toml",
-            &format!(
-                "[theme]\nbase_css = \"base.css\"\n[[widgets.stats]]\nlabel = \"Probe\"\n[widgets.stats.plugin]\napi_version = 1\ncommand = {:?}\n",
-                script_path.display().to_string()
-            ),
-        );
-        root.write("base.css", ".panel { color: red; }");
-        root.write("scripts/unixnotis-thermal-stat", "#!/bin/sh\necho 42\n");
-
-        let bundle_path = root.path.join("demo.unixnotis");
-        let summary = export_preset_from_with_confirm(
-            &root.path,
-            &bundle_path,
-            &[],
-            false,
-            |_refs| Ok(()),
-            |_leaks| Ok(true),
-        )
-        .expect("export with rewrite");
-
-        assert_eq!(summary.file_count, 3);
-        let bundle = read_bundle(&bundle_path).expect("read bundle");
-        let config_file = bundle
-            .files
-            .iter()
-            .find(|file| file.relative_path == Path::new("config.toml"))
-            .expect("bundled config");
-        let config_text = std::str::from_utf8(&config_file.contents).expect("utf8 config");
-
-        assert!(config_text.contains("scripts/unixnotis-thermal-stat"));
-        assert!(!config_text.contains(&script_path.display().to_string()));
-        let live_config = fs::read_to_string(root.path.join("config.toml")).expect("live config");
-        assert!(live_config.contains(&script_path.display().to_string()));
-    }
-
-    #[test]
-    fn export_can_keep_host_specific_command_paths_when_fix_is_declined() {
-        let root = TempDirGuard::new("keep-host-specific-command-path");
-        let script_path = root.path.join("scripts/unixnotis-thermal-stat");
-        root.write(
-            "config.toml",
-            &format!(
-                "[theme]\nbase_css = \"base.css\"\n[[widgets.stats]]\nlabel = \"Probe\"\n[widgets.stats.plugin]\napi_version = 1\ncommand = {:?}\n",
-                script_path.display().to_string()
-            ),
-        );
-        root.write("base.css", ".panel { color: red; }");
-        root.write("scripts/unixnotis-thermal-stat", "#!/bin/sh\necho 42\n");
-
-        let bundle_path = root.path.join("demo.unixnotis");
-        export_preset_from_with_confirm(
-            &root.path,
-            &bundle_path,
-            &[],
-            false,
-            |_refs| Ok(()),
-            |_leaks| Ok(false),
-        )
-        .expect("export without rewrite");
-
-        let bundle = read_bundle(&bundle_path).expect("read bundle");
-        let config_file = bundle
-            .files
-            .iter()
-            .find(|file| file.relative_path == Path::new("config.toml"))
-            .expect("bundled config");
-        let config_text = std::str::from_utf8(&config_file.contents).expect("utf8 config");
-
-        assert!(config_text.contains(&script_path.display().to_string()));
-    }
 }
