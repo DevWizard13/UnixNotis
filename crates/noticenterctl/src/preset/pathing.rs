@@ -220,7 +220,7 @@ fn prompt_to_append_extension(original: &Path, suggested: &Path) -> Result<bool>
     ))
 }
 
-fn prompt_yes_no(prompt: &str) -> Result<bool> {
+pub(super) fn prompt_yes_no(prompt: &str) -> Result<bool> {
     // Shared yes/no prompt keeps import and export warnings consistent
     print!("{prompt} [y/N] ");
     io::stdout().flush().context("flush preset prompt")?;

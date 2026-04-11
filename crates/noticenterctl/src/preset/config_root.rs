@@ -6,6 +6,8 @@
 use anyhow::{anyhow, Context, Result};
 use std::env;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use super::pathing::{normalize_relative_path, relative_path_matches_exclusion};
@@ -20,6 +22,10 @@ pub(super) struct PresetFileSource {
     pub(super) source_path: PathBuf,
     // Cached size goes into the manifest so later validation stays cheap
     pub(super) size: u64,
+    // File mode is cached so archive overrides can keep the same permissions
+    pub(super) mode: u32,
+    // Export can replace config.toml bytes in memory without touching the live tree
+    pub(super) contents_override: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default)]
@@ -107,6 +113,8 @@ pub(super) fn collect_config_files(
                 relative_path: relative,
                 source_path: path,
                 size: metadata.len(),
+                mode: file_mode(&metadata),
+                contents_override: None,
             });
         }
     }
@@ -119,6 +127,28 @@ pub(super) fn collect_config_files(
     Ok(collected)
 }
 
+pub(super) fn override_collected_file_contents(
+    collected: &mut CollectedConfigFiles,
+    relative_path: &Path,
+    contents: Vec<u8>,
+) -> Result<()> {
+    let Some(file) = collected
+        .files
+        .iter_mut()
+        .find(|file| file.relative_path == relative_path)
+    else {
+        return Err(anyhow!(
+            "preset export could not find {} in the collected file set",
+            relative_path.display()
+        ));
+    };
+
+    // The override stays in memory so export can fix bundled config.toml only
+    file.size = contents.len() as u64;
+    file.contents_override = Some(contents);
+    Ok(())
+}
+
 fn resolve_working_path(path: &Path) -> Result<PathBuf> {
     // Relative export targets are resolved from the current shell directory
     if path.is_absolute() {
@@ -128,6 +158,18 @@ fn resolve_working_path(path: &Path) -> Result<PathBuf> {
     Ok(env::current_dir()
         .context("resolve current working directory")?
         .join(path))
+}
+
+fn file_mode(metadata: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode()
+    }
+
+    #[cfg(not(unix))]
+    {
+        0o644
+    }
 }
 
 fn is_backup_dir(relative_path: &Path) -> bool {
@@ -145,10 +187,10 @@ fn is_backup_dir(relative_path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_config_files;
+    use super::{collect_config_files, override_collected_file_contents};
     use crate::preset::pathing::format_relative_path;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -225,6 +267,31 @@ mod tests {
                 .map(|path| format_relative_path(path))
                 .collect::<Vec<_>>(),
             vec!["linked.png"]
+        );
+    }
+
+    #[test]
+    fn override_collected_file_contents_updates_manifest_size() {
+        let root = TempDirGuard::new("override");
+        root.write("config.toml", "demo = true");
+
+        let mut collected = collect_config_files(&root.path, None, &[]).expect("collect files");
+        override_collected_file_contents(
+            &mut collected,
+            Path::new("config.toml"),
+            b"demo = false\n".to_vec(),
+        )
+        .expect("override config");
+
+        let config = collected
+            .files
+            .iter()
+            .find(|file| file.relative_path == Path::new("config.toml"))
+            .expect("config file");
+        assert_eq!(config.size, b"demo = false\n".len() as u64);
+        assert_eq!(
+            config.contents_override.as_deref(),
+            Some(&b"demo = false\n"[..])
         );
     }
 }

@@ -66,6 +66,17 @@ pub(super) fn write_bundle(
     )?;
 
     for file in &collected.files {
+        if let Some(contents) = &file.contents_override {
+            // Overridden files stay in memory so export can patch config.toml in the bundle only
+            append_bytes(
+                &mut builder,
+                &archive_payload_path(&file.relative_path),
+                contents,
+                file.mode,
+            )?;
+            continue;
+        }
+
         // Files are streamed from disk so export memory stays bounded by one file at a time
         builder
             .append_path_with_name(&file.source_path, archive_payload_path(&file.relative_path))
@@ -296,11 +307,15 @@ mod tests {
                     relative_path: PathBuf::from("base.css"),
                     source_path: css_path,
                     size: 18,
+                    mode: 0o644,
+                    contents_override: None,
                 },
                 PresetFileSource {
                     relative_path: PathBuf::from("config.toml"),
                     source_path: config_path,
                     size: 11,
+                    mode: 0o644,
+                    contents_override: None,
                 },
             ],
             skipped_symlinks: Vec::new(),
@@ -327,5 +342,39 @@ mod tests {
 
         assert_eq!(bundle.manifest.bundle_name, "demo");
         assert_eq!(bundle.files.len(), 2);
+    }
+
+    #[test]
+    fn archive_round_trip_uses_overridden_file_bytes() {
+        let root = TempDirGuard::new("override");
+        let config_path = root.write("config.toml", "demo = true");
+        let bundle_path = root.path.join("demo.unixnotis");
+
+        let collected = CollectedConfigFiles {
+            files: vec![PresetFileSource {
+                relative_path: PathBuf::from("config.toml"),
+                source_path: config_path,
+                size: 12,
+                mode: 0o644,
+                contents_override: Some(b"demo = false\n".to_vec()),
+            }],
+            skipped_symlinks: Vec::new(),
+            skipped_non_regular: Vec::new(),
+        };
+        let manifest = PresetManifest::new(
+            "demo".to_string(),
+            "2026-04-11T12:00:00Z".to_string(),
+            "0.1.0".to_string(),
+            vec![PresetManifestFile {
+                path: "config.toml".to_string(),
+                size: 13,
+            }],
+        );
+
+        write_bundle(&bundle_path, &manifest, &collected).expect("write bundle");
+        let bundle = read_bundle(&bundle_path).expect("read bundle");
+
+        assert_eq!(bundle.files.len(), 1);
+        assert_eq!(bundle.files[0].contents, b"demo = false\n");
     }
 }

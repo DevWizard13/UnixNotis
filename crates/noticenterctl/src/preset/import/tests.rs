@@ -137,6 +137,8 @@ fn import_rejects_bundled_absolute_theme_paths_before_writing() {
                 relative_path: PathBuf::from(relative_path),
                 size: fs::metadata(&source_path).expect("metadata").len(),
                 source_path,
+                mode: 0o644,
+                contents_override: None,
             }
         })
         .collect(),
@@ -224,6 +226,8 @@ fn import_rejects_outside_css_asset_refs_in_noninteractive_runs() {
                     relative_path: PathBuf::from(relative_path),
                     size: fs::metadata(&source_path).expect("metadata").len(),
                     source_path,
+                    mode: 0o644,
+                    contents_override: None,
                 }
             })
             .collect(),

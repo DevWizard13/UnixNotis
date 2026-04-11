@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use unixnotis_core::{util, Config};
 
-use super::pathing::normalize_lexical_path;
+use super::pathing::{format_relative_path, normalize_lexical_path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommandReference {
@@ -26,6 +26,16 @@ pub(crate) struct OutsideCommandPath {
     // Raw command string from the config
     pub(crate) command: String,
     // Resolved first-token path used by the validator
+    pub(crate) resolved_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostSpecificCommandPath {
+    // Config slot that carried the host-specific path
+    pub(crate) slot: String,
+    // Raw command string from the config
+    pub(crate) command: String,
+    // Resolved first-token path under the config root
     pub(crate) resolved_path: PathBuf,
 }
 
@@ -124,6 +134,67 @@ pub(crate) fn collect_outside_command_paths(
         .collect()
 }
 
+pub(crate) fn collect_host_specific_command_paths(
+    config_dir: &Path,
+    config: &Config,
+) -> Vec<HostSpecificCommandPath> {
+    let normalized_root = normalize_lexical_path(config_dir);
+
+    collect_command_references_from_config(config)
+        .into_iter()
+        .filter_map(|reference| {
+            let token = first_command_token(&reference.command)?;
+            let resolved_path = resolve_command_path_token(config_dir, &reference.command)?;
+            let normalized_path = normalize_lexical_path(&resolved_path);
+            // Only absolute host-local command paths under the config root are warned here
+            if !normalized_path.starts_with(&normalized_root) || !is_host_specific_path_token(token)
+            {
+                return None;
+            }
+
+            Some(HostSpecificCommandPath {
+                slot: reference.slot,
+                command: reference.command,
+                resolved_path,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn rewrite_host_specific_command_paths(
+    config_dir: &Path,
+    config: &mut Config,
+) -> Vec<HostSpecificCommandPath> {
+    let leaks = collect_host_specific_command_paths(config_dir, config);
+    if leaks.is_empty() {
+        return leaks;
+    }
+
+    // Each command-bearing slot is rewritten in place so only the exported bundle changes
+    rewrite_slider_commands(config_dir, &mut config.widgets.volume);
+    rewrite_slider_commands(config_dir, &mut config.widgets.brightness);
+    for toggle in &mut config.widgets.toggles {
+        rewrite_optional_command(config_dir, &mut toggle.state_cmd);
+        rewrite_optional_command(config_dir, &mut toggle.on_cmd);
+        rewrite_optional_command(config_dir, &mut toggle.off_cmd);
+        rewrite_optional_command(config_dir, &mut toggle.watch_cmd);
+    }
+    for stat in &mut config.widgets.stats {
+        rewrite_optional_command(config_dir, &mut stat.cmd);
+        if let Some(plugin) = stat.plugin.as_mut() {
+            rewrite_inline_command(config_dir, &mut plugin.command);
+        }
+    }
+    for card in &mut config.widgets.cards {
+        rewrite_optional_command(config_dir, &mut card.cmd);
+        if let Some(plugin) = card.plugin.as_mut() {
+            rewrite_inline_command(config_dir, &mut plugin.command);
+        }
+    }
+
+    leaks
+}
+
 pub(crate) fn validate_config_command_paths_stay_in_root(
     config_dir: &Path,
     config: &Config,
@@ -176,6 +247,27 @@ fn collect_slider_commands(
     push_optional_command(commands, &format!("{base_slot}.watch_cmd"), watch_cmd);
 }
 
+fn rewrite_slider_commands(config_dir: &Path, slider: &mut unixnotis_core::SliderWidgetConfig) {
+    rewrite_inline_command(config_dir, &mut slider.get_cmd);
+    rewrite_inline_command(config_dir, &mut slider.set_cmd);
+    rewrite_optional_command(config_dir, &mut slider.toggle_cmd);
+    rewrite_optional_command(config_dir, &mut slider.watch_cmd);
+}
+
+fn rewrite_optional_command(config_dir: &Path, value: &mut Option<String>) {
+    let Some(command) = value.as_mut() else {
+        return;
+    };
+    rewrite_inline_command(config_dir, command);
+}
+
+fn rewrite_inline_command(config_dir: &Path, command: &mut String) {
+    let Some(rewritten) = rewrite_command_to_config_relative(config_dir, command) else {
+        return;
+    };
+    *command = rewritten;
+}
+
 fn push_optional_command(commands: &mut Vec<CommandReference>, slot: &str, value: Option<&str>) {
     let Some(command) = value else {
         return;
@@ -203,7 +295,7 @@ fn resolve_command_path_token(config_dir: &Path, command: &str) -> Option<PathBu
         return None;
     }
 
-    let first = trimmed.split_whitespace().next()?;
+    let first = first_command_token(trimmed)?;
     if !looks_like_path_token(first) {
         return None;
     }
@@ -215,6 +307,39 @@ fn resolve_command_path_token(config_dir: &Path, command: &str) -> Option<PathBu
     Some(config_dir.join(expanded))
 }
 
+fn rewrite_command_to_config_relative(config_dir: &Path, command: &str) -> Option<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || !util::is_simple_command(trimmed) {
+        return None;
+    }
+
+    let first = first_command_token(trimmed)?;
+    if !is_host_specific_path_token(first) {
+        return None;
+    }
+
+    let resolved_path = resolve_command_path_token(config_dir, trimmed)?;
+    let normalized_root = normalize_lexical_path(config_dir);
+    let normalized_path = normalize_lexical_path(&resolved_path);
+    // Only paths that really live under the config root can be rewritten safely
+    let relative_path = normalized_path.strip_prefix(&normalized_root).ok()?;
+    let rewritten_first = format_relative_path(relative_path);
+    if rewritten_first.is_empty() {
+        return None;
+    }
+
+    // Keep the rest of the command string as-is so flags and placeholders survive
+    let rest = trimmed[first.len()..].trim_start();
+    if rest.is_empty() {
+        return Some(rewritten_first);
+    }
+    Some(format!("{rewritten_first} {rest}"))
+}
+
+fn first_command_token(command: &str) -> Option<&str> {
+    command.split_whitespace().next()
+}
+
 fn looks_like_path_token(token: &str) -> bool {
     token == "~"
         || token.starts_with("~/")
@@ -223,10 +348,15 @@ fn looks_like_path_token(token: &str) -> bool {
         || token.contains('/')
 }
 
+fn is_host_specific_path_token(token: &str) -> bool {
+    token.starts_with('/') || token == "~" || token.starts_with("~/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_command_references_from_config, collect_outside_command_paths,
+        collect_command_references_from_config, collect_host_specific_command_paths,
+        collect_outside_command_paths, rewrite_host_specific_command_paths,
         validate_command_paths_in_config_bytes,
     };
     use std::path::PathBuf;
@@ -293,5 +423,50 @@ mod tests {
         assert!(error
             .to_string()
             .contains("points outside the UnixNotis config directory"));
+    }
+
+    #[test]
+    fn host_specific_command_paths_include_absolute_path_inside_root() {
+        let config_dir = temp_root("inside-root-host-specific");
+        let script_path = config_dir.join("scripts/unixnotis-thermal-stat");
+        let config = format!(
+            "\
+[theme]\nbase_css = \"base.css\"\n\
+[[widgets.stats]]\nlabel = \"Probe\"\n\
+[widgets.stats.plugin]\napi_version = 1\ncommand = {:?}\n",
+            script_path.display().to_string()
+        );
+
+        let parsed = toml::from_str(&config).expect("parse config");
+        let leaks = collect_host_specific_command_paths(&config_dir, &parsed);
+
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].slot, "widgets.stats[0].plugin.command");
+    }
+
+    #[test]
+    fn rewrite_host_specific_command_paths_makes_commands_config_relative() {
+        let config_dir = temp_root("rewrite");
+        let script_path = config_dir.join("scripts/unixnotis-thermal-stat");
+        let config = format!(
+            "\
+[theme]\nbase_css = \"base.css\"\n\
+[[widgets.stats]]\nlabel = \"Probe\"\n\
+[widgets.stats.plugin]\napi_version = 1\ncommand = {:?}\n",
+            format!("{} --json", script_path.display())
+        );
+
+        let mut parsed: Config = toml::from_str(&config).expect("parse config");
+        let rewritten = rewrite_host_specific_command_paths(&config_dir, &mut parsed);
+
+        assert_eq!(rewritten.len(), 1);
+        assert_eq!(
+            parsed.widgets.stats[0]
+                .plugin
+                .as_ref()
+                .expect("plugin")
+                .command,
+            "scripts/unixnotis-thermal-stat --json"
+        );
     }
 }

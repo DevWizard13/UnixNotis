@@ -4,6 +4,7 @@
 //! queueing logic can stay focused on backpressure and scheduling.
 
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
@@ -14,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Runtime;
 use tracing::warn;
+use unixnotis_core::Config;
 use wait_timeout::ChildExt;
 
 use super::command_parse::parse_simple_command;
@@ -240,7 +242,7 @@ pub(super) fn spawn_capture_command(cmd: &str) -> io::Result<Child> {
 pub(super) fn build_command(cmd: &str) -> Command {
     if let Some((program, args)) = parse_simple_command(cmd) {
         // Simple commands avoid shell invocation for safety and performance.
-        let mut command = Command::new(program);
+        let mut command = Command::new(resolve_simple_program(&program));
         command.args(args);
         configure_command(&mut command);
         return command;
@@ -263,7 +265,7 @@ pub(super) fn spawn_capture_command_async(cmd: &str) -> io::Result<tokio::proces
 pub(super) fn build_tokio_command(cmd: &str) -> TokioCommand {
     if let Some((program, args)) = parse_simple_command(cmd) {
         // Tokio command mirrors the blocking path for consistent behavior.
-        let mut command = TokioCommand::new(program);
+        let mut command = TokioCommand::new(resolve_simple_program(&program));
         command.args(args);
         configure_command_tokio(&mut command);
         return command;
@@ -303,6 +305,32 @@ fn configure_command_tokio(command: &mut TokioCommand) {
     }
 }
 
+fn resolve_simple_program(program: &str) -> PathBuf {
+    // Runtime lookup keeps shared presets working after export rewrites host-local paths
+    resolve_simple_program_from_root(Config::default_config_dir().ok().as_deref(), program)
+}
+
+fn resolve_simple_program_from_root(config_dir: Option<&Path>, program: &str) -> PathBuf {
+    let path = Path::new(program);
+    if !looks_like_relative_path_program(program, path) {
+        return path.to_path_buf();
+    }
+
+    // Preset imports rewrite bundled scripts to config-root-relative paths for portability
+    config_dir
+        .map(|config_dir| config_dir.join(path))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn looks_like_relative_path_program(program: &str, path: &Path) -> bool {
+    // Bare names still use PATH lookup, while path-like names are rooted in the config dir
+    !path.is_absolute()
+        && (program == "."
+            || program.starts_with("./")
+            || program.starts_with("../")
+            || program.contains('/'))
+}
+
 pub(in crate::ui::widgets) fn kill_process_group(pid: i32) {
     if pid <= 0 {
         return;
@@ -316,8 +344,9 @@ pub(in crate::ui::widgets) fn kill_process_group(pid: i32) {
 #[cfg(test)]
 mod tests {
     use std::io::{self, Cursor};
+    use std::path::Path;
 
-    use super::{read_to_end_limited, MAX_CAPTURE_BYTES};
+    use super::{read_to_end_limited, resolve_simple_program_from_root, MAX_CAPTURE_BYTES};
 
     #[test]
     fn read_to_end_limited_accepts_small_payloads() {
@@ -331,5 +360,15 @@ mod tests {
         let payload = vec![0u8; MAX_CAPTURE_BYTES + 1];
         let err = read_to_end_limited(Cursor::new(payload)).expect_err("oversized payload");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn resolve_simple_program_roots_relative_script_paths_in_config_dir() {
+        let config_dir = Path::new("/tmp/demo/unixnotis");
+
+        assert_eq!(
+            resolve_simple_program_from_root(Some(config_dir), "scripts/demo-widget"),
+            config_dir.join("scripts/demo-widget")
+        );
     }
 }

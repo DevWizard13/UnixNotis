@@ -8,7 +8,10 @@ use std::path::Path;
 use unixnotis_core::Config;
 
 use super::archive::read_bundle;
-use super::command_paths::{collect_command_references_from_config, collect_outside_command_paths};
+use super::command_paths::{
+    collect_command_references_from_config, collect_host_specific_command_paths,
+    collect_outside_command_paths,
+};
 use super::pathing::{resolve_cli_bundle_path, validate_preset_bundle_path};
 
 pub(super) fn run_inspect(input_path: &Path) -> Result<()> {
@@ -72,6 +75,25 @@ pub(super) fn inspect_preset_at(input_path: &Path) -> Result<String> {
                             out.push_str(&format!(
                                 "  - {} points outside the config root: {}\n",
                                 warning.slot, warning.command
+                            ));
+                        }
+                    }
+
+                    let leaked_paths = collect_host_specific_command_paths(
+                        Path::new("$XDG_CONFIG_HOME/unixnotis"),
+                        &config,
+                    );
+                    out.push_str(&format!(
+                        "host-specific command paths: {}\n",
+                        leaked_paths.len()
+                    ));
+                    if leaked_paths.is_empty() {
+                        out.push_str("  none\n");
+                    } else {
+                        for leak in leaked_paths {
+                            out.push_str(&format!(
+                                "  - {} uses a host-local config path: {}\n",
+                                leak.slot, leak.command
                             ));
                         }
                     }
@@ -168,6 +190,7 @@ mod tests {
         assert!(report.contains("preset: demo"));
         assert!(report.contains("widgets.volume.get_cmd"));
         assert!(report.contains("command path warnings:"));
+        assert!(report.contains("host-specific command paths:"));
         assert!(report.contains("file list:"));
         assert!(report.contains("config.toml"));
     }
