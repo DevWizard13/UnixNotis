@@ -120,7 +120,9 @@ pub(super) fn collect_config_files(
 }
 
 pub(super) fn ensure_safe_target_path(config_dir: &Path, relative_path: &Path) -> Result<PathBuf> {
+    // Normalize first so later checks only deal with one clean relative path form
     let relative_path = normalize_relative_path(relative_path)?;
+    // Join stays local only if every live path segment under the root is a real directory
     let target_path = config_dir.join(&relative_path);
 
     // Existing symlink components could redirect writes outside the config tree
@@ -129,12 +131,14 @@ pub(super) fn ensure_safe_target_path(config_dir: &Path, relative_path: &Path) -
         if let Component::Normal(part) = component {
             probe.push(part);
             if !probe.exists() {
+                // A missing tail segment is fine because nothing can redirect through it yet
                 break;
             }
 
             let metadata = fs::symlink_metadata(&probe)
                 .with_context(|| format!("inspect target path {}", probe.display()))?;
             if metadata.file_type().is_symlink() {
+                // Reject the whole import target once a single segment can jump outside the root
                 return Err(anyhow!(
                     "preset import refuses to write through symlinked paths: {}",
                     probe.display()
@@ -144,6 +148,47 @@ pub(super) fn ensure_safe_target_path(config_dir: &Path, relative_path: &Path) -
     }
 
     Ok(target_path)
+}
+
+pub(super) fn ensure_no_symlink_ancestors(path: &Path) -> Result<()> {
+    // A symlink anywhere on the live config root path can redirect all later writes
+    let mut probe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            // Keep any drive prefix intact on platforms that use one
+            Component::Prefix(prefix) => probe.push(prefix.as_os_str()),
+            // Rebuild the absolute path one segment at a time from the filesystem root
+            Component::RootDir => probe.push(Path::new("/")),
+            // `.` has no effect on the real target path
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Parent segments here would make the root check itself ambiguous
+                return Err(anyhow!(
+                    "path contains unexpected parent traversal: {}",
+                    path.display()
+                ));
+            }
+            // Normal path parts are checked one by one so a linked parent cannot hide deeper hops
+            Component::Normal(part) => probe.push(part),
+        }
+
+        if !probe.exists() {
+            // Once a component does not exist yet, later symlink checks cannot inspect deeper
+            break;
+        }
+
+        let metadata = fs::symlink_metadata(&probe)
+            .with_context(|| format!("inspect path component {}", probe.display()))?;
+        if metadata.file_type().is_symlink() {
+            // Stop before import writes into a root that already points somewhere else
+            return Err(anyhow!(
+                "preset import refuses to use a path with symlinked ancestors: {}",
+                probe.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub(super) fn create_backup_dir(config_dir: &Path) -> Result<PathBuf> {
@@ -226,7 +271,7 @@ fn is_backup_dir(relative_path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_config_files, write_atomic_bytes};
+    use super::{collect_config_files, ensure_no_symlink_ancestors, write_atomic_bytes};
     use crate::preset::pathing::format_relative_path;
     use std::fs;
     use std::path::PathBuf;
@@ -319,5 +364,20 @@ mod tests {
         write_atomic_bytes(&target, b"new", 0o755).expect("write file");
 
         assert_eq!(fs::read_to_string(&target).expect("read file"), "new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_no_symlink_ancestors_rejects_symlinked_parent_path() {
+        // A symlinked ancestor can redirect the whole config root outside the expected tree
+        let root = TempDirGuard::new("symlink-ancestor");
+        let real_xdg = root.path.join("real-xdg");
+        let linked_xdg = root.path.join("linked-xdg");
+        fs::create_dir_all(real_xdg.join("unixnotis")).expect("create real config dir");
+        std::os::unix::fs::symlink(&real_xdg, &linked_xdg).expect("create xdg symlink");
+
+        let error =
+            ensure_no_symlink_ancestors(&linked_xdg.join("unixnotis")).expect_err("reject symlink");
+        assert!(error.to_string().contains("symlinked ancestors"));
     }
 }

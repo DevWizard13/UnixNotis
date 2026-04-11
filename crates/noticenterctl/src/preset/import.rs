@@ -11,7 +11,9 @@ use unixnotis_core::Config;
 use crate::main_css_check::run_css_check;
 
 use super::archive::{read_bundle, BundleFile};
-use super::filesystem::{create_backup_dir, ensure_safe_target_path, write_atomic_bytes};
+use super::filesystem::{
+    create_backup_dir, ensure_no_symlink_ancestors, ensure_safe_target_path, write_atomic_bytes,
+};
 use super::pathing::{
     parse_except_paths, relative_path_matches_exclusion, resolve_cli_bundle_path,
     validate_preset_bundle_path,
@@ -94,19 +96,13 @@ pub(super) fn import_preset_into(
     dry_run: bool,
 ) -> Result<ImportSummary> {
     validate_preset_bundle_path(input_path)?;
-    if config_dir.exists() {
-        // A symlinked config root could redirect all writes outside the expected tree
-        let metadata = fs::symlink_metadata(config_dir)
-            .with_context(|| format!("inspect config directory {}", config_dir.display()))?;
-        if metadata.file_type().is_symlink() {
-            return Err(anyhow!(
-                "preset import refuses to use a symlinked config directory: {}",
-                config_dir.display()
-            ));
-        }
-    }
+    // The whole config-root path must be free of symlink hops before any write plan is built
+    ensure_no_symlink_ancestors(config_dir)?;
 
     let exclusions = parse_except_paths(except)?;
+    // A kept-local config.toml means the bundle config never drives post-import theme setup
+    let imports_config_toml =
+        !relative_path_matches_exclusion(Path::new("config.toml"), &exclusions);
     // Read and validate the full bundle before touching the local config tree
     let bundle = read_bundle(input_path).context("read preset bundle for import")?;
 
@@ -118,6 +114,19 @@ pub(super) fn import_preset_into(
         return Err(anyhow!(
             "preset bundle is missing config.toml and cannot be imported"
         ));
+    }
+    if imports_config_toml {
+        // Parse the bundled config early so hostile theme paths fail before any file is written
+        let bundled_config = bundle
+            .files
+            .iter()
+            // Reuse the already validated bundle payload instead of reading from disk again
+            .find(|file| file.relative_path == Path::new("config.toml"))
+            .ok_or_else(|| {
+                anyhow!("preset bundle is missing config.toml and cannot be imported")
+            })?;
+        // This closes the chain where a safe archive could still point theme files outside the root
+        validate_imported_theme_paths_stay_in_root(config_dir, &bundled_config.contents)?;
     }
 
     let mut excluded = 0usize;
@@ -180,6 +189,7 @@ pub(super) fn import_preset_into(
             let Some(backup_dir) = backup_dir.as_ref() else {
                 return Err(anyhow!("internal error: missing backup directory"));
             };
+            // Backup layout mirrors the config tree so manual restore stays straightforward
             let backup_path = backup_dir.join(&item.file.relative_path);
             if let Some(parent) = backup_path.parent() {
                 fs::create_dir_all(parent)
@@ -210,10 +220,48 @@ pub(super) fn import_preset_into(
     })
 }
 
+fn validate_imported_theme_paths_stay_in_root(
+    config_dir: &Path,
+    config_bytes: &[u8],
+) -> Result<()> {
+    // The bundle config is trusted during post-import setup, so its theme targets must stay local
+    let config_text =
+        std::str::from_utf8(config_bytes).context("preset config.toml is not valid UTF-8")?;
+    let config: Config =
+        toml::from_str(config_text).context("parse bundled config.toml for import validation")?;
+    // Resolve against the target config root because that is where import will later materialize CSS files
+    let theme_paths = config
+        .resolve_theme_paths_from(config_dir)
+        .context("resolve bundled theme paths for import validation")?;
+
+    for (slot_name, path) in [
+        ("base_css", &theme_paths.base_css),
+        ("panel_css", &theme_paths.panel_css),
+        ("popup_css", &theme_paths.popup_css),
+        ("widgets_css", &theme_paths.widgets_css),
+        ("media_css", &theme_paths.media_css),
+    ] {
+        // `starts_with` is enough here because resolved theme paths are concrete filesystem paths now
+        // Absolute or host-specific theme targets would let post-import setup escape the config root
+        if !path.starts_with(config_dir) {
+            return Err(anyhow!(
+                "preset import requires theme.{} to stay under the config root: {}",
+                slot_name,
+                path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::import_preset_into;
+    use crate::preset::archive::write_bundle;
     use crate::preset::export::export_preset_from;
+    use crate::preset::filesystem::{CollectedConfigFiles, PresetFileSource};
+    use crate::preset::manifest::{PresetManifest, PresetManifestFile};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -309,5 +357,68 @@ mod tests {
             fs::read_to_string(import_root.path.join("config.toml")).expect("read config"),
             "[theme]\nbase_css = \"base.css\"\n"
         );
+    }
+
+    #[test]
+    fn import_rejects_bundled_absolute_theme_paths_before_writing() {
+        // A hostile config should not make post-import setup create files outside the config root
+        let export_root = TempDirGuard::new("absolute-theme-export");
+        let outside_theme = export_root.path.join("outside-theme.css");
+        export_root.write(
+            "config.toml",
+            &format!(
+                // The bundle looks normal on the surface, but one theme slot points outside the root
+                "[theme]\nbase_css = {:?}\npanel_css = \"panel.css\"\npopup_css = \"popup.css\"\nwidgets_css = \"widgets.css\"\nmedia_css = \"media.css\"\n",
+                outside_theme.display().to_string()
+            ),
+        );
+        export_root.write("panel.css", ".panel { color: red; }");
+        export_root.write("popup.css", ".popup { color: blue; }");
+        export_root.write("widgets.css", ".widgets { color: green; }");
+        export_root.write("media.css", ".media { color: yellow; }");
+        let bundle_path = export_root.path.join("demo.unixnotis");
+        let collected = CollectedConfigFiles {
+            files: [
+                ("config.toml", "config.toml"),
+                ("panel.css", "panel.css"),
+                ("popup.css", "popup.css"),
+                ("widgets.css", "widgets.css"),
+                ("media.css", "media.css"),
+            ]
+            .into_iter()
+            .map(|(relative_path, source_path)| {
+                let source_path = export_root.path.join(source_path);
+                PresetFileSource {
+                    // Build the archive by hand so export-side root checks do not hide the import bug
+                    relative_path: PathBuf::from(relative_path),
+                    size: fs::metadata(&source_path).expect("metadata").len(),
+                    source_path,
+                }
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let manifest = PresetManifest::new(
+            "demo".to_string(),
+            "2026-04-11T00:00:00Z".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+            collected
+                .files
+                .iter()
+                .map(|file| PresetManifestFile {
+                    path: file.relative_path.display().to_string(),
+                    size: file.size,
+                })
+                .collect(),
+        );
+        write_bundle(&bundle_path, &manifest, &collected).expect("write bundle");
+        let import_root = TempDirGuard::new("absolute-theme-import");
+
+        let error = import_preset_into(&import_root.path, &bundle_path, &[], false)
+            .expect_err("reject absolute bundled theme path");
+
+        assert!(error.to_string().contains("stay under the config root"));
+        assert!(!outside_theme.exists());
+        assert!(!import_root.path.join("config.toml").exists());
     }
 }
