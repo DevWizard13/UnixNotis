@@ -168,5 +168,7 @@ impl UiState {
             &config,
             &self.popup_input_region,
         );
+        // Config reload must also refresh visible popup widgets and limits
+        self.refresh_after_config_reload();
     }
 }

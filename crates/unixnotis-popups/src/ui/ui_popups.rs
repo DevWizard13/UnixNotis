@@ -169,6 +169,20 @@ impl UiState {
         );
     }
 
+    pub(super) fn refresh_after_config_reload(&mut self) {
+        // Materialized popup roots cache their width at build time
+        // Refresh them after stack geometry changes so visible cards stay aligned
+        let popup_width = self.popup_stack.width_request().max(1);
+        for entry in self.popups.values() {
+            let Some(root) = entry.root.as_ref() else {
+                continue;
+            };
+            root.set_size_request(popup_width, -1);
+        }
+        // Re-run visibility so max_visible changes take effect right away
+        self.update_popup_visibility();
+    }
+
     fn apply_visible_popups(&mut self, desired_visible: Vec<u32>) {
         // Leaving the visible slice drops widget trees so overflow stays lightweight
         let previous_visible = self.visible_popups.clone();
