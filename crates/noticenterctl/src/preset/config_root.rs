@@ -109,11 +109,12 @@ pub(super) fn collect_config_files(
 
             // File size is cached once here so manifest generation does not reopen the file later
             let metadata = entry.metadata()?;
+            let mode = file_mode(&path, &metadata)?;
             collected.files.push(PresetFileSource {
                 relative_path: relative,
                 source_path: path,
                 size: metadata.len(),
-                mode: file_mode(&metadata),
+                mode,
                 contents_override: None,
             });
         }
@@ -160,15 +161,26 @@ fn resolve_working_path(path: &Path) -> Result<PathBuf> {
         .join(path))
 }
 
-fn file_mode(metadata: &fs::Metadata) -> u32 {
+fn file_mode(path: &Path, metadata: &fs::Metadata) -> Result<u32> {
     #[cfg(unix)]
     {
-        metadata.permissions().mode()
+        let raw_mode = metadata.permissions().mode();
+        // Reject special permission bits so exported presets do not carry surprising file behavior
+        let permission_mode = raw_mode & 0o7777;
+        if permission_mode & 0o7000 != 0 {
+            return Err(anyhow!(
+                "preset export refuses files with special permission bits: {}",
+                path.display()
+            ));
+        }
+        Ok(permission_mode & 0o777)
     }
 
     #[cfg(not(unix))]
     {
-        0o644
+        let _ = path;
+        let _ = metadata;
+        Ok(0o644)
     }
 }
 
@@ -191,6 +203,8 @@ mod tests {
     use crate::preset::pathing::format_relative_path;
     use std::fs;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -268,6 +282,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["linked.png"]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_config_files_rejects_special_permission_bits() {
+        let root = TempDirGuard::new("special-mode");
+        root.write("config.toml", "demo = true");
+        root.write("scripts/run.sh", "#!/bin/sh\necho hi\n");
+
+        let script_path = root.path.join("scripts/run.sh");
+        let mut perms = fs::metadata(&script_path).expect("script metadata").permissions();
+        perms.set_mode(0o4755);
+        fs::set_permissions(&script_path, perms).expect("set script mode");
+
+        let error = collect_config_files(&root.path, None, &[]).expect_err("reject special mode");
+        assert!(error.to_string().contains("special permission bits"));
     }
 
     #[test]

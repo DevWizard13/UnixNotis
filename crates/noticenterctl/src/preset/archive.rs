@@ -66,21 +66,29 @@ pub(super) fn write_bundle(
     )?;
 
     for file in &collected.files {
+        let mode = sanitize_payload_mode(file.mode, &file.relative_path)?;
+
         if let Some(contents) = &file.contents_override {
             // Overridden files stay in memory so export can patch config.toml in the bundle only
             append_bytes(
                 &mut builder,
                 &archive_payload_path(&file.relative_path),
                 contents,
-                file.mode,
+                mode,
             )?;
             continue;
         }
 
         // Files are streamed from disk so export memory stays bounded by one file at a time
-        builder
-            .append_path_with_name(&file.source_path, archive_payload_path(&file.relative_path))
-            .with_context(|| format!("append {} to archive", file.source_path.display()))?;
+        let mut source_file = File::open(&file.source_path)
+            .with_context(|| format!("open {} for preset archive", file.source_path.display()))?;
+        append_reader(
+            &mut builder,
+            &archive_payload_path(&file.relative_path),
+            &mut source_file,
+            file.size,
+            mode,
+        )?;
     }
 
     // Finish the tar writer first, then flush the gzip stream to disk
@@ -154,7 +162,8 @@ pub(super) fn read_bundle(bundle_path: &Path) -> Result<BundleArchive> {
         entry
             .read_to_end(&mut contents)
             .with_context(|| format!("read bundle payload {}", archive_path.display()))?;
-        let mode = entry.header().mode().unwrap_or(0o644);
+        let mode =
+            sanitize_payload_mode(entry.header().mode().unwrap_or(0o644), &relative_path)?;
 
         files.insert(
             relative_path.clone(),
@@ -226,6 +235,35 @@ fn append_bytes(
     Ok(())
 }
 
+fn append_reader<R: Read>(
+    builder: &mut Builder<GzEncoder<File>>,
+    path: &Path,
+    reader: &mut R,
+    size: u64,
+    mode: u32,
+) -> Result<()> {
+    let mut header = Header::new_gnu();
+    header.set_mode(mode);
+    header.set_size(size);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, reader)
+        .with_context(|| format!("append {} to preset archive", path.display()))?;
+    Ok(())
+}
+
+fn sanitize_payload_mode(mode: u32, relative_path: &Path) -> Result<u32> {
+    // Keep only permission bits and reject setuid/setgid/sticky flags from preset payloads
+    let permission_mode = mode & 0o7777;
+    if permission_mode & 0o7000 != 0 {
+        return Err(anyhow!(
+            "preset payload contains unsupported special permission bits: {}",
+            relative_path.display()
+        ));
+    }
+    Ok(permission_mode & 0o777)
+}
+
 fn temp_bundle_path(bundle_path: &Path) -> PathBuf {
     let parent = bundle_path
         .parent()
@@ -249,10 +287,14 @@ mod tests {
     use crate::preset::config_root::CollectedConfigFiles;
     use crate::preset::config_root::PresetFileSource;
     use crate::preset::manifest::{PresetManifest, PresetManifestFile};
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::fs;
-    use std::path::PathBuf;
+    use std::io::Cursor;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tar::{Builder, Header};
 
     static TEST_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -376,5 +418,56 @@ mod tests {
 
         assert_eq!(bundle.files.len(), 1);
         assert_eq!(bundle.files[0].contents, b"demo = false\n");
+    }
+
+    #[test]
+    fn read_bundle_rejects_special_permission_bits() {
+        let root = TempDirGuard::new("special-mode");
+        let bundle_path = root.path.join("demo.unixnotis");
+        let output = fs::File::create(&bundle_path).expect("create bundle");
+        let encoder = GzEncoder::new(output, Compression::default());
+        let mut builder = Builder::new(encoder);
+
+        let manifest = PresetManifest::new(
+            "demo".to_string(),
+            "2026-04-11T12:00:00Z".to_string(),
+            "0.1.0".to_string(),
+            vec![PresetManifestFile {
+                path: "config.toml".to_string(),
+                size: 12,
+            }],
+        );
+        let manifest_bytes = manifest.encode().expect("encode manifest").into_bytes();
+        let mut manifest_header = Header::new_gnu();
+        manifest_header.set_mode(0o644);
+        manifest_header.set_size(manifest_bytes.len() as u64);
+        manifest_header.set_cksum();
+        builder
+            .append_data(
+                &mut manifest_header,
+                Path::new("manifest.toml"),
+                Cursor::new(manifest_bytes),
+            )
+            .expect("append manifest");
+
+        let payload = b"demo = true\n";
+        let mut payload_header = Header::new_gnu();
+        payload_header.set_mode(0o4755);
+        payload_header.set_size(payload.len() as u64);
+        payload_header.set_cksum();
+        builder
+            .append_data(
+                &mut payload_header,
+                Path::new("payload/config.toml"),
+                Cursor::new(payload),
+            )
+            .expect("append payload");
+        builder.finish().expect("finish archive");
+        let encoder = builder.into_inner().expect("take encoder");
+        let file = encoder.finish().expect("finish gzip");
+        file.sync_all().expect("sync bundle");
+
+        let error = read_bundle(&bundle_path).expect_err("reject special mode bits");
+        assert!(error.to_string().contains("special permission bits"));
     }
 }
