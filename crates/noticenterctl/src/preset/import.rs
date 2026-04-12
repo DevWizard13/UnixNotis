@@ -83,7 +83,7 @@ pub(super) fn run_import(input_path: &Path, except: &[String], dry_run: bool) ->
             return Err(err);
         }
     };
-    // Recheck the live config so `--except config.toml` cannot reuse an unsafe local theme path
+    // Recheck the live config so `--except config.toml` cannot reuse an outside local theme path
     if let Err(err) = validate_config_theme_paths_stay_in_root(&config_dir, &config) {
         rollback_import_transaction(transaction)?;
         return Err(err);

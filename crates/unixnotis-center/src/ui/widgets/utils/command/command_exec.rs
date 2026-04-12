@@ -4,13 +4,14 @@
 //! queueing logic can stay focused on backpressure and scheduling.
 
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
-
+use rustix::process::{Pid, Signal};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Runtime;
@@ -281,28 +282,14 @@ pub(super) fn build_tokio_command(cmd: &str) -> TokioCommand {
 fn configure_command(command: &mut Command) {
     command.stdin(Stdio::null());
     #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    command.process_group(0);
 }
 
 fn configure_command_tokio(command: &mut TokioCommand) {
     // Use a dedicated process group so timeouts can kill the whole subtree.
     command.stdin(Stdio::null());
     #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    command.process_group(0);
 }
 
 fn resolve_simple_program(program: &str) -> PathBuf {
@@ -336,8 +323,10 @@ pub(in crate::ui::widgets) fn kill_process_group(pid: i32) {
         return;
     }
     #[cfg(unix)]
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
+    {
+        if let Some(pid) = Pid::from_raw(pid) {
+            let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+        }
     }
 }
 
