@@ -202,9 +202,9 @@ mod tests {
     use super::{collect_config_files, override_collected_file_contents};
     use crate::preset::pathing::format_relative_path;
     use std::fs;
-    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -292,7 +292,9 @@ mod tests {
         root.write("scripts/run.sh", "#!/bin/sh\necho hi\n");
 
         let script_path = root.path.join("scripts/run.sh");
-        let mut perms = fs::metadata(&script_path).expect("script metadata").permissions();
+        let mut perms = fs::metadata(&script_path)
+            .expect("script metadata")
+            .permissions();
         perms.set_mode(0o4755);
         fs::set_permissions(&script_path, perms).expect("set script mode");
 
