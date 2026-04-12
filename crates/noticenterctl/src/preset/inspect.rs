@@ -8,7 +8,7 @@ use std::path::Path;
 use unixnotis_core::Config;
 
 use super::archive::read_bundle;
-use super::command_paths::{
+use super::command_rules::{
     collect_command_references_from_config, collect_host_specific_command_paths,
     collect_outside_command_paths,
 };

@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use unixnotis_core::{Config, ThemePaths};
 
-use super::super::command_paths::{
+use super::super::command_rules::{
     validate_command_paths_in_config_bytes, validate_config_command_paths_stay_in_root,
 };
 use super::super::pathing::normalize_lexical_path;

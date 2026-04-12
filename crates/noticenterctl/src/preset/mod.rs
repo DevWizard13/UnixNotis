@@ -4,7 +4,7 @@
 //! so the local-only share flow stays separate from the D-Bus control path
 
 mod archive;
-pub(crate) mod command_paths;
+pub(crate) mod command_rules;
 mod config_root;
 pub(crate) mod css_asset_refs;
 mod export;

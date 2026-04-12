@@ -22,9 +22,7 @@ use self::prompts::{
     rewrite_host_specific_command_paths_if_requested,
 };
 use super::archive::write_bundle;
-use super::command_paths::{
-    validate_config_command_paths_stay_in_root, HostSpecificCommandPath,
-};
+use super::command_rules::{validate_config_command_paths_stay_in_root, HostSpecificCommandPath};
 use super::config_root::{collect_config_files, override_collected_file_contents};
 use super::css_asset_refs::{collect_external_css_asset_refs_from_sources, ExternalCssAssetRef};
 use super::manifest::{PresetManifest, PresetManifestFile};

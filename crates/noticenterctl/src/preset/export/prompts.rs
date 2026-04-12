@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 use unixnotis_core::Config;
 
-use crate::preset::command_paths::{
+use crate::preset::command_rules::{
     collect_host_specific_command_paths, rewrite_host_specific_command_paths,
     HostSpecificCommandPath,
 };

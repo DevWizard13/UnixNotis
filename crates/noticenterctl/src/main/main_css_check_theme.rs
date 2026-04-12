@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use unixnotis_core::{Config, ThemePaths};
 
-use crate::preset::command_paths::{
+use crate::preset::command_rules::{
     collect_host_specific_command_paths, collect_outside_command_paths,
 };
 use crate::preset::css_asset_refs::collect_external_css_asset_refs_from_paths;
