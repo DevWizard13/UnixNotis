@@ -24,7 +24,7 @@ use self::checks::{
 use self::plan::{build_import_plan, ImportPlan};
 use super::archive::read_bundle;
 use super::css_asset_refs::{collect_external_css_asset_refs_from_bundle, ExternalCssAssetRef};
-use super::filesystem_checks::ensure_no_symlink_ancestors;
+use super::filesystem::ensure_no_symlink_ancestors;
 use super::pathing::{
     confirm_continue_or_abort, parse_except_paths, relative_path_matches_exclusion,
     resolve_cli_bundle_path, validate_preset_bundle_path,

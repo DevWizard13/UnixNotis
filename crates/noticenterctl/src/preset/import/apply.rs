@@ -6,8 +6,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use super::super::filesystem_checks::ensure_dir_fd_matches_live_path;
-use super::super::filesystem_secure::{
+use super::super::filesystem::ensure_dir_fd_matches_live_path;
+use super::super::filesystem::{
     create_backup_dir_secure, open_secure_dir_all, read_relative_file_secure,
     remove_empty_relative_dirs_secure, remove_relative_dir_secure, remove_relative_file_secure,
     write_relative_file_atomic_secure,

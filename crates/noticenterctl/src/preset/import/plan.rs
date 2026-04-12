@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::super::archive::BundleFile;
-use super::super::filesystem_checks::ensure_safe_target_path;
+use super::super::filesystem::ensure_safe_target_path;
 use super::super::pathing::relative_path_matches_exclusion;
 
 #[derive(Debug)]
